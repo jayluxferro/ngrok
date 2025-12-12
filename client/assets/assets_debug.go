@@ -12,8 +12,8 @@
 // assets/client/static/js/jquery.timeago.js
 // assets/client/static/js/ngrok.js
 // assets/client/static/js/vkbeautify.js
-// assets/client/tls.backup/ngrokroot.crt
-// assets/client/tls.backup/snakeoilca.crt
+// assets/client/tls/ngrokroot.crt
+// assets/client/tls/snakeoilca.crt
 // DO NOT EDIT!
 
 // +build debug
@@ -258,10 +258,10 @@ func assetsClientStaticJsVkbeautifyJs() (*asset, error) {
 	return a, err
 }
 
-// assetsClientTlsBackupNgrokrootCrt reads file data from disk. It returns an error on failure.
-func assetsClientTlsBackupNgrokrootCrt() (*asset, error) {
-	path := "/Volumes/Lux/dev/opensource/ngrok/assets/client/tls.backup/ngrokroot.crt"
-	name := "assets/client/tls.backup/ngrokroot.crt"
+// assetsClientTlsNgrokrootCrt reads file data from disk. It returns an error on failure.
+func assetsClientTlsNgrokrootCrt() (*asset, error) {
+	path := "/Volumes/Lux/dev/opensource/ngrok/assets/client/tls/ngrokroot.crt"
+	name := "assets/client/tls/ngrokroot.crt"
 	bytes, err := bindataRead(path, name)
 	if err != nil {
 		return nil, err
@@ -276,10 +276,10 @@ func assetsClientTlsBackupNgrokrootCrt() (*asset, error) {
 	return a, err
 }
 
-// assetsClientTlsBackupSnakeoilcaCrt reads file data from disk. It returns an error on failure.
-func assetsClientTlsBackupSnakeoilcaCrt() (*asset, error) {
-	path := "/Volumes/Lux/dev/opensource/ngrok/assets/client/tls.backup/snakeoilca.crt"
-	name := "assets/client/tls.backup/snakeoilca.crt"
+// assetsClientTlsSnakeoilcaCrt reads file data from disk. It returns an error on failure.
+func assetsClientTlsSnakeoilcaCrt() (*asset, error) {
+	path := "/Volumes/Lux/dev/opensource/ngrok/assets/client/tls/snakeoilca.crt"
+	name := "assets/client/tls/snakeoilca.crt"
 	bytes, err := bindataRead(path, name)
 	if err != nil {
 		return nil, err
@@ -358,8 +358,8 @@ var _bindata = map[string]func() (*asset, error){
 	"assets/client/static/js/jquery.timeago.js": assetsClientStaticJsJqueryTimeagoJs,
 	"assets/client/static/js/ngrok.js": assetsClientStaticJsNgrokJs,
 	"assets/client/static/js/vkbeautify.js": assetsClientStaticJsVkbeautifyJs,
-	"assets/client/tls.backup/ngrokroot.crt": assetsClientTlsBackupNgrokrootCrt,
-	"assets/client/tls.backup/snakeoilca.crt": assetsClientTlsBackupSnakeoilcaCrt,
+	"assets/client/tls/ngrokroot.crt": assetsClientTlsNgrokrootCrt,
+	"assets/client/tls/snakeoilca.crt": assetsClientTlsSnakeoilcaCrt,
 }
 
 // AssetDir returns the file names below a certain
@@ -424,9 +424,9 @@ var _bintree = &bintree{nil, map[string]*bintree{
 					"vkbeautify.js": &bintree{assetsClientStaticJsVkbeautifyJs, map[string]*bintree{}},
 				}},
 			}},
-			"tls.backup": &bintree{nil, map[string]*bintree{
-				"ngrokroot.crt": &bintree{assetsClientTlsBackupNgrokrootCrt, map[string]*bintree{}},
-				"snakeoilca.crt": &bintree{assetsClientTlsBackupSnakeoilcaCrt, map[string]*bintree{}},
+			"tls": &bintree{nil, map[string]*bintree{
+				"ngrokroot.crt": &bintree{assetsClientTlsNgrokrootCrt, map[string]*bintree{}},
+				"snakeoilca.crt": &bintree{assetsClientTlsSnakeoilcaCrt, map[string]*bintree{}},
 			}},
 		}},
 	}},

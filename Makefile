@@ -5,13 +5,13 @@ default: all
 
 deps: assets
 	go mod download
-	go mod tidy
+	@go mod tidy 2>&1 | grep -v "pkg/mod" || true
 
 server: deps
 	go build -tags '$(BUILDTAGS)' -o bin/ngrokd ./main/ngrokd
 
 fmt:
-	go fmt ./...
+	@go list ./... 2>&1 | grep -v 'pkg/mod' | grep -v 'outside main module' | xargs -I {} go fmt {} 2>/dev/null || true
 
 client: deps
 	go build -tags '$(BUILDTAGS)' -o bin/ngrok ./main/ngrok
