@@ -1,0 +1,9 @@
+#!/bin/bash
+
+for x in $(cat dist.txt);
+do
+	os=$(echo $x | cut -f 1 -d /);
+	arch=$(echo $x | cut -f 2 -d /);
+	echo $os "-" $arch;
+	GOOS=$os GOARCH=$arch make release-server release-client
+done

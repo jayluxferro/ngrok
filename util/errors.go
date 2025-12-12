@@ -12,7 +12,7 @@ const crashMessage = `panic: %v
 Oh noes! ngrok crashed!
 
 Please submit the stack trace and any relevant information to:
-github.com/inconshreveable/ngrok/issues`
+ngrok/issues`
 
 func MakePanicTrace(err interface{}) string {
 	stackBuf := make([]byte, 4096)

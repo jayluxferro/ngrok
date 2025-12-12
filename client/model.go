@@ -106,10 +106,19 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 		m.Info("Trusting host's root certificates")
 		m.tlsConfig = &tls.Config{}
 	} else {
-		m.Info("Trusting root CAs: %v", rootCrtPaths)
+		m.Info("Loading root CAs from: %v", rootCrtPaths)
 		var err error
-		if m.tlsConfig, err = LoadTLSConfig(rootCrtPaths); err != nil {
-			panic(err)
+		m.tlsConfig, err = LoadTLSConfig(rootCrtPaths)
+		if err != nil {
+			// This should not happen with the new implementation,
+			// but handle it gracefully just in case
+			m.Warn("Failed to load TLS config, using system root CAs: %v", err)
+			m.tlsConfig = &tls.Config{}
+		} else if m.tlsConfig.RootCAs == nil {
+			// No embedded certificates were loaded, using system root CAs
+			m.Info("No embedded certificates found, using system root CAs")
+		} else {
+			m.Info("Using embedded root certificates")
 		}
 	}
 

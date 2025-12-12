@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/base64"
 	"fmt"
-	"math/rand"
 	"net"
 	"ngrok/conn"
 	"ngrok/log"
