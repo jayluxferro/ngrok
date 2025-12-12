@@ -1,0 +1,207 @@
+name: Build Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.7.1)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: 386
+            suffix: linux-386
+          - goos: linux
+            goarch: arm
+            suffix: linux-arm
+          # macOS
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          # Windows
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64
+          - goos: windows
+            goarch: 386
+            suffix: windows-386
+          # FreeBSD
+          - goos: freebsd
+            goarch: amd64
+            suffix: freebsd-amd64
+          - goos: freebsd
+            goarch: arm64
+            suffix: freebsd-arm64
+          # OpenBSD
+          - goos: openbsd
+            goarch: amd64
+            suffix: openbsd-amd64
+          - goos: openbsd
+            goarch: arm64
+            suffix: openbsd-arm64
+          # NetBSD
+          - goos: netbsd
+            goarch: amd64
+            suffix: netbsd-amd64
+          - goos: netbsd
+            goarch: arm64
+            suffix: netbsd-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install go-bindata
+        run: |
+          go install github.com/jayluxferro/go-bindata/go-bindata@latest
+
+      - name: Generate assets (release)
+        run: |
+          BUILDTAGS=release make assets
+
+      - name: Build client
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            go build -tags release -ldflags="-s -w" -o bin/ngrok-${{ matrix.suffix }}.exe ./main/ngrok
+          else
+            go build -tags release -ldflags="-s -w" -o bin/ngrok-${{ matrix.suffix }} ./main/ngrok
+          fi
+
+      - name: Build server
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            go build -tags release -ldflags="-s -w" -o bin/ngrokd-${{ matrix.suffix }}.exe ./main/ngrokd
+          else
+            go build -tags release -ldflags="-s -w" -o bin/ngrokd-${{ matrix.suffix }} ./main/ngrokd
+          fi
+
+      - name: Create archive (Unix)
+        if: matrix.goos != 'windows'
+        run: |
+          cd bin
+          tar czf ngrok-${{ matrix.suffix }}.tar.gz ngrok-${{ matrix.suffix }} ngrokd-${{ matrix.suffix }}
+          sha256sum ngrok-${{ matrix.suffix }}.tar.gz > ngrok-${{ matrix.suffix }}.tar.gz.sha256
+          echo "Created: ngrok-${{ matrix.suffix }}.tar.gz"
+
+      - name: Create archive (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          cd bin
+          zip ngrok-${{ matrix.suffix }}.zip ngrok-${{ matrix.suffix }}.exe ngrokd-${{ matrix.suffix }}.exe
+          sha256sum ngrok-${{ matrix.suffix }}.zip > ngrok-${{ matrix.suffix }}.zip.sha256
+          echo "Created: ngrok-${{ matrix.suffix }}.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngrok-${{ matrix.suffix }}
+          path: |
+            bin/ngrok-${{ matrix.suffix }}*
+            bin/ngrokd-${{ matrix.suffix }}*
+          retention-days: 90
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## Release ${{ steps.version.outputs.version }}
+
+            ### Downloads
+
+            **Client and Server binaries for all supported platforms:**
+
+            | Platform | Architecture | Download |
+            |----------|-------------|----------|
+            | Linux | amd64 | [ngrok-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-amd64.tar.gz) |
+            | Linux | arm64 | [ngrok-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm64.tar.gz) |
+            | Linux | 386 | [ngrok-linux-386.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-386.tar.gz) |
+            | Linux | arm | [ngrok-linux-arm.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm.tar.gz) |
+            | macOS | amd64 | [ngrok-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-amd64.tar.gz) |
+            | macOS | arm64 | [ngrok-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-arm64.tar.gz) |
+            | Windows | amd64 | [ngrok-windows-amd64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-amd64.zip) |
+            | Windows | arm64 | [ngrok-windows-arm64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-arm64.zip) |
+            | Windows | 386 | [ngrok-windows-386.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-386.zip) |
+            | FreeBSD | amd64 | [ngrok-freebsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-amd64.tar.gz) |
+            | FreeBSD | arm64 | [ngrok-freebsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-arm64.tar.gz) |
+            | OpenBSD | amd64 | [ngrok-openbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-amd64.tar.gz) |
+            | OpenBSD | arm64 | [ngrok-openbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-arm64.tar.gz) |
+            | NetBSD | amd64 | [ngrok-netbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-amd64.tar.gz) |
+            | NetBSD | arm64 | [ngrok-netbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-arm64.tar.gz) |
+
+            ### Installation
+
+            Extract the archive for your platform and architecture, then:
+
+            - **Client**: `./ngrok` (or `ngrok.exe` on Windows)
+            - **Server**: `./ngrokd` (or `ngrokd.exe` on Windows)
+
+            ### Checksums
+
+            SHA256 checksums are included with each release archive.
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: false
+
