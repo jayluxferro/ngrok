@@ -1,6 +1,7 @@
 .PHONY: default server client deps fmt clean all release-all assets client-assets server-assets contributors
 
-BUILDTAGS=debug
+BUILDTAGS ?= debug
+export BUILDTAGS
 default: all
 
 deps: assets
