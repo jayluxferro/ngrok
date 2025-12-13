@@ -83,6 +83,13 @@ jobs:
       - name: Install go-bindata
         run: |
           go install github.com/jayluxferro/go-bindata/go-bindata@latest
+          # Ensure go-bindata is in PATH
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Clean and prepare assets directories
+        run: |
+          rm -rf client/assets server/assets
+          mkdir -p client/assets server/assets
 
       - name: Generate assets (release)
         run: |
