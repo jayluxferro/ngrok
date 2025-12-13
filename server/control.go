@@ -101,6 +101,23 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 		return
 	}
 
+	// Validate auth token if tokens are configured
+	if len(opts.authTokens) > 0 {
+		clientToken := authMsg.User
+		validToken := false
+		for _, validTokenStr := range opts.authTokens {
+			if clientToken == validTokenStr {
+				validToken = true
+				break
+			}
+		}
+		if !validToken {
+			failAuth(fmt.Errorf("Invalid authentication token"))
+			return
+		}
+		ctlConn.Info("Authenticated with valid token")
+	}
+
 	// register the control
 	if replaced := controlRegistry.Add(c.id, c); replaced != nil {
 		replaced.shutdown.WaitComplete()

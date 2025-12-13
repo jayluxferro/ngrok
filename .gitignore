@@ -1,4 +1,5 @@
 *.swp
+*.yml
 bin/
 pkg/
 src/code.google.com
@@ -13,3 +14,4 @@ src/ngrok/server/assets/
 # Generated asset files
 client/assets/assets_*.go
 server/assets/assets_*.go
+

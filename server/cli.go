@@ -2,6 +2,7 @@ package server
 
 import (
 	"flag"
+	"strings"
 )
 
 type Options struct {
@@ -13,6 +14,7 @@ type Options struct {
 	tlsKey     string
 	logto      string
 	loglevel   string
+	authTokens []string // Valid auth tokens (empty means no validation required)
 }
 
 func parseArgs() *Options {
@@ -24,7 +26,20 @@ func parseArgs() *Options {
 	tlsKey := flag.String("tlsKey", "", "Path to a TLS key file")
 	logto := flag.String("log", "stdout", "Write log messages to this file. 'stdout' and 'none' have special meanings")
 	loglevel := flag.String("log-level", "DEBUG", "The level of messages to log. One of: DEBUG, INFO, WARNING, ERROR")
+	authTokensFlag := flag.String("authToken", "", "Comma-separated list of valid auth tokens (optional, if not set, no authentication required)")
 	flag.Parse()
+
+	// Parse auth tokens from comma-separated string
+	var authTokens []string
+	if *authTokensFlag != "" {
+		tokens := strings.Split(*authTokensFlag, ",")
+		for _, token := range tokens {
+			token = strings.TrimSpace(token)
+			if token != "" {
+				authTokens = append(authTokens, token)
+			}
+		}
+	}
 
 	return &Options{
 		httpAddr:   *httpAddr,
@@ -35,5 +50,6 @@ func parseArgs() *Options {
 		tlsKey:     *tlsKey,
 		logto:      *logto,
 		loglevel:   *loglevel,
+		authTokens: authTokens,
 	}
 }
