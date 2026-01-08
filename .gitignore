@@ -14,4 +14,5 @@ src/ngrok/server/assets/
 # Generated asset files
 client/assets/assets_*.go
 server/assets/assets_*.go
-
+ngrok
+ngrokd
