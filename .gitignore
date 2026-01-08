@@ -10,6 +10,7 @@ src/gopkg.in
 src/ngrok/client/assets/
 src/ngrok/server/assets/
 .idea/
+.DS_Store
 
 # Generated asset files
 client/assets/assets_*.go
