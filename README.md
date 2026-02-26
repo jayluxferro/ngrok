@@ -161,6 +161,10 @@ ngrok reads configuration from `~/.ngrok` by default. You can specify a custom c
 ```yaml
 server_addr: your-server.com:4443  # Tunnel control port (default: 4443, TLS-encrypted)
 inspect_addr: 127.0.0.1:4040       # Local web interface for inspecting requests
+inspect_auth: admin:secret         # Optional: basic auth for inspector UI
+inspect_token: some-token          # Optional: header token for inspector (X-Ngrok-Inspect-Token)
+inspect_max_body_bytes: 1048576    # Optional: max captured request/response body bytes
+proxy_max_concurrency: 64          # Optional: max concurrent proxy setup workers on client
 trust_host_root_certs: true        # Trust your server's TLS certificate
 auth_token: your-auth-token        # Optional: Authentication token (if required by your server)
 
@@ -188,7 +192,8 @@ ngrok [OPTIONS] <local port or address>
 Options:
   -config=path       Configuration file path (default: ~/.ngrok)
   -log=path          Log file path (default: stdout)
-  -log-level=level  Log level: DEBUG, INFO, WARN, ERROR
+  -log-level=level   Log level: DEBUG, INFO, WARN, ERROR
+  -log-format=format Log format: text or json
   -subdomain=name    Request a specific subdomain
   -hostname=name     Request a specific hostname
   -authtoken=token   Authentication token (for self-hosted server)
@@ -203,11 +208,20 @@ Options:
   -httpAddr=:80      HTTP listening address (for public tunnel traffic)
   -httpsAddr=:443    HTTPS listening address (for public tunnel traffic)
   -tunnelAddr=:4443  Tunnel control connection address (for ngrok clients, TLS-encrypted)
+  -adminAddr=:9090   Admin address for /healthz and /metrics (empty to disable)
   -tlsKey=path       Path to TLS private key
   -tlsCrt=path       Path to TLS certificate
-  -authToken=tokens   Comma-separated list of valid auth tokens (optional, if not set, no authentication required)
+  -authToken=tokens  Comma-separated list of valid auth tokens
+                     Supports plaintext tokens and sha256:<hex-digest> values
+  -hashToken=token   Print sha256 token hash in format sha256:<hex> and exit
   -log=path          Log file path (default: stdout)
-  -log-level=level  Log level: DEBUG, INFO, WARN, ERROR
+  -log-level=level   Log level: DEBUG, INFO, WARN, ERROR
+  -log-format=format Log format: text or json
+  -maxMsgBytes=n     Max control/proxy message size in bytes
+  -authRate=n        Max auth attempts per minute per IP (0 disables)
+  -publicRate=n      Max new public conns per second per IP (0 disables)
+  -maxConnPerIP=n    Max concurrent public conns per IP (0 disables)
+  -pprof             Enable /debug/pprof on -adminAddr
 ```
 
 **Authentication:**
@@ -216,6 +230,27 @@ Options:
 - Multiple tokens can be specified: `-authToken="token1,token2,token3"`
 
 **Note:** The `server_addr` in the client config points to the `tunnelAddr` port (4443), which is separate from the HTTP (80) and HTTPS (443) ports. Port 4443 handles client control connections, while ports 80/443 handle the actual tunneled web traffic.
+
+## Recommended Hardened Server Command
+
+```bash
+./bin/ngrokd \
+  -domain=example.com \
+  -tlsCrt=/etc/ngrok/tls.crt \
+  -tlsKey=/etc/ngrok/tls.key \
+  -authToken="sha256:<digest1>,sha256:<digest2>" \
+  -adminAddr=127.0.0.1:9090 \
+  -maxMsgBytes=4194304 \
+  -authRate=120 \
+  -publicRate=200 \
+  -maxConnPerIP=100 \
+  -log-format=json
+```
+
+Generate token digests with:
+```bash
+./bin/ngrokd -hashToken="my-secret-token"
+```
 
 ## Protocol
 
@@ -226,6 +261,14 @@ ngrok uses a custom protocol over TLS for secure tunneling:
 3. **Message Format**: Netstring-encoded JSON messages
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed protocol documentation.
+For production hardening guidance, see [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md).
+
+## Smoke Test
+
+Run a lightweight local smoke check:
+```bash
+./scripts/smoke.sh
+```
 
 ## Modernization
 

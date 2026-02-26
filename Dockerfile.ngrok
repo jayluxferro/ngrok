@@ -1,0 +1,13 @@
+FROM golang:1.21-alpine AS build
+WORKDIR /src
+COPY . .
+RUN apk add --no-cache make git && \
+    make client
+
+FROM alpine:3.20
+RUN adduser -D -u 10001 ngrok
+USER ngrok
+WORKDIR /home/ngrok
+COPY --from=build /src/bin/ngrok /usr/local/bin/ngrok
+ENTRYPOINT ["ngrok"]
+
