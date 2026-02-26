@@ -1,6 +1,9 @@
 package server
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 func validateOptions(opts *Options) error {
 	if (opts.tlsCrt == "") != (opts.tlsKey == "") {
@@ -14,6 +17,18 @@ func validateOptions(opts *Options) error {
 	}
 	if opts.enablePprof && opts.adminAddr == "" {
 		return fmt.Errorf("-pprof requires -adminAddr")
+	}
+	if opts.adminRate < 0 {
+		return fmt.Errorf("-adminRate cannot be negative")
+	}
+	if opts.adminAuth != "" && !strings.Contains(opts.adminAuth, ":") {
+		return fmt.Errorf("-adminAuth must be user:password")
+	}
+	if opts.statusAuth != "" && !strings.Contains(opts.statusAuth, ":") {
+		return fmt.Errorf("-statusAuth must be user:password")
+	}
+	if opts.adminAddr == "" && (opts.adminAuth != "" || opts.adminToken != "") {
+		return fmt.Errorf("admin auth/token requires -adminAddr")
 	}
 	return nil
 }

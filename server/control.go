@@ -119,6 +119,7 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 			if warnSampler.allow("auth-invalid") {
 				ctlConn.Warn("Authentication failed: invalid token")
 			}
+			observe.events.publish(map[string]interface{}{"type": "auth_reject", "reason": "invalid_token", "at": time.Now().UTC()})
 			failAuth(fmt.Errorf("Invalid authentication token"))
 			return
 		}

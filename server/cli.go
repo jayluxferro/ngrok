@@ -12,6 +12,12 @@ type Options struct {
 	httpsAddr    string
 	tunnelAddr   string
 	adminAddr    string
+	adminAuth    string
+	adminToken   string
+	adminRate    int
+	statusURL    string
+	statusAuth   string
+	statusToken  string
 	domain       string
 	tlsCrt       string
 	tlsKey       string
@@ -31,6 +37,12 @@ func parseArgs() *Options {
 	httpsAddr := flag.String("httpsAddr", ":443", "Public address listening for HTTPS connections, emptry string to disable")
 	tunnelAddr := flag.String("tunnelAddr", ":4443", "Public address listening for ngrok client")
 	adminAddr := flag.String("adminAddr", "", "Address for admin endpoints (/healthz, /metrics), empty to disable")
+	adminAuth := flag.String("adminAuth", "", "Admin basic auth in user:password format")
+	adminToken := flag.String("adminToken", "", "Admin token required via X-Ngrok-Admin-Token")
+	adminRate := flag.Int("adminRate", 120, "Max admin requests per minute per IP (0 disables)")
+	statusURL := flag.String("statusURL", "", "Query an admin endpoint URL and print status, then exit")
+	statusAuth := flag.String("statusAuth", "", "Basic auth for -statusURL in user:password format")
+	statusToken := flag.String("statusToken", "", "Token for -statusURL via X-Ngrok-Admin-Token")
 	domain := flag.String("domain", "ngrok.com", "Domain where the tunnels are hosted")
 	tlsCrt := flag.String("tlsCrt", "", "Path to a TLS certificate file")
 	tlsKey := flag.String("tlsKey", "", "Path to a TLS key file")
@@ -48,6 +60,13 @@ func parseArgs() *Options {
 
 	if *hashToken != "" {
 		fmt.Printf("sha256:%s\n", tokenDigest(*hashToken))
+		os.Exit(0)
+	}
+	if *statusURL != "" {
+		if err := runStatus(*statusURL, *statusAuth, *statusToken); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -68,6 +87,12 @@ func parseArgs() *Options {
 		httpsAddr:    *httpsAddr,
 		tunnelAddr:   *tunnelAddr,
 		adminAddr:    *adminAddr,
+		adminAuth:    *adminAuth,
+		adminToken:   *adminToken,
+		adminRate:    *adminRate,
+		statusURL:    *statusURL,
+		statusAuth:   *statusAuth,
+		statusToken:  *statusToken,
 		domain:       *domain,
 		tlsCrt:       *tlsCrt,
 		tlsKey:       *tlsKey,

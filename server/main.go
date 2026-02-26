@@ -101,6 +101,7 @@ func tunnelListener(addr string, tlsConfig *tls.Config) *conn.Listener {
 					ip := remoteIP(tunnelConn.RemoteAddr())
 					if !authLimiter.allow(ip) {
 						atomic.AddUint64(&rateDropCount, 1)
+						observe.events.publish(map[string]interface{}{"type": "rate_limit_drop", "scope": "auth", "ip": ip, "at": time.Now().UTC()})
 						if warnSampler.allow("auth-rate:" + ip) {
 							tunnelConn.Warn("Rate-limited auth attempt from %s", ip)
 						}
@@ -176,7 +177,7 @@ func Main() {
 
 	if opts.adminAddr != "" {
 		log.Info("Starting admin server on %s", opts.adminAddr)
-		adminSrv = startAdminServer(opts.adminAddr, opts.enablePprof)
+		adminSrv = startAdminServer(opts.adminAddr, opts.enablePprof, parseAdminAuth(opts.adminAuth, opts.adminToken), opts.adminRate)
 	}
 
 	sigCh := make(chan os.Signal, 1)

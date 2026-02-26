@@ -71,14 +71,16 @@ func httpHandler(c conn.Conn, proto string) {
 	ip := remoteIP(c.RemoteAddr())
 	if !publicLimiter.allow(ip) {
 		atomic.AddUint64(&rateDropCount, 1)
-		if warnSampler.allow("public-rate:"+ip) {
+		observe.events.publish(map[string]interface{}{"type": "rate_limit_drop", "scope": "public_http", "ip": ip, "at": time.Now().UTC()})
+		if warnSampler.allow("public-rate:" + ip) {
 			log.Warn("Rate-limited public request from %s", ip)
 		}
 		c.Write([]byte(BadRequest))
 		return
 	}
 	if !connLimiter.acquire(ip) {
-		if warnSampler.allow("public-cap:"+ip) {
+		observe.events.publish(map[string]interface{}{"type": "connection_cap_drop", "scope": "public_http", "ip": ip, "at": time.Now().UTC()})
+		if warnSampler.allow("public-cap:" + ip) {
 			log.Warn("Connection cap reached for %s", ip)
 		}
 		c.Write([]byte(BadRequest))

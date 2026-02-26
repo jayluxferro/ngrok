@@ -182,6 +182,7 @@ func NewTunnel(m *msg.ReqTunnel, ctl *Control) (t *Tunnel, err error) {
 	t.Info("Registered new tunnel on: %s", t.ctl.conn.Id())
 
 	metrics.OpenTunnel(t)
+	observe.onTunnelOpen(t)
 	return
 }
 
@@ -205,6 +206,7 @@ func (t *Tunnel) Shutdown() {
 	// t.ctl.stoptunnel <- t
 
 	metrics.CloseTunnel(t)
+	observe.onTunnelClose(t)
 }
 
 func (t *Tunnel) Id() string {
@@ -240,6 +242,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 			ip := remoteIP(publicConn.RemoteAddr())
 			if !publicLimiter.allow(ip) {
 				atomic.AddUint64(&rateDropCount, 1)
+				observe.events.publish(map[string]interface{}{"type": "rate_limit_drop", "scope": "public_tcp", "ip": ip, "at": time.Now().UTC()})
 				if warnSampler.allow("tcp-rate:" + ip) {
 					publicConn.Warn("Rate-limited TCP public connection from %s", ip)
 				}
@@ -247,6 +250,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 				return
 			}
 			if !connLimiter.acquire(ip) {
+				observe.events.publish(map[string]interface{}{"type": "connection_cap_drop", "scope": "public_tcp", "ip": ip, "at": time.Now().UTC()})
 				if warnSampler.allow("tcp-cap:" + ip) {
 					publicConn.Warn("Connection cap reached for %s", ip)
 				}
@@ -278,6 +282,7 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn) {
 
 	startTime := time.Now()
 	metrics.OpenConnection(t, publicConn)
+	observe.onConnOpen(t)
 
 	var proxyConn conn.Conn
 	var err error
@@ -322,4 +327,5 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn) {
 	// join the public and proxy connections
 	bytesIn, bytesOut := conn.Join(publicConn, proxyConn)
 	metrics.CloseConnection(t, publicConn, startTime, bytesIn, bytesOut)
+	observe.onConnClose(t, bytesIn, bytesOut)
 }

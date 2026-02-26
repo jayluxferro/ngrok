@@ -209,6 +209,9 @@ Options:
   -httpsAddr=:443    HTTPS listening address (for public tunnel traffic)
   -tunnelAddr=:4443  Tunnel control connection address (for ngrok clients, TLS-encrypted)
   -adminAddr=:9090   Admin address for /healthz and /metrics (empty to disable)
+  -adminAuth=u:p     Basic auth for all admin endpoints
+  -adminToken=token  Header token for admin endpoints (X-Ngrok-Admin-Token)
+  -adminRate=n       Max admin requests per minute per IP (0 disables)
   -tlsKey=path       Path to TLS private key
   -tlsCrt=path       Path to TLS certificate
   -authToken=tokens  Comma-separated list of valid auth tokens
@@ -222,6 +225,9 @@ Options:
   -publicRate=n      Max new public conns per second per IP (0 disables)
   -maxConnPerIP=n    Max concurrent public conns per IP (0 disables)
   -pprof             Enable /debug/pprof on -adminAddr
+  -statusURL=url     Query admin URL (or /metrics) and print JSON status, then exit
+  -statusAuth=u:p    Basic auth for -statusURL
+  -statusToken=tok   X-Ngrok-Admin-Token for -statusURL
 ```
 
 **Authentication:**
@@ -251,6 +257,14 @@ Generate token digests with:
 ```bash
 ./bin/ngrokd -hashToken="my-secret-token"
 ```
+
+Admin endpoints:
+- `/` dashboard (live metrics/tunnels/events)
+- `/healthz` health check
+- `/metrics` JSON counters
+- `/tunnels` per-tunnel stats
+- `/events` SSE event stream
+- `/debug/pprof/*` if `-pprof` is enabled
 
 ## Protocol
 

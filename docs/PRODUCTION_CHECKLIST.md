@@ -12,6 +12,8 @@ Use this checklist before exposing tunnels publicly.
 - Set `-authToken` on `ngrokd`.
 - Prefer hashed tokens with `sha256:<hex-digest>` in `-authToken`.
 - Protect client inspector with `inspect_auth` and/or `inspect_token`.
+- Protect admin endpoints with `-adminAuth` and/or `-adminToken`.
+- Bind `-adminAddr` to localhost or a private management network.
 
 ## Limits and Abuse Protection
 - Set `-maxMsgBytes` to a conservative value.
