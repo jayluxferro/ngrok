@@ -19,12 +19,14 @@ import (
 
 type HttpRequest struct {
 	*http.Request
-	BodyBytes []byte
+	BodyBytes     []byte
+	BodyTruncated bool
 }
 
 type HttpResponse struct {
 	*http.Response
-	BodyBytes []byte
+	BodyBytes     []byte
+	BodyTruncated bool
 }
 
 type HttpTxn struct {
@@ -43,6 +45,14 @@ type Http struct {
 	reqTimer metrics.Timer
 }
 
+var maxCapturedBodyBytes int64 = 1 * 1024 * 1024 // 1 MiB per request/response body
+
+func SetMaxCapturedBodyBytes(limit int64) {
+	if limit > 0 {
+		maxCapturedBodyBytes = limit
+	}
+}
+
 func NewHttp() *Http {
 	return &Http{
 		Txns:     util.NewBroadcast(),
@@ -52,10 +62,22 @@ func NewHttp() *Http {
 	}
 }
 
-func extractBody(r io.Reader) ([]byte, io.ReadCloser, error) {
+func extractBody(r io.Reader) ([]byte, io.ReadCloser, bool, error) {
+	limited := &io.LimitedReader{R: r, N: maxCapturedBodyBytes}
 	buf := new(bytes.Buffer)
-	_, err := buf.ReadFrom(r)
-	return buf.Bytes(), io.NopCloser(buf), err
+	if _, err := buf.ReadFrom(limited); err != nil {
+		return nil, nil, false, err
+	}
+
+	truncated := limited.N == 0
+	if truncated {
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			return nil, nil, true, err
+		}
+	}
+
+	body := buf.Bytes()
+	return body, io.NopCloser(bytes.NewReader(body)), truncated, nil
 }
 
 func (h *Http) GetName() string { return "http" }
@@ -94,7 +116,7 @@ func (h *Http) readRequests(tee *conn.Tee, lastTxn chan *HttpTxn, connCtx interf
 		txn := &HttpTxn{Start: time.Now(), ConnUserCtx: connCtx}
 		txn.Req = &HttpRequest{Request: req}
 		if req.Body != nil {
-			txn.Req.BodyBytes, txn.Req.Body, err = extractBody(req.Body)
+			txn.Req.BodyBytes, txn.Req.Body, txn.Req.BodyTruncated, err = extractBody(req.Body)
 			if err != nil {
 				tee.Warn("Failed to extract request body: %v", err)
 			}
@@ -122,7 +144,7 @@ func (h *Http) readResponses(tee *conn.Tee, lastTxn chan *HttpTxn) {
 		txn.Resp = &HttpResponse{Response: resp}
 		// apparently, Body can be nil in some cases
 		if resp.Body != nil {
-			txn.Resp.BodyBytes, txn.Resp.Body, err = extractBody(resp.Body)
+			txn.Resp.BodyBytes, txn.Resp.Body, txn.Resp.BodyTruncated, err = extractBody(resp.Body)
 			if err != nil {
 				tee.Warn("Failed to extract response body: %v", err)
 			}

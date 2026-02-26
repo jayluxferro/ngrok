@@ -121,6 +121,7 @@ func (v *TermView) draw() {
 func (v *TermView) run() {
 	defer close(v.shutdown)
 	defer termbox.Close()
+	defer v.ctl.Updates().UnReg(v.updates)
 
 	redraw := v.redraw.Reg()
 	defer v.redraw.UnReg(redraw)
@@ -173,7 +174,8 @@ func (v *TermView) input() {
 			v.redraw.In() <- 1
 
 		case termbox.EventError:
-			panic(ev.Err)
+			v.Warn("Termbox error: %v", ev.Err)
+			return
 		}
 	}
 }

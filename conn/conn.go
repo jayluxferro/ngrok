@@ -33,6 +33,7 @@ type loggedConn struct {
 
 type Listener struct {
 	net.Addr
+	net.Listener
 	Conns chan *loggedConn
 }
 
@@ -60,16 +61,18 @@ func Listen(addr, typ string, tlsCfg *tls.Config) (l *Listener, err error) {
 	}
 
 	l = &Listener{
-		Addr:  listener.Addr(),
-		Conns: make(chan *loggedConn),
+		Addr:     listener.Addr(),
+		Listener: listener,
+		Conns:    make(chan *loggedConn),
 	}
 
 	go func() {
+		defer close(l.Conns)
 		for {
 			rawConn, err := listener.Accept()
 			if err != nil {
-				log.Error("Failed to accept new TCP connection of type %s: %v", typ, err)
-				continue
+				// Listener has likely been closed for shutdown.
+				return
 			}
 
 			c := wrapConn(rawConn, typ)
@@ -81,6 +84,10 @@ func Listen(addr, typ string, tlsCfg *tls.Config) (l *Listener, err error) {
 		}
 	}()
 	return
+}
+
+func (l *Listener) Close() error {
+	return l.Listener.Close()
 }
 
 func Wrap(conn net.Conn, typ string) *loggedConn {

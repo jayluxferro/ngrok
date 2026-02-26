@@ -18,6 +18,10 @@ type Configuration struct {
 	HttpProxy          string                          `yaml:"http_proxy,omitempty"`
 	ServerAddr         string                          `yaml:"server_addr,omitempty"`
 	InspectAddr        string                          `yaml:"inspect_addr,omitempty"`
+	InspectAuth        string                          `yaml:"inspect_auth,omitempty"`
+	InspectToken       string                          `yaml:"inspect_token,omitempty"`
+	InspectMaxBodySize int64                           `yaml:"inspect_max_body_bytes,omitempty"`
+	ProxyMaxConcurrent int                             `yaml:"proxy_max_concurrency,omitempty"`
 	TrustHostRootCerts bool                            `yaml:"trust_host_root_certs,omitempty"`
 	AuthToken          string                          `yaml:"auth_token,omitempty"`
 	Tunnels            map[string]*TunnelConfiguration `yaml:"tunnels,omitempty"`
@@ -74,6 +78,12 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	if config.InspectAddr == "" {
 		config.InspectAddr = defaultInspectAddr
 	}
+	if config.InspectMaxBodySize <= 0 {
+		config.InspectMaxBodySize = 1 * 1024 * 1024
+	}
+	if config.ProxyMaxConcurrent <= 0 {
+		config.ProxyMaxConcurrent = 64
+	}
 
 	if config.HttpProxy == "" {
 		config.HttpProxy = os.Getenv("http_proxy")
@@ -102,9 +112,20 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		}
 	}
 
+	if config.InspectAuth != "" && !strings.Contains(config.InspectAuth, ":") {
+		return nil, fmt.Errorf("inspect_auth must be formatted as username:password")
+	}
+	if config.InspectMaxBodySize > 64*1024*1024 {
+		return nil, fmt.Errorf("inspect_max_body_bytes too large (max 67108864)")
+	}
+
 	for name, t := range config.Tunnels {
 		if t == nil || t.Protocols == nil || len(t.Protocols) == 0 {
 			err = fmt.Errorf("Tunnel %s does not specify any protocols to tunnel.", name)
+			return
+		}
+		if t.RemotePort != 0 && len(t.Protocols) != 1 {
+			err = fmt.Errorf("Tunnel %s remote_port requires exactly one protocol (tcp)", name)
 			return
 		}
 
@@ -115,6 +136,15 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			}
 
 			if err = validateProtocol(k, tunnelName); err != nil {
+				return
+			}
+
+			if t.RemotePort != 0 && k != "tcp" {
+				err = fmt.Errorf("Tunnel %s remote_port is only valid for tcp protocol", name)
+				return
+			}
+			if (t.Hostname != "" || t.Subdomain != "") && k == "tcp" {
+				err = fmt.Errorf("Tunnel %s hostname/subdomain are only valid for http/https protocols", name)
 				return
 			}
 		}

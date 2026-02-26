@@ -39,6 +39,7 @@ type Options struct {
 	config    string
 	logto     string
 	loglevel  string
+	logformat string
 	authtoken string
 	httpauth  string
 	hostname  string
@@ -69,6 +70,11 @@ func ParseArgs() (opts *Options, err error) {
 		"log-level",
 		"DEBUG",
 		"The level of messages to log. One of: DEBUG, INFO, WARNING, ERROR")
+
+	logformat := flag.String(
+		"log-format",
+		"text",
+		"Log format: text or json")
 
 	authtoken := flag.String(
 		"authtoken",
@@ -101,6 +107,7 @@ func ParseArgs() (opts *Options, err error) {
 		config:    *config,
 		logto:     *logto,
 		loglevel:  *loglevel,
+		logformat: *logformat,
 		httpauth:  *httpauth,
 		subdomain: *subdomain,
 		protocol:  *protocol,

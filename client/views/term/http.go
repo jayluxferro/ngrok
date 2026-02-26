@@ -52,10 +52,17 @@ func newTermHttpView(ctl mvc.Controller, termView *TermView, proto *proto.Http, 
 
 func (v *HttpView) Run() {
 	updates := v.httpProto.Txns.Reg()
+	defer v.httpProto.Txns.UnReg(updates)
 
 	for {
 		select {
-		case txn := <-updates:
+		case <-v.shutdown:
+			return
+
+		case txn, ok := <-updates:
+			if !ok {
+				return
+			}
 			v.Debug("Got HTTP update")
 			if txn.(*proto.HttpTxn).Resp == nil {
 				v.HttpRequests.Add(txn)

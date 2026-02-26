@@ -2,10 +2,18 @@ package msg
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
+	"io"
 	"ngrok/conn"
 )
+
+var maxMessageSize int64 = 4 * 1024 * 1024 // 4 MiB
+
+func SetMaxMessageSize(size int64) {
+	if size > 0 {
+		maxMessageSize = size
+	}
+}
 
 func readMsgShared(c conn.Conn) (buffer []byte, err error) {
 	c.Debug("Waiting to read message")
@@ -17,8 +25,15 @@ func readMsgShared(c conn.Conn) (buffer []byte, err error) {
 	}
 	c.Debug("Reading message with length: %d", sz)
 
+	if sz <= 0 {
+		return nil, fmt.Errorf("invalid message length: %d", sz)
+	}
+	if sz > maxMessageSize {
+		return nil, fmt.Errorf("message length %d exceeds maximum %d", sz, maxMessageSize)
+	}
+
 	buffer = make([]byte, sz)
-	n, err := c.Read(buffer)
+	n, err := io.ReadFull(c, buffer)
 	c.Debug("Read message %s", buffer)
 
 	if err != nil {
@@ -26,7 +41,7 @@ func readMsgShared(c conn.Conn) (buffer []byte, err error) {
 	}
 
 	if int64(n) != sz {
-		err = errors.New(fmt.Sprintf("Expected to read %d bytes, but only read %d", sz, n))
+		err = fmt.Errorf("expected to read %d bytes, but only read %d", sz, n)
 		return
 	}
 

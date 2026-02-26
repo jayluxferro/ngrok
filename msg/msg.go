@@ -39,6 +39,7 @@ type Auth struct {
 	OS        string
 	Arch      string
 	ClientId  string // empty for new sessions
+	Caps      []string
 }
 
 // A server responds to an Auth message with an
@@ -56,6 +57,7 @@ type AuthResp struct {
 	MmVersion string
 	ClientId  string
 	Error     string
+	Caps      []string
 }
 
 // A client sends this message to the server over the control channel

@@ -15,6 +15,7 @@ import (
 	"ngrok/proto"
 	"ngrok/util"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -33,6 +34,7 @@ type SerializedBody struct {
 	ContentType    string
 	Text           string
 	Length         int
+	Truncated      bool
 	Error          string
 	ErrorOffset    int
 	Form           url.Values
@@ -64,6 +66,8 @@ type WebHttpView struct {
 	state        chan SerializedUiState
 	HttpRequests *util.Ring
 	idToTxn      map[string]*SerializedTxn
+	idToTxnMu    sync.RWMutex
+	shutdown     chan struct{}
 }
 
 type SerializedUiState struct {
@@ -83,6 +87,7 @@ func newWebHttpView(ctl mvc.Controller, wv *WebView, proto *proto.Http) *WebHttp
 		httpProto:    proto,
 		idToTxn:      make(map[string]*SerializedTxn),
 		HttpRequests: util.NewRing(20),
+		shutdown:     make(chan struct{}),
 	}
 	ctl.Go(whv.updateHttp)
 	whv.register()
@@ -90,13 +95,14 @@ func newWebHttpView(ctl mvc.Controller, wv *WebView, proto *proto.Http) *WebHttp
 }
 
 type XMLDoc struct {
-	data []byte `xml:",innerxml"`
+	Data []byte `xml:",innerxml"`
 }
 
-func makeBody(h http.Header, body []byte) SerializedBody {
+func makeBody(h http.Header, body []byte, truncated bool) SerializedBody {
 	b := SerializedBody{
 		Length:      len(body),
 		Text:        base64.StdEncoding.EncodeToString(body),
+		Truncated:   truncated,
 		ErrorOffset: -1,
 	}
 
@@ -146,70 +152,92 @@ func (whv *WebHttpView) updateHttp() {
 	// open channels for incoming http state changes
 	// and broadcasts
 	txnUpdates := whv.httpProto.Txns.Reg()
-	for txn := range txnUpdates {
-		// XXX: it's not safe for proto.Http and this code
-		// to be accessing txn and txn.(req/resp) without synchronization
-		htxn := txn.(*proto.HttpTxn)
+	defer whv.httpProto.Txns.UnReg(txnUpdates)
 
-		// we haven't processed this transaction yet if we haven't set the
-		// user data
-		if htxn.UserCtx == nil {
-			rawReq, err := proto.DumpRequestOut(htxn.Req.Request, true)
-			if err != nil {
-				whv.Error("Failed to dump request: %v", err)
-				continue
+	for {
+		select {
+		case <-whv.shutdown:
+			return
+
+		case txn, ok := <-txnUpdates:
+			if !ok {
+				return
 			}
 
-			body := makeBody(htxn.Req.Header, htxn.Req.BodyBytes)
-			whtxn := &SerializedTxn{
-				Id:      util.RandId(8),
-				HttpTxn: htxn,
-				Req: SerializedRequest{
-					MethodPath: htxn.Req.Method + " " + htxn.Req.URL.Path,
-					Raw:        base64.StdEncoding.EncodeToString(rawReq),
-					Params:     htxn.Req.URL.Query(),
-					Header:     htxn.Req.Header,
-					Body:       body,
-					Binary:     !utf8.Valid(rawReq),
-				},
-				Start:   htxn.Start.Unix(),
-				ConnCtx: htxn.ConnUserCtx.(mvc.ConnectionContext),
-			}
+			// XXX: it's not safe for proto.Http and this code
+			// to be accessing txn and txn.(req/resp) without synchronization
+			htxn := txn.(*proto.HttpTxn)
 
-			htxn.UserCtx = whtxn
-			// XXX: unsafe map access from multiple go routines
-			whv.idToTxn[whtxn.Id] = whtxn
-			// XXX: use return value to delete from map so we don't leak memory
-			whv.HttpRequests.Add(whtxn)
-		} else {
-			rawResp, err := httputil.DumpResponse(htxn.Resp.Response, true)
-			if err != nil {
-				whv.Error("Failed to dump response: %v", err)
-				continue
-			}
+			// we haven't processed this transaction yet if we haven't set the
+			// user data
+			if htxn.UserCtx == nil {
+				rawReq, err := proto.DumpRequestOut(htxn.Req.Request, true)
+				if err != nil {
+					whv.Error("Failed to dump request: %v", err)
+					continue
+				}
 
-			txn := htxn.UserCtx.(*SerializedTxn)
-			body := makeBody(htxn.Resp.Header, htxn.Resp.BodyBytes)
-			txn.Duration = htxn.Duration.Nanoseconds()
-			txn.Resp = SerializedResponse{
-				Status: htxn.Resp.Status,
-				Raw:    base64.StdEncoding.EncodeToString(rawResp),
-				Header: htxn.Resp.Header,
-				Body:   body,
-				Binary: !utf8.Valid(rawResp),
-			}
+				body := makeBody(htxn.Req.Header, htxn.Req.BodyBytes, htxn.Req.BodyTruncated)
+				whtxn := &SerializedTxn{
+					Id:      util.RandId(8),
+					HttpTxn: htxn,
+					Req: SerializedRequest{
+						MethodPath: htxn.Req.Method + " " + htxn.Req.URL.Path,
+						Raw:        base64.StdEncoding.EncodeToString(rawReq),
+						Params:     htxn.Req.URL.Query(),
+						Header:     htxn.Req.Header,
+						Body:       body,
+						Binary:     !utf8.Valid(rawReq),
+					},
+					Start:   htxn.Start.Unix(),
+					ConnCtx: htxn.ConnUserCtx.(mvc.ConnectionContext),
+				}
 
-			payload, err := json.Marshal(txn)
-			if err != nil {
-				whv.Error("Failed to serialized txn payload for websocket: %v", err)
+				htxn.UserCtx = whtxn
+				whv.idToTxnMu.Lock()
+				whv.idToTxn[whtxn.Id] = whtxn
+				whv.idToTxnMu.Unlock()
+
+				if evicted := whv.HttpRequests.Add(whtxn); evicted != nil {
+					if oldTxn, ok := evicted.(*SerializedTxn); ok {
+						whv.idToTxnMu.Lock()
+						delete(whv.idToTxn, oldTxn.Id)
+						whv.idToTxnMu.Unlock()
+					}
+				}
+			} else {
+				rawResp, err := httputil.DumpResponse(htxn.Resp.Response, true)
+				if err != nil {
+					whv.Error("Failed to dump response: %v", err)
+					continue
+				}
+
+				txn := htxn.UserCtx.(*SerializedTxn)
+				body := makeBody(htxn.Resp.Header, htxn.Resp.BodyBytes, htxn.Resp.BodyTruncated)
+				txn.Duration = htxn.Duration.Nanoseconds()
+				txn.Resp = SerializedResponse{
+					Status: htxn.Resp.Status,
+					Raw:    base64.StdEncoding.EncodeToString(rawResp),
+					Header: htxn.Resp.Header,
+					Body:   body,
+					Binary: !utf8.Valid(rawResp),
+				}
+
+				payload, err := json.Marshal(txn)
+				if err != nil {
+					whv.Error("Failed to serialized txn payload for websocket: %v", err)
+				}
+				whv.webview.wsMessages.In() <- payload
 			}
-			whv.webview.wsMessages.In() <- payload
 		}
 	}
 }
 
 func (whv *WebHttpView) register() {
-	http.HandleFunc("/http/in/replay", func(w http.ResponseWriter, r *http.Request) {
+	whv.webview.mux.HandleFunc("/http/in/replay", func(w http.ResponseWriter, r *http.Request) {
+		if !whv.webview.authorized(w, r) {
+			return
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				err := util.MakePanicTrace(r)
@@ -220,7 +248,10 @@ func (whv *WebHttpView) register() {
 
 		r.ParseForm()
 		txnid := r.Form.Get("txnid")
-		if txn, ok := whv.idToTxn[txnid]; ok {
+		whv.idToTxnMu.RLock()
+		txn, ok := whv.idToTxn[txnid]
+		whv.idToTxnMu.RUnlock()
+		if ok {
 			reqBytes, err := base64.StdEncoding.DecodeString(txn.Req.Raw)
 			if err != nil {
 				panic(err)
@@ -232,7 +263,10 @@ func (whv *WebHttpView) register() {
 		}
 	})
 
-	http.HandleFunc("/http/in", func(w http.ResponseWriter, r *http.Request) {
+	whv.webview.mux.HandleFunc("/http/in", func(w http.ResponseWriter, r *http.Request) {
+		if !whv.webview.authorized(w, r) {
+			return
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				err := util.MakePanicTrace(r)
@@ -247,9 +281,10 @@ func (whv *WebHttpView) register() {
 		}
 
 		tmpl := template.Must(template.New("page.html").Delims("{%", "%}").Parse(string(pageTmpl)))
+		filtered := whv.filterTxns(r)
 
 		payloadData := SerializedPayload{
-			Txns:    whv.HttpRequests.Slice(),
+			Txns:    filtered,
 			UiState: SerializedUiState{Tunnels: whv.ctl.State().GetTunnels()},
 		}
 
@@ -263,7 +298,67 @@ func (whv *WebHttpView) register() {
 			panic(err)
 		}
 	})
+
+	whv.webview.mux.HandleFunc("/http/in/export", func(w http.ResponseWriter, r *http.Request) {
+		if !whv.webview.authorized(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]interface{}{
+			"txns": whv.filterTxns(r),
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	})
 }
 
 func (whv *WebHttpView) Shutdown() {
+	close(whv.shutdown)
+}
+
+func (whv *WebHttpView) filterTxns(r *http.Request) []interface{} {
+	methodFilter := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("method")))
+	pathFilter := strings.TrimSpace(r.URL.Query().Get("path"))
+	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
+	containsFilter := strings.TrimSpace(r.URL.Query().Get("contains"))
+
+	items := whv.HttpRequests.Slice()
+	filtered := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		txn, ok := item.(*SerializedTxn)
+		if !ok {
+			continue
+		}
+
+		if pathFilter != "" && !strings.Contains(txn.Req.MethodPath, pathFilter) {
+			continue
+		}
+		if methodFilter != "" {
+			parts := strings.SplitN(txn.Req.MethodPath, " ", 2)
+			method := ""
+			if len(parts) > 0 {
+				method = strings.ToUpper(parts[0])
+			}
+			if method != methodFilter {
+				continue
+			}
+		}
+		if statusFilter != "" {
+			if txn.Resp.Status == "" || !strings.HasPrefix(txn.Resp.Status, statusFilter) {
+				continue
+			}
+		}
+		if containsFilter != "" {
+			if !strings.Contains(strings.ToLower(txn.Req.MethodPath), strings.ToLower(containsFilter)) &&
+				!strings.Contains(strings.ToLower(txn.Req.Body.Text), strings.ToLower(containsFilter)) &&
+				!strings.Contains(strings.ToLower(txn.Resp.Body.Text), strings.ToLower(containsFilter)) {
+				continue
+			}
+		}
+
+		filtered = append(filtered, txn)
+	}
+	return filtered
 }

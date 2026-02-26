@@ -16,6 +16,7 @@ import (
 	"ngrok/version"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -39,7 +40,9 @@ type ClientModel struct {
 
 	id            string
 	tunnels       map[string]mvc.Tunnel
+	tunnelsMu     sync.RWMutex
 	serverVersion string
+	serverCaps    map[string]struct{}
 	metrics       *ClientMetrics
 	updateStatus  mvc.UpdateStatus
 	connStatus    mvc.ConnStatus
@@ -52,6 +55,7 @@ type ClientModel struct {
 	tlsConfig     *tls.Config
 	tunnelConfig  map[string]*TunnelConfiguration
 	configPath    string
+	proxyWorkers  chan struct{}
 }
 
 func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
@@ -99,6 +103,9 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 
 		// config path
 		configPath: config.Path,
+
+		// bounded proxy setup workers
+		proxyWorkers: make(chan struct{}, config.ProxyMaxConcurrent),
 	}
 
 	// configure TLS
@@ -125,6 +132,9 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 	// configure TLS SNI
 	m.tlsConfig.ServerName = serverName(m.serverAddr)
 	m.tlsConfig.InsecureSkipVerify = useInsecureSkipVerify()
+	if m.tlsConfig.InsecureSkipVerify {
+		m.Warn("TLS certificate verification is disabled (NGROK_INSECURE_SKIP_VERIFY=1)")
+	}
 
 	return m
 }
@@ -142,31 +152,34 @@ func serverName(addr string) string {
 }
 
 // mvc.State interface
-func (c ClientModel) GetProtocols() []proto.Protocol { return c.protocols }
-func (c ClientModel) GetClientVersion() string       { return version.MajorMinor() }
-func (c ClientModel) GetServerVersion() string       { return c.serverVersion }
-func (c ClientModel) GetTunnels() []mvc.Tunnel {
+func (c *ClientModel) GetProtocols() []proto.Protocol { return c.protocols }
+func (c *ClientModel) GetClientVersion() string       { return version.MajorMinor() }
+func (c *ClientModel) GetServerVersion() string       { return c.serverVersion }
+func (c *ClientModel) GetTunnels() []mvc.Tunnel {
+	c.tunnelsMu.RLock()
+	defer c.tunnelsMu.RUnlock()
+
 	tunnels := make([]mvc.Tunnel, 0)
 	for _, t := range c.tunnels {
 		tunnels = append(tunnels, t)
 	}
 	return tunnels
 }
-func (c ClientModel) GetConnStatus() mvc.ConnStatus     { return c.connStatus }
-func (c ClientModel) GetUpdateStatus() mvc.UpdateStatus { return c.updateStatus }
+func (c *ClientModel) GetConnStatus() mvc.ConnStatus     { return c.connStatus }
+func (c *ClientModel) GetUpdateStatus() mvc.UpdateStatus { return c.updateStatus }
 
-func (c ClientModel) GetConnectionMetrics() (metrics.Meter, metrics.Timer) {
+func (c *ClientModel) GetConnectionMetrics() (metrics.Meter, metrics.Timer) {
 	return c.metrics.connMeter, c.metrics.connTimer
 }
 
-func (c ClientModel) GetBytesInMetrics() (metrics.Counter, metrics.Histogram) {
+func (c *ClientModel) GetBytesInMetrics() (metrics.Counter, metrics.Histogram) {
 	return c.metrics.bytesInCount, c.metrics.bytesIn
 }
 
-func (c ClientModel) GetBytesOutMetrics() (metrics.Counter, metrics.Histogram) {
+func (c *ClientModel) GetBytesOutMetrics() (metrics.Counter, metrics.Histogram) {
 	return c.metrics.bytesOutCount, c.metrics.bytesOut
 }
-func (c ClientModel) SetUpdateStatus(updateStatus mvc.UpdateStatus) {
+func (c *ClientModel) SetUpdateStatus(updateStatus mvc.UpdateStatus) {
 	c.updateStatus = updateStatus
 	c.update()
 }
@@ -249,6 +262,7 @@ func (c *ClientModel) control() {
 		Version:   version.Proto,
 		MmVersion: version.MajorMinor(),
 		User:      c.authToken,
+		Caps:      []string{"inspect_body_truncation", "inspect_auth"},
 	}
 
 	if err = msg.WriteMsg(ctlConn, auth); err != nil {
@@ -269,6 +283,10 @@ func (c *ClientModel) control() {
 
 	c.id = authResp.ClientId
 	c.serverVersion = authResp.MmVersion
+	c.serverCaps = make(map[string]struct{}, len(authResp.Caps))
+	for _, capName := range authResp.Caps {
+		c.serverCaps[capName] = struct{}{}
+	}
 	c.Info("Authenticated with server, client id: %v", c.id)
 	c.update()
 	if err = SaveAuthToken(c.configPath, c.authToken); err != nil {
@@ -316,7 +334,7 @@ func (c *ClientModel) control() {
 
 		switch m := rawMsg.(type) {
 		case *msg.ReqProxy:
-			c.ctl.Go(c.proxy)
+			c.ctl.Go(c.proxyBounded)
 
 		case *msg.Pong:
 			atomic.StoreInt64(&lastPong, time.Now().UnixNano())
@@ -335,7 +353,9 @@ func (c *ClientModel) control() {
 				Protocol:  c.protoMap[m.Protocol],
 			}
 
+			c.tunnelsMu.Lock()
 			c.tunnels[tunnel.PublicUrl] = tunnel
+			c.tunnelsMu.Unlock()
 			c.connStatus = mvc.ConnOnline
 			c.Info("Tunnel established at %v", tunnel.PublicUrl)
 			c.update()
@@ -344,6 +364,12 @@ func (c *ClientModel) control() {
 			ctlConn.Warn("Ignoring unknown control message %v ", m)
 		}
 	}
+}
+
+func (c *ClientModel) proxyBounded() {
+	c.proxyWorkers <- struct{}{}
+	defer func() { <-c.proxyWorkers }()
+	c.proxy()
 }
 
 // Establishes and manages a tunnel proxy connection with the server
@@ -378,7 +404,9 @@ func (c *ClientModel) proxy() {
 		return
 	}
 
+	c.tunnelsMu.RLock()
 	tunnel, ok := c.tunnels[startPxy.Url]
+	c.tunnelsMu.RUnlock()
 	if !ok {
 		remoteConn.Error("Couldn't find tunnel for proxy: %s", startPxy.Url)
 		return

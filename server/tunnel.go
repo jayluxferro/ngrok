@@ -214,30 +214,57 @@ func (t *Tunnel) Id() string {
 // Listens for new public tcp connections from the internet.
 func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 	for {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Warn("listenTcp failed with error %v", r)
-			}
-		}()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn("listenTcp failed with error %v", r)
+				}
+			}()
 
-		// accept public connections
-		tcpConn, err := listener.AcceptTCP()
+			// accept public connections
+			tcpConn, err := listener.AcceptTCP()
 
-		if err != nil {
-			// not an error, we're shutting down this tunnel
-			if atomic.LoadInt32(&t.closing) == 1 {
+			if err != nil {
+				// not an error, we're shutting down this tunnel
+				if atomic.LoadInt32(&t.closing) == 1 {
+					return
+				}
+
+				t.Error("Failed to accept new TCP connection: %v", err)
 				return
 			}
 
-			t.Error("Failed to accept new TCP connection: %v", err)
-			continue
+			publicConn := conn.Wrap(tcpConn, "pub")
+			publicConn.AddLogPrefix(t.Id())
+			publicConn.Info("New connection from %v", publicConn.RemoteAddr())
+			ip := remoteIP(publicConn.RemoteAddr())
+			if !publicLimiter.allow(ip) {
+				atomic.AddUint64(&rateDropCount, 1)
+				if warnSampler.allow("tcp-rate:" + ip) {
+					publicConn.Warn("Rate-limited TCP public connection from %s", ip)
+				}
+				publicConn.Close()
+				return
+			}
+			if !connLimiter.acquire(ip) {
+				if warnSampler.allow("tcp-cap:" + ip) {
+					publicConn.Warn("Connection cap reached for %s", ip)
+				}
+				publicConn.Close()
+				return
+			}
+			incPublicConns()
+
+			go func(ip string, c conn.Conn) {
+				defer connLimiter.release(ip)
+				defer decPublicConns()
+				t.HandlePublicConnection(c)
+			}(ip, publicConn)
+		}()
+
+		if atomic.LoadInt32(&t.closing) == 1 {
+			return
 		}
-
-		conn := conn.Wrap(tcpConn, "pub")
-		conn.AddLogPrefix(t.Id())
-		conn.Info("New connection from %v", conn.RemoteAddr())
-
-		go t.HandlePublicConnection(conn)
 	}
 }
 

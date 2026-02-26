@@ -9,6 +9,7 @@ import (
 	"ngrok/version"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,6 +63,7 @@ type Control struct {
 
 func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	var err error
+	atomic.AddInt64(&controlConnCount, 1)
 
 	// create the object
 	c := &Control{
@@ -80,6 +82,8 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	failAuth := func(e error) {
 		_ = msg.WriteMsg(ctlConn, &msg.AuthResp{Error: e.Error()})
 		ctlConn.Close()
+		atomic.AddUint64(&authRejectCount, 1)
+		atomic.AddInt64(&controlConnCount, -1)
 	}
 
 	// register the clientid
@@ -106,12 +110,15 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 		clientToken := authMsg.User
 		validToken := false
 		for _, validTokenStr := range opts.authTokens {
-			if clientToken == validTokenStr {
+			if tokenMatches(validTokenStr, clientToken) {
 				validToken = true
 				break
 			}
 		}
 		if !validToken {
+			if warnSampler.allow("auth-invalid") {
+				ctlConn.Warn("Authentication failed: invalid token")
+			}
 			failAuth(fmt.Errorf("Invalid authentication token"))
 			return
 		}
@@ -131,6 +138,7 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 		Version:   version.Proto,
 		MmVersion: version.MajorMinor(),
 		ClientId:  c.id,
+		Caps:      []string{"sha256_tokens", "rate_limits"},
 	}
 
 	// As a performance optimization, ask for a proxy connection up front
@@ -306,6 +314,7 @@ func (c *Control) stopper() {
 
 	c.shutdown.Complete()
 	c.conn.Info("Shutdown complete")
+	atomic.AddInt64(&controlConnCount, -1)
 }
 
 func (c *Control) RegisterProxy(conn conn.Conn) {

@@ -8,6 +8,7 @@ import (
 	"ngrok/conn"
 	"ngrok/log"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +68,25 @@ func httpHandler(c conn.Conn, proto string) {
 
 	// Make sure we detect dead connections while we decide how to multiplex
 	c.SetDeadline(time.Now().Add(connReadTimeout))
+	ip := remoteIP(c.RemoteAddr())
+	if !publicLimiter.allow(ip) {
+		atomic.AddUint64(&rateDropCount, 1)
+		if warnSampler.allow("public-rate:"+ip) {
+			log.Warn("Rate-limited public request from %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return
+	}
+	if !connLimiter.acquire(ip) {
+		if warnSampler.allow("public-cap:"+ip) {
+			log.Warn("Connection cap reached for %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return
+	}
+	defer connLimiter.release(ip)
+	incPublicConns()
+	defer decPublicConns()
 
 	// multiplex by extracting the Host header, the vhost library
 	vhostConn, err := vhost.HTTP(c)

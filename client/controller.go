@@ -8,6 +8,7 @@ import (
 	"ngrok/log"
 	"ngrok/proto"
 	"ngrok/util"
+	"strings"
 	"sync"
 )
 
@@ -158,9 +159,22 @@ func (ctl *Controller) Run(config *Configuration) {
 	// init web ui
 	var webView *web.WebView
 	if config.InspectAddr != "disabled" {
-		webView = web.NewWebView(ctl, config.InspectAddr)
+		var inspectAuth *web.WebAuth
+		if config.InspectAuth != "" || config.InspectToken != "" {
+			inspectAuth = &web.WebAuth{Token: config.InspectToken, RequireAny: true}
+			if config.InspectAuth != "" {
+				parts := strings.SplitN(config.InspectAuth, ":", 2)
+				if len(parts) == 2 {
+					inspectAuth.BasicUser = parts[0]
+					inspectAuth.BasicPass = parts[1]
+				}
+			}
+		}
+		webView = web.NewWebView(ctl, config.InspectAddr, inspectAuth)
 		ctl.AddView(webView)
 	}
+
+	proto.SetMaxCapturedBodyBytes(config.InspectMaxBodySize)
 
 	// init term ui
 	var termView *term.TermView
