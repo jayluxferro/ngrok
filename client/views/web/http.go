@@ -138,6 +138,13 @@ func makeBody(h http.Header, body []byte, truncated bool) SerializedBody {
 
 		case "application/x-www-form-urlencoded":
 			b.Form, err = url.ParseQuery(string(body))
+			if err == nil {
+				for k := range b.Form {
+					if sensitiveField(k) {
+						b.Form[k] = []string{"REDACTED"}
+					}
+				}
+			}
 		}
 	}
 
@@ -176,6 +183,13 @@ func (whv *WebHttpView) updateHttp() {
 					whv.Error("Failed to dump request: %v", err)
 					continue
 				}
+				redactedReq := htxn.Req.Request.Clone(htxn.Req.Request.Context())
+				redactedReq.Header = redactHeaders(htxn.Req.Header)
+				rawReq, err = proto.DumpRequestOut(redactedReq, true)
+				if err != nil {
+					whv.Error("Failed to dump redacted request: %v", err)
+					continue
+				}
 
 				body := makeBody(htxn.Req.Header, htxn.Req.BodyBytes, htxn.Req.BodyTruncated)
 				whtxn := &SerializedTxn{
@@ -185,7 +199,7 @@ func (whv *WebHttpView) updateHttp() {
 						MethodPath: htxn.Req.Method + " " + htxn.Req.URL.Path,
 						Raw:        base64.StdEncoding.EncodeToString(rawReq),
 						Params:     htxn.Req.URL.Query(),
-						Header:     htxn.Req.Header,
+						Header:     redactHeaders(htxn.Req.Header),
 						Body:       body,
 						Binary:     !utf8.Valid(rawReq),
 					},
@@ -206,7 +220,10 @@ func (whv *WebHttpView) updateHttp() {
 					}
 				}
 			} else {
-				rawResp, err := httputil.DumpResponse(htxn.Resp.Response, true)
+				redactedResp := new(http.Response)
+				*redactedResp = *htxn.Resp.Response
+				redactedResp.Header = redactHeaders(htxn.Resp.Header)
+				rawResp, err := httputil.DumpResponse(redactedResp, true)
 				if err != nil {
 					whv.Error("Failed to dump response: %v", err)
 					continue
@@ -218,7 +235,7 @@ func (whv *WebHttpView) updateHttp() {
 				txn.Resp = SerializedResponse{
 					Status: htxn.Resp.Status,
 					Raw:    base64.StdEncoding.EncodeToString(rawResp),
-					Header: htxn.Resp.Header,
+					Header: redactHeaders(htxn.Resp.Header),
 					Body:   body,
 					Binary: !utf8.Valid(rawResp),
 				}
@@ -361,4 +378,31 @@ func (whv *WebHttpView) filterTxns(r *http.Request) []interface{} {
 		filtered = append(filtered, txn)
 	}
 	return filtered
+}
+
+func redactHeaders(in http.Header) http.Header {
+	out := make(http.Header, len(in))
+	for k, v := range in {
+		copied := make([]string, len(v))
+		copy(copied, v)
+		if sensitiveHeader(k) {
+			copied = []string{"REDACTED"}
+		}
+		out[k] = copied
+	}
+	return out
+}
+
+func sensitiveHeader(k string) bool {
+	k = strings.ToLower(strings.TrimSpace(k))
+	switch k {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-ngrok-inspect-token", "x-ngrok-admin-token":
+		return true
+	}
+	return false
+}
+
+func sensitiveField(k string) bool {
+	k = strings.ToLower(strings.TrimSpace(k))
+	return strings.Contains(k, "password") || strings.Contains(k, "passwd") || strings.Contains(k, "token") || strings.Contains(k, "secret") || strings.Contains(k, "key")
 }

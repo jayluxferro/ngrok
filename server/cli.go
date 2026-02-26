@@ -33,6 +33,7 @@ type Options struct {
 }
 
 func parseArgs() *Options {
+	configPath := flag.String("config", "", "Path to ngrokd YAML config file")
 	httpAddr := flag.String("httpAddr", ":80", "Public address for HTTP connections, empty string to disable")
 	httpsAddr := flag.String("httpsAddr", ":443", "Public address listening for HTTPS connections, emptry string to disable")
 	tunnelAddr := flag.String("tunnelAddr", ":4443", "Public address listening for ngrok client")
@@ -68,6 +69,76 @@ func parseArgs() *Options {
 			os.Exit(1)
 		}
 		os.Exit(0)
+	}
+
+	seen := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
+	})
+
+	if *configPath != "" {
+		cfg, err := loadServerConfig(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to read config:", err.Error())
+			os.Exit(1)
+		}
+		if !seen["httpAddr"] && cfg.HttpAddr != "" {
+			*httpAddr = cfg.HttpAddr
+		}
+		if !seen["httpsAddr"] && cfg.HTTPSAddr != "" {
+			*httpsAddr = cfg.HTTPSAddr
+		}
+		if !seen["tunnelAddr"] && cfg.TunnelAddr != "" {
+			*tunnelAddr = cfg.TunnelAddr
+		}
+		if !seen["adminAddr"] && cfg.AdminAddr != "" {
+			*adminAddr = cfg.AdminAddr
+		}
+		if !seen["adminAuth"] && cfg.AdminAuth != "" {
+			*adminAuth = cfg.AdminAuth
+		}
+		if !seen["adminToken"] && cfg.AdminToken != "" {
+			*adminToken = cfg.AdminToken
+		}
+		if !seen["adminRate"] && cfg.AdminRate >= 0 {
+			*adminRate = cfg.AdminRate
+		}
+		if !seen["domain"] && cfg.Domain != "" {
+			*domain = cfg.Domain
+		}
+		if !seen["tlsCrt"] && cfg.TLSCrt != "" {
+			*tlsCrt = cfg.TLSCrt
+		}
+		if !seen["tlsKey"] && cfg.TLSKey != "" {
+			*tlsKey = cfg.TLSKey
+		}
+		if !seen["log"] && cfg.LogTo != "" {
+			*logto = cfg.LogTo
+		}
+		if !seen["log-level"] && cfg.LogLevel != "" {
+			*loglevel = cfg.LogLevel
+		}
+		if !seen["log-format"] && cfg.LogFormat != "" {
+			*logformat = cfg.LogFormat
+		}
+		if !seen["maxMsgBytes"] && cfg.MaxMsgBytes > 0 {
+			*maxMsgBytes = cfg.MaxMsgBytes
+		}
+		if !seen["authRate"] && cfg.AuthRate >= 0 {
+			*authRate = cfg.AuthRate
+		}
+		if !seen["publicRate"] && cfg.PublicRate >= 0 {
+			*publicRate = cfg.PublicRate
+		}
+		if !seen["maxConnPerIP"] && cfg.MaxConnPerIP >= 0 {
+			*maxConnPerIP = cfg.MaxConnPerIP
+		}
+		if !seen["pprof"] && cfg.EnablePprof {
+			*enablePprof = true
+		}
+		if len(cfg.AuthTokens) > 0 && !seen["authToken"] {
+			*authTokensFlag = strings.Join(cfg.AuthTokens, ",")
+		}
 	}
 
 	// Parse auth tokens from comma-separated string

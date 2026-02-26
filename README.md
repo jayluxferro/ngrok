@@ -209,6 +209,7 @@ Options:
   -httpsAddr=:443    HTTPS listening address (for public tunnel traffic)
   -tunnelAddr=:4443  Tunnel control connection address (for ngrok clients, TLS-encrypted)
   -adminAddr=:9090   Admin address for /healthz and /metrics (empty to disable)
+  -config=path       YAML config file for ngrokd options
   -adminAuth=u:p     Basic auth for all admin endpoints
   -adminToken=token  Header token for admin endpoints (X-Ngrok-Admin-Token)
   -adminRate=n       Max admin requests per minute per IP (0 disables)
@@ -262,6 +263,7 @@ Admin endpoints:
 - `/` dashboard (live metrics/tunnels/events)
 - `/healthz` health check
 - `/metrics` JSON counters
+- `/metrics/prometheus` Prometheus text format
 - `/tunnels` per-tunnel stats
 - `/events` SSE event stream
 - `/debug/pprof/*` if `-pprof` is enabled
@@ -282,6 +284,11 @@ For production hardening guidance, see [docs/PRODUCTION_CHECKLIST.md](docs/PRODU
 Run a lightweight local smoke check:
 ```bash
 ./scripts/smoke.sh
+```
+
+Run full local e2e tunnel validation:
+```bash
+./scripts/e2e.sh
 ```
 
 ## Modernization

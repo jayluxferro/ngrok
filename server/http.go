@@ -121,7 +121,7 @@ func httpHandler(c conn.Conn, proto string) {
 	// then fail the request with 401 Not Authorized and request the client reissue the
 	// request with basic authdeny the request
 	if tunnel.req.HttpAuth != "" && auth != tunnel.req.HttpAuth {
-		c.Info("Authentication failed: %s", auth)
+		c.Info("Authentication failed")
 		c.Write([]byte(NotAuthorized))
 		return
 	}
