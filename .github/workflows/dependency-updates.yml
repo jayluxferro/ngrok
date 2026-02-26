@@ -1,0 +1,47 @@
+name: Dependency Updates
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  update-go-modules:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Update dependencies (patch/minor)
+        run: |
+          go get -u ./...
+          go mod tidy
+
+      - name: Run tests
+        run: |
+          make assets
+          go test -tags debug ./main/ngrok ./main/ngrokd ./client ./server ./conn ./msg ./proto ./util ./cache ./log ./version ./client/views/web
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/dependency-updates
+          commit-message: "chore(deps): update Go dependencies"
+          title: "chore(deps): automated dependency updates"
+          body: |
+            Automated weekly dependency update.
+
+            - Updated Go module dependencies via `go get -u ./...`
+            - Ran `go mod tidy`
+            - Ran test suite in debug mode
+          labels: dependencies
+
