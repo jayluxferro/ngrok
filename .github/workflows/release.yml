@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +89,9 @@ jobs:
           # Ensure go-bindata is in PATH
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
       - name: Clean and prepare assets directories
         run: |
           rm -rf client/assets server/assets
@@ -136,6 +140,19 @@ jobs:
           zip ngrok-${{ matrix.suffix }}.zip ngrok-${{ matrix.suffix }}.exe ngrokd-${{ matrix.suffix }}.exe
           sha256sum ngrok-${{ matrix.suffix }}.zip > ngrok-${{ matrix.suffix }}.zip.sha256
           echo "Created: ngrok-${{ matrix.suffix }}.zip"
+
+      - name: Sign archives and checksums
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cd bin
+          for f in ngrok-${{ matrix.suffix }}.tar.gz ngrok-${{ matrix.suffix }}.zip; do
+            if [ -f "$f" ]; then
+              cosign sign-blob --yes --output-signature "${f}.sig" --output-certificate "${f}.pem" "$f"
+              cosign sign-blob --yes --output-signature "${f}.sha256.sig" --output-certificate "${f}.sha256.pem" "${f}.sha256"
+              echo "Signed: $f and ${f}.sha256"
+            fi
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -215,4 +232,3 @@ jobs:
             artifacts/**/*
           draft: false
           prerelease: false
-

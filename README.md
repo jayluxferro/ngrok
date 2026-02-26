@@ -308,6 +308,7 @@ See [LICENSE](LICENSE) file for details.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
+For release notes/changelog entries, use [docs/CHANGELOG_TEMPLATE.md](docs/CHANGELOG_TEMPLATE.md).
 
 ## Related Projects
 
