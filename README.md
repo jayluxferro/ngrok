@@ -264,6 +264,7 @@ Admin endpoints:
 - `/healthz` health check
 - `/metrics` JSON counters
 - `/metrics/prometheus` Prometheus text format
+- `/recommendations` observed-traffic-based flag tuning suggestions
 - `/tunnels` per-tunnel stats
 - `/events` SSE event stream
 - `/debug/pprof/*` if `-pprof` is enabled
@@ -290,6 +291,12 @@ Run full local e2e tunnel validation:
 ```bash
 ./scripts/e2e.sh
 ```
+
+Generate tuning suggestions from production observations:
+```bash
+./scripts/tune-defaults.sh http://127.0.0.1:9090
+```
+Optionally set `NGROK_ADMIN_TOKEN` for authenticated admin APIs.
 
 ## Modernization
 

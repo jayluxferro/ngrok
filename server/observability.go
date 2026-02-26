@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,17 @@ type observabilityStore struct {
 	started time.Time
 	tunnels map[string]*tunnelSnapshot
 	events  *eventHub
+	history []metricsPoint
+}
+
+type metricsPoint struct {
+	At                 time.Time `json:"at"`
+	PublicConnections  int64     `json:"public_connections"`
+	ControlConnections int64     `json:"control_connections"`
+	TunnelsActive      int64     `json:"tunnels_active"`
+	PublicConnOpened   uint64    `json:"public_conn_open_total"`
+	RateDropCount      uint64    `json:"rate_drop_count"`
+	AuthRejectCount    uint64    `json:"auth_reject_count"`
 }
 
 type eventHub struct {
@@ -65,11 +77,13 @@ func (h *eventHub) publish(event map[string]interface{}) {
 }
 
 func newObservabilityStore() *observabilityStore {
-	return &observabilityStore{
+	o := &observabilityStore{
 		started: time.Now().UTC(),
 		tunnels: make(map[string]*tunnelSnapshot),
 		events:  newEventHub(),
 	}
+	go o.sampler()
+	return o
 }
 
 var observe = newObservabilityStore()
@@ -126,4 +140,44 @@ func (o *observabilityStore) snapshots() []tunnelSnapshot {
 
 func (o *observabilityStore) uptimeSeconds() int64 {
 	return int64(time.Since(o.started).Seconds())
+}
+
+func (o *observabilityStore) sampler() {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		p := metricsPoint{
+			At:                 time.Now().UTC(),
+			PublicConnections:  atomic.LoadInt64(&publicConnCount),
+			ControlConnections: atomic.LoadInt64(&controlConnCount),
+			TunnelsActive:      int64(len(o.snapshots())),
+			PublicConnOpened:   atomic.LoadUint64(&publicConnOpenTotal),
+			RateDropCount:      atomic.LoadUint64(&rateDropCount),
+			AuthRejectCount:    atomic.LoadUint64(&authRejectCount),
+		}
+
+		o.mu.Lock()
+		o.history = append(o.history, p)
+		if len(o.history) > 3600 {
+			o.history = o.history[len(o.history)-3600:]
+		}
+		o.mu.Unlock()
+	}
+}
+
+func (o *observabilityStore) historyWindow(windowSeconds int64) []metricsPoint {
+	if windowSeconds <= 0 {
+		windowSeconds = 60
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(windowSeconds) * time.Second)
+
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	out := make([]metricsPoint, 0, len(o.history))
+	for _, p := range o.history {
+		if p.At.After(cutoff) || p.At.Equal(cutoff) {
+			out = append(out, p)
+		}
+	}
+	return out
 }

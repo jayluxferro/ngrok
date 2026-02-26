@@ -20,6 +20,7 @@ Use this checklist before exposing tunnels publicly.
 - Set `-maxMsgBytes` to a conservative value.
 - Set `-authRate`, `-publicRate`, and `-maxConnPerIP` for your traffic profile.
 - Set `inspect_max_body_bytes` to bound in-memory capture size.
+- Use `/recommendations?window=<seconds>` and `scripts/tune-defaults.sh` to adjust defaults from observed production traffic.
 
 Recommended starting values:
 - `-maxMsgBytes=4194304`

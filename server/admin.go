@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,11 +16,12 @@ import (
 )
 
 var (
-	authRejectCount  uint64
-	rateDropCount    uint64
-	publicConnCount  int64
-	publicConnPeak   int64
-	controlConnCount int64
+	authRejectCount     uint64
+	rateDropCount       uint64
+	publicConnCount     int64
+	publicConnOpenTotal uint64
+	publicConnPeak      int64
+	controlConnCount    int64
 )
 
 const adminSessionCookie = "ngrok_admin_session"
@@ -55,6 +57,7 @@ func parseAdminAuth(auth, token string) *adminAuth {
 
 func incPublicConns() {
 	n := atomic.AddInt64(&publicConnCount, 1)
+	atomic.AddUint64(&publicConnOpenTotal, 1)
 	for {
 		peak := atomic.LoadInt64(&publicConnPeak)
 		if n <= peak || atomic.CompareAndSwapInt64(&publicConnPeak, peak, n) {
@@ -145,14 +148,60 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 	}))
 
 	mux.HandleFunc("/metrics", secure(http.MethodGet, true, func(w http.ResponseWriter, r *http.Request) {
+		window := parseInt64Query(r, "window", 60)
+		series := observe.historyWindow(window)
+		rates := rateSummary(series)
+
 		payload := map[string]interface{}{
 			"public_connections":      atomic.LoadInt64(&publicConnCount),
 			"public_connections_peak": atomic.LoadInt64(&publicConnPeak),
 			"control_connections":     atomic.LoadInt64(&controlConnCount),
+			"public_conn_open_total":  atomic.LoadUint64(&publicConnOpenTotal),
 			"auth_reject_count":       atomic.LoadUint64(&authRejectCount),
 			"rate_drop_count":         atomic.LoadUint64(&rateDropCount),
 			"uptime_seconds":          observe.uptimeSeconds(),
 			"tunnels_active":          len(observe.snapshots()),
+			"window_seconds":          window,
+			"rates":                   rates,
+		}
+		if strings.EqualFold(r.URL.Query().Get("detail"), "full") {
+			payload["series"] = series
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+
+	mux.HandleFunc("/recommendations", secure(http.MethodGet, true, func(w http.ResponseWriter, r *http.Request) {
+		window := parseInt64Query(r, "window", 300)
+		series := observe.historyWindow(window)
+		rates := rateSummary(series)
+		peakPublic := int64(0)
+		for _, p := range series {
+			if p.PublicConnections > peakPublic {
+				peakPublic = p.PublicConnections
+			}
+		}
+
+		recommendedPublicRate := int(rates["public_conn_open_rate_per_sec"]*2 + 1)
+		if recommendedPublicRate < 50 {
+			recommendedPublicRate = 50
+		}
+		recommendedConnPerIP := int(float64(peakPublic)*1.5) + 10
+		if recommendedConnPerIP < 50 {
+			recommendedConnPerIP = 50
+		}
+
+		payload := map[string]interface{}{
+			"window_seconds": window,
+			"observed": map[string]interface{}{
+				"peak_public_connections": peakPublic,
+				"rates":                   rates,
+			},
+			"recommended": map[string]interface{}{
+				"publicRate":   recommendedPublicRate,
+				"maxConnPerIP": recommendedConnPerIP,
+				"authRate":     maxInt(opts.authRate, int(rates["auth_reject_rate_per_sec"]*120+30)),
+			},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(payload)
@@ -281,15 +330,69 @@ table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #334155;
 #events{max-height:260px;overflow:auto;white-space:pre}
 </style></head><body>
 <h1>ngrokd observability <a href="/logout" style="color:#93c5fd">logout</a></h1>
+<div class="card">
+  <label>Window:
+    <select id="window"><option value="60">1m</option><option value="300" selected>5m</option><option value="900">15m</option></select>
+  </label>
+  <label>Refresh:
+    <select id="refresh"><option value="2000" selected>2s</option><option value="5000">5s</option><option value="10000">10s</option></select>
+  </label>
+</div>
 <div class="card"><pre id="metrics"></pre></div>
+<div class="card"><pre id="reco"></pre></div>
 <div class="card"><table id="tunnels"><thead><tr><th>URL</th><th>Proto</th><th>Active</th><th>Total</th><th>Bytes In</th><th>Bytes Out</th></tr></thead><tbody></tbody></table></div>
 <div class="card"><div>Events</div><div id="events"></div></div>
 <script>
 async function refresh(){
-  const m=await fetch('/metrics').then(r=>r.json()); document.getElementById('metrics').textContent=JSON.stringify(m,null,2);
+  const w=document.getElementById('window').value;
+  const m=await fetch('/metrics?window='+w).then(r=>r.json()); document.getElementById('metrics').textContent=JSON.stringify(m,null,2);
+  const rec=await fetch('/recommendations?window='+w).then(r=>r.json()); document.getElementById('reco').textContent=JSON.stringify(rec,null,2);
   const t=await fetch('/tunnels').then(r=>r.json()); const tb=document.querySelector('#tunnels tbody'); tb.innerHTML='';
   (t.tunnels||[]).forEach(x=>{const tr=document.createElement('tr'); tr.innerHTML='<td>'+x.url+'</td><td>'+x.protocol+'</td><td>'+x.active_connections+'</td><td>'+x.total_connections+'</td><td>'+x.bytes_in+'</td><td>'+x.bytes_out+'</td>'; tb.appendChild(tr);});
 }
-refresh(); setInterval(refresh,2000);
+let timer=null; function setTimer(){ if(timer) clearInterval(timer); timer=setInterval(refresh, parseInt(document.getElementById('refresh').value)); }
+document.getElementById('refresh').addEventListener('change', setTimer);
+document.getElementById('window').addEventListener('change', refresh);
+refresh(); setTimer();
 const ev=document.getElementById('events'); const es=new EventSource('/events'); es.onmessage=(e)=>{ev.textContent=e.data+'\n'+ev.textContent; if(ev.textContent.length>20000){ev.textContent=ev.textContent.slice(0,20000);} };
 </script></body></html>`
+
+func parseInt64Query(r *http.Request, key string, def int64) int64 {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func rateSummary(series []metricsPoint) map[string]float64 {
+	out := map[string]float64{
+		"public_conn_open_rate_per_sec": 0,
+		"rate_drop_rate_per_sec":        0,
+		"auth_reject_rate_per_sec":      0,
+	}
+	if len(series) < 2 {
+		return out
+	}
+	first := series[0]
+	last := series[len(series)-1]
+	dt := last.At.Sub(first.At).Seconds()
+	if dt <= 0 {
+		return out
+	}
+	out["public_conn_open_rate_per_sec"] = float64(last.PublicConnOpened-first.PublicConnOpened) / dt
+	out["rate_drop_rate_per_sec"] = float64(last.RateDropCount-first.RateDropCount) / dt
+	out["auth_reject_rate_per_sec"] = float64(last.AuthRejectCount-first.AuthRejectCount) / dt
+	return out
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
