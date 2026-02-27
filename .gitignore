@@ -11,6 +11,7 @@ src/ngrok/client/assets/
 src/ngrok/server/assets/
 .idea/
 .DS_Store
+ngrok.log*
 
 # Generated asset files
 client/assets/assets_*.go
