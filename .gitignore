@@ -18,3 +18,5 @@ client/assets/assets_*.go
 server/assets/assets_*.go
 ngrok
 ngrokd
+
+tmp/

@@ -26,6 +26,15 @@ type Tunnel struct {
 	PublicUrl string
 	Protocol  proto.Protocol
 	LocalAddr string
+
+	// Per-tunnel HTTP header policy, carried from the tunnel's configuration
+	// (client/config.go) to whoever builds the rewrite policy. Nothing in this
+	// package interprets these fields; they are pure data.
+	HostHeader           string
+	RequestHeaderAdd     []string
+	RequestHeaderRemove  []string
+	ResponseHeaderAdd    []string
+	ResponseHeaderRemove []string
 }
 
 type ConnectionContext struct {

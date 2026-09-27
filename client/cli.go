@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"ngrok/version"
 	"os"
+	"strings"
 )
 
 const usage1 string = `Usage: %s [OPTIONS] <local port or address>
@@ -47,6 +48,32 @@ type Options struct {
 	subdomain string
 	command   string
 	args      []string
+
+	// HTTP header manipulation. The add/remove flags are repeatable, so they
+	// accumulate into stringLists rather than single values.
+	hostHeader           string
+	requestHeaderAdd     stringList
+	requestHeaderRemove  stringList
+	responseHeaderAdd    stringList
+	responseHeaderRemove stringList
+}
+
+// stringList is a flag.Value that accumulates each occurrence of a repeatable
+// flag; the Go flag package has no repeatable-flag support of its own.
+//
+// Note that Set appends the raw value: splitting "key:value" on the first colon
+// and validating the pieces happens in LoadConfiguration, not here, so that
+// values coming from the command line and from the config file are checked by
+// exactly one code path.
+type stringList []string
+
+func (l *stringList) String() string {
+	return strings.Join(*l, ",")
+}
+
+func (l *stringList) Set(value string) error {
+	*l = append(*l, value)
+	return nil
 }
 
 func ParseArgs() (opts *Options, err error) {
@@ -101,19 +128,49 @@ func ParseArgs() (opts *Options, err error) {
 		"http+https",
 		"The protocol of the traffic over the tunnel {'http', 'https', 'tcp'} (default: 'http+https')")
 
+	hostHeader := flag.String(
+		"host-header",
+		"",
+		"Rewrite the Host header of requests sent to your local server. 'rewrite' rewrites it to the local address's hostname, 'preserve' leaves it unchanged (default), or specify an explicit hostname. (HTTP only)")
+
+	requestHeaderAdd := new(stringList)
+	flag.Var(requestHeaderAdd,
+		"request-header-add",
+		"Header 'key:value' to add to requests sent to your local server. May be given multiple times to add multiple headers. (HTTP only)")
+
+	requestHeaderRemove := new(stringList)
+	flag.Var(requestHeaderRemove,
+		"request-header-remove",
+		"Header key to remove from requests sent to your local server. May be given multiple times to remove multiple headers. (HTTP only)")
+
+	responseHeaderAdd := new(stringList)
+	flag.Var(responseHeaderAdd,
+		"response-header-add",
+		"Header 'key:value' to add to responses returned to the public client. May be given multiple times to add multiple headers. (HTTP only)")
+
+	responseHeaderRemove := new(stringList)
+	flag.Var(responseHeaderRemove,
+		"response-header-remove",
+		"Header key to remove from responses returned to the public client. May be given multiple times to remove multiple headers. (HTTP only)")
+
 	flag.Parse()
 
 	opts = &Options{
-		config:    *config,
-		logto:     *logto,
-		loglevel:  *loglevel,
-		logformat: *logformat,
-		httpauth:  *httpauth,
-		subdomain: *subdomain,
-		protocol:  *protocol,
-		authtoken: *authtoken,
-		hostname:  *hostname,
-		command:   flag.Arg(0),
+		config:               *config,
+		logto:                *logto,
+		loglevel:             *loglevel,
+		logformat:            *logformat,
+		httpauth:             *httpauth,
+		subdomain:            *subdomain,
+		protocol:             *protocol,
+		authtoken:            *authtoken,
+		hostname:             *hostname,
+		hostHeader:           *hostHeader,
+		requestHeaderAdd:     *requestHeaderAdd,
+		requestHeaderRemove:  *requestHeaderRemove,
+		responseHeaderAdd:    *responseHeaderAdd,
+		responseHeaderRemove: *responseHeaderRemove,
+		command:              flag.Arg(0),
 	}
 
 	switch opts.command {

@@ -12,6 +12,7 @@ import (
 	"ngrok/log"
 	"ngrok/msg"
 	"ngrok/proto"
+	"ngrok/rewriter"
 	"ngrok/util"
 	"ngrok/version"
 	"runtime"
@@ -347,10 +348,25 @@ func (c *ClientModel) control() {
 				continue
 			}
 
+			// The tunnel carries its header policy from here on: this is the
+			// last point at which the config that requested the tunnel is
+			// still reachable, and by the time a proxied connection arrives
+			// proxy() has nothing but the tunnel itself (found by public URL).
+			tunnelCfg := reqIdToTunnelConfig[m.ReqId]
+			requestHeaderAdd, requestHeaderRemove := flattenHeaderConfig(tunnelCfg.RequestHeader)
+			responseHeaderAdd, responseHeaderRemove := flattenHeaderConfig(tunnelCfg.ResponseHeader)
+
 			tunnel := mvc.Tunnel{
 				PublicUrl: m.Url,
-				LocalAddr: reqIdToTunnelConfig[m.ReqId].Protocols[m.Protocol],
+				LocalAddr: tunnelCfg.Protocols[m.Protocol],
 				Protocol:  c.protoMap[m.Protocol],
+
+				HostHeader: tunnelCfg.HostHeader,
+
+				RequestHeaderAdd:     requestHeaderAdd,
+				RequestHeaderRemove:  requestHeaderRemove,
+				ResponseHeaderAdd:    responseHeaderAdd,
+				ResponseHeaderRemove: responseHeaderRemove,
 			}
 
 			c.tunnelsMu.Lock()
@@ -437,13 +453,61 @@ Content-Length: %d
 	c.update()
 	m.connTimer.Time(func() {
 		localConn := tunnel.Protocol.WrapConn(localConn, mvc.ConnectionContext{Tunnel: tunnel, ClientAddr: startPxy.ClientAddr})
-		bytesIn, bytesOut := conn.Join(localConn, remoteConn)
+		bytesIn, bytesOut := c.relay(localConn, remoteConn, tunnel, startPxy.ClientAddr)
 		m.bytesIn.Update(bytesIn)
 		m.bytesOut.Update(bytesOut)
 		m.bytesInCount.Inc(bytesIn)
 		m.bytesOutCount.Inc(bytesOut)
 	})
 	c.update()
+}
+
+// relay shuttles bytes between the two legs of a proxied connection until both
+// directions have stopped -- which conn.Join makes happen as soon as either
+// side closes -- and reports how much flowed in each direction. bytesIn counts
+// the public -> local leg and bytesOut the local -> public one, which is what
+// the raw join has always reported and what the byte metrics mean.
+//
+// This is where header rewriting enters the data path (SPEC 5.3), split out of
+// proxy() so that the join can be exercised without a server to register with,
+// a tunnel to look up or a control channel to speak.
+//
+// The direction wiring is the one thing here that is easy to get backwards.
+// Requests flow remoteConn -> localConn and responses flow localConn ->
+// remoteConn, and each rewriter wraps the *source* end of the direction it
+// rewrites: the request rewriter reads remoteConn (the public bytes) and the
+// response rewriter reads localConn (the upstream bytes). Wrapping the source
+// rather than the destination is what keeps back-pressure intact -- the
+// rewriter only ever pulls from the side that is being read anyway.
+//
+// conn.Join's first return value is always the bytes it copied into its first
+// argument from its second, so Join(fromUpstream, toUpstream) reports requests
+// first and responses second: the same order the unwrapped Join(localConn,
+// remoteConn) reports, which is why bytesIn keeps its meaning. The two
+// filtered conns only filter reads; writes, closes and deadlines still go to
+// the connections underneath (rewriter/conn.go), so each leg is closed exactly
+// as the raw join closed it.
+func (c *ClientModel) relay(localConn, remoteConn conn.Conn, tunnel mvc.Tunnel, clientAddr string) (bytesIn, bytesOut int64) {
+	if tunnel.Protocol.GetName() != "http" {
+		// Nothing with a header syntax: TCP tunnels, and any protocol this
+		// client version does not know, keep the byte pipe they always had.
+		return conn.Join(localConn, remoteConn)
+	}
+
+	policy := policyFromTunnel(tunnel, clientAddr)
+	if policy == nil || policy.IsNoop() {
+		// A no-op policy would only copy the bytes the long way round. A live
+		// HTTP tunnel cannot currently produce one -- SPEC 4.3's X-Forwarded
+		// injection is always on, and that alone makes the policy do work --
+		// but the escape hatch stays wired so the decision is stated here
+		// rather than implied by the absence of a check.
+		c.Debug("Tunnel %s: no header rewriting for this connection", tunnel.PublicUrl)
+		return conn.Join(localConn, remoteConn)
+	}
+
+	c.Debug("Tunnel %s: rewriting HTTP headers (host_header=%q)", tunnel.PublicUrl, policy.HostHeader)
+	toUpstream, fromUpstream := rewriter.NewConnPair(remoteConn, localConn, policy)
+	return conn.Join(fromUpstream, toUpstream)
 }
 
 // Hearbeating to ensure our connection ngrokd is still live

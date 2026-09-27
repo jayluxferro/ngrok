@@ -29,12 +29,25 @@ type Configuration struct {
 	Path               string                          `yaml:"-"`
 }
 
+// HeaderConfig is the "key:value" add list / header-name remove list pair used
+// by both request_header and response_header (ngrok v2 config-file shape).
+type HeaderConfig struct {
+	Add    []string `yaml:"add,omitempty"`
+	Remove []string `yaml:"remove,omitempty"`
+}
+
 type TunnelConfiguration struct {
 	Subdomain  string            `yaml:"subdomain,omitempty"`
 	Hostname   string            `yaml:"hostname,omitempty"`
 	Protocols  map[string]string `yaml:"proto,omitempty"`
 	HttpAuth   string            `yaml:"auth,omitempty"`
 	RemotePort uint16            `yaml:"remote_port,omitempty"`
+
+	// HTTP header manipulation. Validated for every tunnel regardless of
+	// protocol, but only applied to http tunnels.
+	HostHeader     string        `yaml:"host_header,omitempty"`
+	RequestHeader  *HeaderConfig `yaml:"request_header,omitempty"`
+	ResponseHeader *HeaderConfig `yaml:"response_header,omitempty"`
 }
 
 func LoadConfiguration(opts *Options) (config *Configuration, err error) {
@@ -149,6 +162,10 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			}
 		}
 
+		if err = validateHeaderPolicy(name, t); err != nil {
+			return
+		}
+
 		// use the name of the tunnel as the subdomain if none is specified
 		if t.Hostname == "" && t.Subdomain == "" {
 			// XXX: a crude heuristic, really we should be checking if the last part
@@ -173,10 +190,13 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	case "default":
 		config.Tunnels = make(map[string]*TunnelConfiguration)
 		config.Tunnels["default"] = &TunnelConfiguration{
-			Subdomain: opts.subdomain,
-			Hostname:  opts.hostname,
-			HttpAuth:  opts.httpauth,
-			Protocols: make(map[string]string),
+			Subdomain:      opts.subdomain,
+			Hostname:       opts.hostname,
+			HttpAuth:       opts.httpauth,
+			Protocols:      make(map[string]string),
+			HostHeader:     opts.hostHeader,
+			RequestHeader:  newHeaderConfig(opts.requestHeaderAdd, opts.requestHeaderRemove),
+			ResponseHeader: newHeaderConfig(opts.responseHeaderAdd, opts.responseHeaderRemove),
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -187,6 +207,12 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			if config.Tunnels["default"].Protocols[proto], err = normalizeAddress(opts.args[0], ""); err != nil {
 				return
 			}
+		}
+
+		// the synthesized tunnel never went through the config-file validation
+		// loop above, so validate what the header flags produced here
+		if err = validateHeaderPolicy("default", config.Tunnels["default"]); err != nil {
+			return
 		}
 
 	// list tunnels
@@ -271,6 +297,133 @@ func validateProtocol(proto, propName string) (err error) {
 	}
 
 	return
+}
+
+const (
+	hostHeaderRewrite  = "rewrite"
+	hostHeaderPreserve = "preserve"
+)
+
+// headerTokenRegexp is the RFC 7230 token grammar for header field names. Any
+// value that fails it (CR/LF, spaces, ':', control bytes, ...) is rejected here,
+// before it can ever reach a header writer.
+var headerTokenRegexp = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
+
+// newHeaderConfig turns the repeatable flag values into a HeaderConfig. It
+// returns nil when both lists are empty so that users who set no header flags
+// keep the exact config they had before (no empty request_header block, and no
+// change to how their config re-marshals).
+func newHeaderConfig(add, remove []string) *HeaderConfig {
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+
+	return &HeaderConfig{Add: add, Remove: remove}
+}
+
+// validateHeaderPolicy validates the header policy of one tunnel. It is called
+// both for tunnels read from the config file and for the CLI-synthesized
+// "default" tunnel. Everything it rejects is a startup error naming the tunnel
+// and the offending entry: there is deliberately no silent fallback.
+func validateHeaderPolicy(tunnelName string, t *TunnelConfiguration) error {
+	if err := validateHostHeader(tunnelName, t.HostHeader); err != nil {
+		return err
+	}
+
+	if t.RequestHeader != nil {
+		if err := validateHeaderConfig(tunnelName, "request_header", t.RequestHeader); err != nil {
+			return err
+		}
+	}
+
+	if t.ResponseHeader != nil {
+		if err := validateHeaderConfig(tunnelName, "response_header", t.ResponseHeader); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateHostHeader accepts the empty value (which means "preserve", the
+// historical behavior), the two keywords, or a plain hostname.
+func validateHostHeader(tunnelName, hostHeader string) error {
+	switch hostHeader {
+	case "", hostHeaderRewrite, hostHeaderPreserve:
+		return nil
+	}
+
+	if strings.ContainsAny(hostHeader, " \t\r\n/") {
+		return fmt.Errorf("Tunnel %s: invalid host_header %q: must be 'rewrite', 'preserve' or a hostname with no spaces, no '/' and no CR/LF",
+			tunnelName, hostHeader)
+	}
+
+	return nil
+}
+
+func validateHeaderConfig(tunnelName, section string, hc *HeaderConfig) error {
+	for _, entry := range hc.Add {
+		if err := validateNoCRLF(tunnelName, section, entry); err != nil {
+			return err
+		}
+
+		// Split on the first colon only, so that values may contain colons
+		// (e.g. "X-Origin: http://example.com").
+		colon := strings.Index(entry, ":")
+		if colon < 0 {
+			return fmt.Errorf("Tunnel %s: %s add entry %q must be formatted as 'key:value'",
+				tunnelName, section, entry)
+		}
+
+		if err := validateHeaderEntry(tunnelName, section, entry, entry[:colon]); err != nil {
+			return err
+		}
+	}
+
+	for _, key := range hc.Remove {
+		if err := validateHeaderEntry(tunnelName, section, key, key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateHeaderEntry checks a single configured header name. entry is the
+// whole configured string, and key the name parsed out of it (equal to entry for
+// removals), so that errors can quote what the user actually wrote.
+func validateHeaderEntry(tunnelName, section, entry, key string) error {
+	if err := validateNoCRLF(tunnelName, section, entry); err != nil {
+		return err
+	}
+
+	if key == "" {
+		return fmt.Errorf("Tunnel %s: %s entry %q has an empty header name", tunnelName, section, entry)
+	}
+
+	if !headerTokenRegexp.MatchString(key) {
+		return fmt.Errorf("Tunnel %s: %s entry %q: %q is not a valid HTTP header name",
+			tunnelName, section, entry, key)
+	}
+
+	// ngrok parity: user-agent is not user-settable in either direction.
+	if strings.EqualFold(key, "user-agent") {
+		return fmt.Errorf("Tunnel %s: %s entry %q: user-agent may not be added or removed",
+			tunnelName, section, entry)
+	}
+
+	return nil
+}
+
+// validateNoCRLF is the header-injection guard: nothing configured here may
+// contain CR or LF, wherever it appears in the string.
+func validateNoCRLF(tunnelName, section, entry string) error {
+	if strings.ContainsAny(entry, "\r\n") {
+		return fmt.Errorf("Tunnel %s: %s entry %q contains a CR or LF (header injection)",
+			tunnelName, section, entry)
+	}
+
+	return nil
 }
 
 func SaveAuthToken(configPath, authtoken string) (err error) {
