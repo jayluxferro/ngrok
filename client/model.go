@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	metrics "github.com/rcrowley/go-metrics"
+	"github.com/xtaci/smux/v2"
 	"io"
 	"math"
 	"net"
@@ -29,7 +30,32 @@ const (
 	pingInterval        = 20 * time.Second
 	maxPongLatency      = 15 * time.Second
 	updateCheckInterval = 6 * time.Hour
-	BadGateway          = `<html>
+
+	// muxCapability is the server capability that switches this client to the
+	// multiplexed transport (SPEC cluster 3, 3.1): every proxy connection is a
+	// stream on one long-lived conn instead of a TCP+TLS dial of its own.
+	// Without it -- a pre-mux server -- the client dials per connection, which
+	// is what it has always done.
+	muxCapability = "proxy-mux"
+
+	// muxMaxAttempts bounds the mux watchdog's consecutive failures: a session
+	// that could not be dialed, or that died before it carried anything. Once
+	// it is reached the mux transport is abandoned for the rest of the control
+	// session and proxy connections are dialed one by one, which is always
+	// correct -- only slower.
+	muxMaxAttempts = 8
+
+	// muxRetryBaseDelay is the first reconnect delay; it doubles per consecutive
+	// failure up to muxMaxRetryDelay.
+	muxRetryBaseDelay = 1 * time.Second
+	muxMaxRetryDelay  = 30 * time.Second
+
+	// muxMinSessionLifetime is how long a mux session must survive to count as
+	// "the transport worked, it just dropped": only a session shorter than this
+	// consumes one of the bounded attempts. Without it, a server that rejects
+	// every mux conn would be redialed in a hot loop forever.
+	muxMinSessionLifetime = 5 * time.Second
+	BadGateway            = `<html>
 <body style="background-color: #97a8b9">
     <div style="margin:auto; width:400px;padding: 20px 60px; background-color: #D3D3D3; border: 5px solid maroon;">
         <h2>Tunnel %s unavailable</h2>
@@ -58,6 +84,12 @@ type ClientModel struct {
 	tunnelConfig  map[string]*TunnelConfiguration
 	configPath    string
 	proxyWorkers  chan struct{}
+
+	// mux session (SPEC 3.1): the single conn every proxy stream travels on,
+	// when the server advertised muxCapability. muxMu guards the slot because
+	// the watchdog replaces it while ReqProxy handlers read it.
+	muxMu sync.Mutex
+	mux   *muxSession
 }
 
 func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
@@ -295,6 +327,23 @@ func (c *ClientModel) control() {
 		c.Error("Failed to save auth token: %v", err)
 	}
 
+	// SPEC 3.1: when the server offers the multiplexed transport, bring up the
+	// mux conn for this control session -- it belongs to the control session and
+	// goes away with it (the watchdog closes it when muxStop closes).
+	//
+	// The first dial happens in the watchdog rather than here on purpose: it is
+	// a second connection to the server, and a server that stalls it must not be
+	// able to hold up the control channel. The cost of that choice is bounded
+	// and small -- the ReqProxy the server sends right after AuthResp is
+	// answered with a dialed proxy conn when it beats the session, and every
+	// later one with a stream.
+	if _, ok := c.serverCaps[muxCapability]; ok {
+		c.Info("Server offers %s; using one multiplexed proxy connection", muxCapability)
+		muxStop := make(chan struct{})
+		defer close(muxStop)
+		go c.muxWatchdog(muxStop, nil)
+	}
+
 	// request tunnels
 	reqIdToTunnelConfig := make(map[string]*TunnelConfiguration)
 	for _, config := range c.tunnelConfig {
@@ -429,8 +478,26 @@ func (c *ClientModel) proxyBounded() {
 	c.proxy()
 }
 
-// Establishes and manages a tunnel proxy connection with the server
+// Establishes and manages a tunnel proxy connection with the server: one stream
+// on the mux session when there is a live one (SPEC 3.1), a conn of its own
+// otherwise.
 func (c *ClientModel) proxy() {
+	if sess := c.muxSession(); sess != nil {
+		if err := c.proxyStream(sess); err == nil {
+			return
+		} else {
+			c.Warn("Mux proxy stream failed (%v), dialing a proxy connection instead", err)
+		}
+	}
+
+	c.proxyDial()
+}
+
+// proxyDial is the original per-connection path: dial the server, register, and
+// relay what the server sends. It is what a server without the mux capability
+// gets, and what serves the window before the mux session is up, while it is
+// being re-established, and after the watchdog gave up.
+func (c *ClientModel) proxyDial() {
 	var (
 		remoteConn conn.Conn
 		err        error
@@ -461,6 +528,58 @@ func (c *ClientModel) proxy() {
 		return
 	}
 
+	c.serveProxyConnection(remoteConn, &startPxy)
+}
+
+// proxyStream answers one ReqProxy with a stream on the mux session: the same
+// RegProxy/StartProxy handshake a dialed proxy conn performs, on a conn that
+// costs no handshake, followed by the very same relay.
+//
+// The error return covers the handshake only. Once the handshake is done and
+// serveProxyConnection has the stream, the connection's lifetime belongs to the
+// server (StartProxy) and the relay: a dead session ends it exactly the way a
+// dropped dialed conn is ended, and it is not retried here. A handshake failure
+// means this stream never carried anything, so the caller is free to dial
+// instead.
+func (c *ClientModel) proxyStream(sess *muxSession) error {
+	stream, err := sess.sess.OpenStream()
+	if err != nil {
+		return fmt.Errorf("failed to open a proxy stream: %v", err)
+	}
+
+	// conn.Wrap's default case is what makes a stream a conn.Conn; after this
+	// line the msg framing, the deadlines and the join are the code the dialed
+	// path runs, unmodified.
+	remoteConn := conn.Wrap(stream, "pxy")
+	if remoteConn == nil {
+		stream.Close()
+		return fmt.Errorf("failed to wrap the proxy stream")
+	}
+	defer remoteConn.Close()
+
+	if err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id}); err != nil {
+		return fmt.Errorf("failed to write RegProxy: %v", err)
+	}
+
+	// wait for the server to ack our register
+	var startPxy msg.StartProxy
+	if err = msg.ReadMsgInto(remoteConn, &startPxy); err != nil {
+		return fmt.Errorf("server failed to write StartProxy: %v", err)
+	}
+
+	c.serveProxyConnection(remoteConn, &startPxy)
+	return nil
+}
+
+// serveProxyConnection is the part of serving a proxy connection that runs once
+// the server has sent StartProxy: find the tunnel it is for, dial the private
+// leg, and relay until both directions stop. It is shared verbatim by the
+// dialed and the mux paths (SPEC 3.1) so that the two transports cannot drift
+// apart: the metrics, the 502 for a dead upstream, the tee/rewriter stack
+// inside relay() and the byte accounting are common to both.
+//
+// The remainder of what used to be proxy()'s body follows, unchanged.
+func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.StartProxy) {
 	c.tunnelsMu.RLock()
 	tunnel, ok := c.tunnels[startPxy.Url]
 	c.tunnelsMu.RUnlock()
@@ -549,6 +668,253 @@ func (c *ClientModel) relay(localConn, remoteConn conn.Conn, tunnel mvc.Tunnel, 
 	c.Debug("Tunnel %s: rewriting HTTP headers (host_header=%q)", tunnel.PublicUrl, policy.HostHeader)
 	toUpstream, fromUpstream := rewriter.NewConnPair(remoteConn, localConn, policy)
 	return conn.Join(fromUpstream, toUpstream)
+}
+
+// muxSession is the client's end of one multiplexed proxy connection (SPEC
+// cluster 3, 3.1): a single TCP+TLS conn to the server carrying every proxy
+// stream, instead of one conn per proxy connection.
+//
+// The session is a shared failure domain -- if it dies, every stream on it dies
+// with it -- so nothing but proxy streams travels over it, and the watchdog
+// below is what makes that acceptable: streams that die mid-flight fail closed,
+// unwinding their joins exactly as a dropped dialed conn does, and a new
+// session is brought up behind them.
+type muxSession struct {
+	log.Logger
+
+	// the conn carrying smux frames, and the session on it
+	conn conn.Conn
+	sess *smux.Session
+
+	// when the session was established, which is what tells a flaky transport
+	// (it lived, then died) from one that never worked (it died at once)
+	established time.Time
+
+	// done is closed once the session is known to be dead; the watchdog waits
+	// on it to know when to reconnect
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// newMuxSession wraps an established smux session and starts the goroutine that
+// turns its death into a closed done channel.
+func newMuxSession(muxConn conn.Conn, sess *smux.Session) *muxSession {
+	m := &muxSession{
+		Logger:      log.NewPrefixLogger("mux"),
+		conn:        muxConn,
+		sess:        sess,
+		established: time.Now(),
+		done:        make(chan struct{}),
+	}
+
+	go m.watch()
+	return m
+}
+
+// watch blocks until the session dies and reports it by closing done.
+//
+// This side opens every proxy stream (the server only ever accepts them), so
+// the accept half of the session exists for exactly this: AcceptStream returns
+// when either end closes the session, when the transport dies, or when smux's
+// keepalive gives up on a peer that stopped answering. Nothing else here would
+// notice any of those before the next stream is attempted.
+func (m *muxSession) watch() {
+	defer close(m.done)
+
+	for {
+		stream, err := m.sess.AcceptStream()
+		if err != nil {
+			m.Info("Mux session closed: %v", err)
+			break
+		}
+
+		// Nothing on the server opens streams to us, so a stream here is a
+		// protocol surprise: close it and keep watching.
+		m.Warn("Closing unexpected stream on the mux session")
+		stream.Close()
+	}
+
+	// Closing the smux session is what fails the streams and closes the conn
+	// underneath; errors from it are noise, because the session is already on
+	// its way out when AcceptStream returns.
+	m.Close()
+}
+
+// Close tears the session down: every stream on it fails and the conn goes
+// away, which is also what unblocks watch() and closes done.
+func (m *muxSession) Close() {
+	m.closeOnce.Do(func() {
+		_ = m.sess.Close()
+		_ = m.conn.Close()
+	})
+}
+
+// muxConfig is the smux configuration for the client side of a mux session.
+//
+// The library defaults are kept -- 10s keepalive, 30s keepalive timeout, 4 MiB
+// receive window, 64 KiB per-stream buffer -- so that both ends run what smux
+// recommends. The keepalive is load-bearing here: it is what turns a server
+// that vanished silently into a dead session, and therefore into a reconnected
+// one, without waiting for a stream to be attempted.
+func muxConfig() *smux.Config {
+	return smux.DefaultConfig()
+}
+
+// dialMuxSession establishes one mux conn to the server: dial it (through the
+// configured http proxy, like every other conn this client opens), declare it
+// with RegMux, and wrap it in an smux client session.
+//
+// RegMux names this client's control session, which is how the server tells the
+// conn apart from a control or a proxy conn; a server that does not know the
+// client id closes the conn, and that shows up here as a session that dies at
+// once, handled like any other mux failure.
+func (c *ClientModel) dialMuxSession() (*muxSession, error) {
+	var (
+		muxConn conn.Conn
+		err     error
+	)
+
+	if c.proxyUrl == "" {
+		muxConn, err = conn.Dial(c.serverAddr, "mux", c.tlsConfig)
+	} else {
+		muxConn, err = conn.DialHttpProxy(c.proxyUrl, c.serverAddr, "mux", c.tlsConfig)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err = msg.WriteMsg(muxConn, &msg.RegMux{ClientId: c.id}); err != nil {
+		muxConn.Close()
+		return nil, err
+	}
+
+	sess, err := smux.Client(muxConn, muxConfig())
+	if err != nil {
+		muxConn.Close()
+		return nil, err
+	}
+
+	return newMuxSession(muxConn, sess), nil
+}
+
+// muxWatchdog owns the mux transport for one control session (SPEC 3.1): it
+// keeps c.mux pointing at a live session, re-establishes it when it dies, and
+// closes it when the control session ends (stop).
+//
+// When it gives up -- muxMaxAttempts consecutive failures, each one a dial that
+// failed or a session that died before carrying anything -- it leaves the slot
+// empty and returns. Every ReqProxy is answered by dialing after that, which is
+// what a pre-mux server gets anyway, so a mux outage costs throughput and never
+// correctness. The next control session starts a fresh watchdog.
+func (c *ClientModel) muxWatchdog(stop <-chan struct{}, sess *muxSession) {
+	attempts := 0
+
+	for {
+		if sess != nil {
+			select {
+			case <-stop:
+				c.Info("Control session ended, closing the mux session")
+				sess.Close()
+				c.clearMuxSession(sess)
+				return
+			case <-sess.done:
+			}
+
+			c.clearMuxSession(sess)
+			lifetime := time.Since(sess.established)
+			if lifetime < muxMinSessionLifetime {
+				// It died before it carried anything, so it counts as a failed
+				// attempt rather than as a working transport that dropped.
+				attempts++
+			} else {
+				attempts = 0
+			}
+			c.Warn("Mux session lost after %s (attempt %d/%d)", lifetime.Round(time.Millisecond), attempts, muxMaxAttempts)
+			sess = nil
+		}
+
+		if attempts >= muxMaxAttempts {
+			c.Error("Giving up on the mux transport after %d failed attempts; proxy connections will be dialed one at a time", attempts)
+			return
+		}
+
+		if attempts > 0 {
+			delay := muxRetryDelay(attempts)
+			c.Info("Waiting %s before reconnecting the mux session", delay)
+			select {
+			case <-time.After(delay):
+			case <-stop:
+				return
+			}
+		}
+
+		newSess, err := c.dialMuxSession()
+		if err != nil {
+			attempts++
+			c.Warn("Failed to establish mux session (attempt %d/%d): %v", attempts, muxMaxAttempts, err)
+			continue
+		}
+
+		// A session established after the control session ended belongs to
+		// nobody (c.id is about to change or the client is about to reconnect):
+		// close it rather than publish it.
+		select {
+		case <-stop:
+			newSess.Close()
+			return
+		default:
+		}
+
+		sess = newSess
+		c.setMuxSession(sess)
+		c.Info("Mux session established with %v", c.serverAddr)
+	}
+}
+
+// muxRetryDelay is how long to wait before the next reconnect attempt:
+// muxRetryBaseDelay doubled per consecutive failure, capped at
+// muxMaxRetryDelay.
+func muxRetryDelay(attempts int) time.Duration {
+	delay := muxRetryBaseDelay
+	for i := 1; i < attempts; i++ {
+		delay *= 2
+		if delay >= muxMaxRetryDelay {
+			return muxMaxRetryDelay
+		}
+	}
+	return delay
+}
+
+// setMuxSession publishes a freshly established session to the ReqProxy path.
+func (c *ClientModel) setMuxSession(s *muxSession) {
+	c.muxMu.Lock()
+	c.mux = s
+	c.muxMu.Unlock()
+}
+
+// clearMuxSession drops a session that has been closed, but only if it is still
+// the one in the slot: a reconnect may already have published its replacement.
+func (c *ClientModel) clearMuxSession(s *muxSession) {
+	c.muxMu.Lock()
+	if c.mux == s {
+		c.mux = nil
+	}
+	c.muxMu.Unlock()
+}
+
+// muxSession returns the session a proxy stream should be opened on, or nil
+// when there is none: no capability, the window before the first session is up,
+// between reconnects, or after the watchdog gave up. A session that is already
+// closed is reported as absent so that the caller dials instead of opening a
+// stream that cannot work.
+func (c *ClientModel) muxSession() *muxSession {
+	c.muxMu.Lock()
+	defer c.muxMu.Unlock()
+
+	if c.mux == nil || c.mux.sess.IsClosed() {
+		return nil
+	}
+	return c.mux
 }
 
 // Hearbeating to ensure our connection ngrokd is still live

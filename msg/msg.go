@@ -15,6 +15,7 @@ func init() {
 	TypeMap["AuthResp"] = t((*AuthResp)(nil))
 	TypeMap["ReqTunnel"] = t((*ReqTunnel)(nil))
 	TypeMap["NewTunnel"] = t((*NewTunnel)(nil))
+	TypeMap["RegMux"] = t((*RegMux)(nil))
 	TypeMap["RegProxy"] = t((*RegProxy)(nil))
 	TypeMap["ReqProxy"] = t((*ReqProxy)(nil))
 	TypeMap["StartProxy"] = t((*StartProxy)(nil))
@@ -109,6 +110,17 @@ type NewTunnel struct {
 // this message over the control channel to the client. When a client receives
 // this message, it must initiate a new proxy connection to the server.
 type ReqProxy struct {
+}
+
+// After authenticating with a server whose AuthResp advertises the "proxy-mux"
+// capability, a client may open one multiplexed connection to the server and
+// send this message over it as its first message, naming the control session
+// (ClientId) the connection belongs to. Every proxy connection for that client
+// then arrives as a stream on this connection, each of which still starts with
+// the RegProxy message it always had; the server replies to a RegMux it cannot
+// attach to a control session by closing the connection.
+type RegMux struct {
+	ClientId string
 }
 
 // After a client receives a ReqProxy message, it opens a new

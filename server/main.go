@@ -113,6 +113,13 @@ func tunnelListener(addr string, tlsConfig *tls.Config) *conn.Listener {
 				case *msg.RegProxy:
 					NewProxy(tunnelConn, m)
 
+				case *msg.RegMux:
+					// A client that multiplexes its proxy connections (SPEC
+					// 3.1) announces that on a fresh conn, exactly like a
+					// control or a proxy conn would; from here on the conn
+					// carries smux frames instead of messages.
+					NewMux(tunnelConn, m)
+
 				default:
 					tunnelConn.Close()
 				}

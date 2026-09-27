@@ -9,6 +9,7 @@ import (
 	"ngrok/version"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -44,6 +45,15 @@ type Control struct {
 
 	// proxy connections
 	proxies chan conn.Conn
+
+	// mux session (SPEC 3.1): the client's multiplexed proxy connection, if it
+	// opened one. Its streams are this control's proxy connections, so it is
+	// attached when the client registers it, replaced when the client
+	// reconnects, and closed when this control shuts down. muxMu guards the
+	// slot: the tunnel listener attaches sessions while the stopper (and the
+	// session's own accept loop) clear them.
+	muxMu sync.Mutex
+	mux   *MuxSession
 
 	// identifier
 	id string
@@ -156,11 +166,15 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	go c.writer()
 
 	// Respond to authentication
+	//
+	// The advertised capabilities are additive: a client that does not know one
+	// ignores it (this client included, until muxCapability arrived), and a
+	// client that knows none of them keeps using the transports it always did.
 	c.out <- &msg.AuthResp{
 		Version:   version.Proto,
 		MmVersion: version.MajorMinor(),
 		ClientId:  c.id,
-		Caps:      []string{"sha256_tokens", "rate_limits"},
+		Caps:      []string{"sha256_tokens", "rate_limits", muxCapability},
 	}
 
 	// As a performance optimization, ask for a proxy connection up front
@@ -328,6 +342,14 @@ func (c *Control) stopper() {
 		t.Shutdown()
 	}
 
+	// tear down the mux session: its streams are this control's proxy
+	// connections (SPEC 3.1) and none of them may outlive it. Closing the
+	// session fails every stream, so the joins on them unwind before the pool
+	// below is drained.
+	if m := c.takeMuxSession(); m != nil {
+		m.Close()
+	}
+
 	// shutdown all of the proxy connections
 	close(c.proxies)
 	for p := range c.proxies {
@@ -337,6 +359,55 @@ func (c *Control) stopper() {
 	c.shutdown.Complete()
 	c.conn.Info("Shutdown complete")
 	atomic.AddInt64(&controlConnCount, -1)
+}
+
+// SetMuxSession attaches a client's multiplexed proxy connection to this
+// control (SPEC 3.1), replacing -- and closing -- whatever session the client
+// had before.
+//
+// A second mux session for one control is what a client that reconnected looks
+// like: the previous one is dead or dying by definition, and its streams must
+// never be handed to a public connection again, so the old session is closed
+// rather than left to be discovered as stale.
+func (c *Control) SetMuxSession(m *MuxSession) {
+	c.muxMu.Lock()
+	old := c.mux
+	c.mux = m
+	c.muxMu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+}
+
+// MuxSession returns this control's mux session, or nil when the client has not
+// registered one (a pre-mux agent, or the window before it does).
+func (c *Control) MuxSession() *MuxSession {
+	c.muxMu.Lock()
+	defer c.muxMu.Unlock()
+	return c.mux
+}
+
+// takeMuxSession detaches and returns the control's mux session, if any, so the
+// caller can close it without holding the lock.
+func (c *Control) takeMuxSession() *MuxSession {
+	c.muxMu.Lock()
+	defer c.muxMu.Unlock()
+
+	m := c.mux
+	c.mux = nil
+	return m
+}
+
+// clearMuxSession drops the control's reference to a session that is closing on
+// its own (its accept loop ended), so that a dead session is not reported as a
+// live one.
+func (c *Control) clearMuxSession(m *MuxSession) {
+	c.muxMu.Lock()
+	if c.mux == m {
+		c.mux = nil
+	}
+	c.muxMu.Unlock()
 }
 
 func (c *Control) RegisterProxy(conn conn.Conn) {

@@ -48,9 +48,20 @@ func wrapConn(conn net.Conn, typ string) *loggedConn {
 		wrapped := &loggedConn{c, conn, log.NewPrefixLogger(), util.GlobalInt31(), typ}
 		wrapped.AddLogPrefix(wrapped.Id())
 		return wrapped
+	default:
+		// Anything else is a net.Conn that is not a TCP connection. The caller
+		// today is the smux multiplexer (SPEC cluster 3, 3.1), which hands us
+		// its streams so that they travel through the whole conn.Conn stack --
+		// msg framing, logging, deadlines, Join -- exactly like the TCP proxy
+		// connections they replace.
+		//
+		// There is no *net.TCPConn to record here, so the tcp field stays nil:
+		// it is only read by CloseRead, which can only mean anything for a TCP
+		// connection and is not called on these conns.
+		wrapped := &loggedConn{nil, conn, log.NewPrefixLogger(), util.GlobalInt31(), typ}
+		wrapped.AddLogPrefix(wrapped.Id())
+		return wrapped
 	}
-
-	return nil
 }
 
 func Listen(addr, typ string, tlsCfg *tls.Config) (l *Listener, err error) {
@@ -199,6 +210,36 @@ func (c *loggedConn) CloseRead() error {
 	return c.tcp.CloseRead()
 }
 
+// joinBufSize is the size of the staging buffer Join hands to io.CopyBuffer, in
+// place of the 32 KiB io.Copy allocates for itself. macOS has no splice(2), so
+// a plain-TCP leg on Darwin pays a userspace hop whatever we do, and a 32 KiB
+// buffer underutilizes a high-BDP link; 256 KiB keeps more of the pipe in
+// flight. On Linux it costs nothing: the legs that can splice (conn/zerocopy.go
+// delegates to the net package) never look at the buffer at all.
+const joinBufSize = 256 * 1024
+
+// joinBufPool is where those buffers come from.
+//
+// A pool, and not one package-level slice, because io.CopyBuffer stages EVERY
+// read through the buffer it is given for the whole life of the copy: a single
+// shared slice is therefore read into by every copy in the process at once.
+// That is not a style preference -- two directions of one join run
+// concurrently, so with a shared slice they overwrite each other's in-flight
+// bytes, which -race reports on the staged leg of
+// TestJoinStagingBufferIsNotShared (conn/zerocopy_test.go). Per-copy buffers
+// cost nothing extra in steady state: the pool holds one buffer per concurrent
+// copy either way and reuses it instead of reallocating.
+//
+// The buffer only matters for legs that expose neither ReadFrom nor WriterTo,
+// because io.CopyBuffer short-circuits to those first. Every *loggedConn now
+// exposes both (conn/zerocopy.go); the legs that do not are the ones wrapped
+// in an interface-embedding adapter -- rewriter's filteredConn, and the tee's
+// read side -- plus anything the net package cannot reach, i.e. TLS legs and
+// smux streams, which is exactly where the larger buffer pays off on Darwin.
+var joinBufPool = sync.Pool{
+	New: func() interface{} { return make([]byte, joinBufSize) },
+}
+
 func Join(c Conn, c2 Conn) (int64, int64) {
 	var wait sync.WaitGroup
 
@@ -207,8 +248,13 @@ func Join(c Conn, c2 Conn) (int64, int64) {
 		defer from.Close()
 		defer wait.Done()
 
+		// One buffer per direction, from the pool: see joinBufPool above for
+		// why this may not be a single shared slice.
+		buf := joinBufPool.Get().([]byte)
+		defer joinBufPool.Put(buf)
+
 		var err error
-		*bytesCopied, err = io.Copy(to, from)
+		*bytesCopied, err = io.CopyBuffer(to, from, buf)
 		if err != nil {
 			from.Warn("Copied %d bytes to %s before failing with error %v", *bytesCopied, to.Id(), err)
 		} else {

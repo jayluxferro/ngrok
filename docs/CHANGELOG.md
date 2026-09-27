@@ -1,4 +1,139 @@
 # Changelog
+## 1.0.4 - 2026-09-27 - Throughput: stream multiplexing, zero-copy legs, bench harness
+
+All three changes go after the same cost: the per-connection setup that every
+short-lived public request pays today. No numbers are quoted in this entry -- the
+harness described in the last section is how they are measured, against the
+pre-change binaries, and the figures belong here once they are in.
+
+### Stream multiplexing (smux)
+
+Public connections are now carried as streams over **one** long-lived
+multiplexed connection per client session, instead of dialing `tunnelAddr` again
+for each one. The old path paid a TCP connection (and its TLS handshake), an
+`Auth` build, and a `RegProxy` -> `StartProxy` round trip for every public
+connection; a stream costs a frame on a session that is already up.
+
+The handshake is negotiated, not assumed. ngrokd advertises a `proxy-mux`
+capability in `AuthResp.Caps`; a client that sees it opens the mux connection
+once after auth and registers it with `RegMux{ClientId}`. From then on its
+`ReqProxy` handler opens a stream instead of dialing, and a stream's first
+message is still `RegProxy{ClientId}`, validated against the session's id. Every
+component downstream of the proxy connection -- the local dial, the tee, the
+header rewriter, gzip, `conn.Join`, pooling -- is unchanged, because a stream is
+wrapped into the same `conn.Conn` a TCP proxy connection was. Multiplexing
+removes setup round trips; it does not touch the data path.
+
+The wire addition is additive and the capability gates it, so there is no
+version bump and no flag day:
+
+- An agent that does not negotiate `proxy-mux` (any build before this one) keeps
+  using the per-connection proxy pool, and ngrokd serves both kinds of client at
+  the same time. A deployment upgrades and downgrades one agent at a time.
+- Both paths can be live in one process, so a rolling restart cannot strand a
+  client on a path the server no longer serves.
+
+**The mux connection is a shared failure domain, and that is the real cost of
+this change.** Every stream on it dies with it: a network blip, a stalled
+connection, or a server restart takes down all of that agent's in-flight public
+connections at once, where the old per-connection path lost at most the one
+connection that was in flight. The agent watches the session and reconnects with
+bounded retries, so new requests recover on their own, but requests that were in
+flight are **dropped, not replayed** -- nothing above the transport knows whether
+a half-written request is safe to send again. On a lossy network this trades
+setup latency for a coarser blast radius; the per-connection path is the safer
+choice if that trade is not acceptable yet.
+
+Smaller costs worth knowing: smux buffers per stream (window memory that grows
+with concurrent streams), and the number of streams a session will carry is
+bounded by smux's defaults rather than by a setting of ours.
+
+### Zero-copy copy legs
+
+The wrapped connection now implements `ReadFrom` and `WriteTo`, delegating to the
+underlying `*net.TCPConn` when there is one. That is enough for `io.Copy` to
+reach `splice(2)` on Linux, so the tunnel legs move bytes between sockets in the
+kernel instead of through a userspace buffer. `conn.Join` also stops copying
+through 32 KiB buffers and uses a 256 KiB one.
+
+Two honest qualifications:
+
+- `splice` only happens when both legs are plain TCP and nothing sits between
+  them. The tee, the header rewriter and gzip all run on `conn.Conn`, so a tunnel
+  with compression on (the default) or a tee in the path cannot be splice-only --
+  the copy falls back to userspace for those legs.
+- macOS has no `splice(2)`, which is where this fork is developed and where the
+  harness is run. There the visible change is the larger buffer, not zero-copy;
+  a macOS benchmark cannot show the Linux win, so do not read a small macOS
+  improvement as "the splice path does not work".
+
+### Benchmark harness
+
+New `scripts/bench.sh`, a deterministic end-to-end benchmark: a python upstream
+on loopback, a real ngrokd, a real agent, and three scenarios measured through
+the live tunnel.
+
+| scenario | what it measures |
+|---|---|
+| bulk | 64 MiB of incompressible random bytes to `/dev/null`, MiB/s, median of 3 runs |
+| conn-rate | 200 sequential requests with `Connection: close`, req/s plus p50/p95 per-request wall time |
+| keep-alive | 1000 requests in one curl invocation, req/s, plus the number of TCP connections curl actually had to open |
+
+```
+bash scripts/bench.sh                        # build the working tree (-tags debug) and run once
+bash scripts/bench.sh baseline_dir current_dir
+```
+
+The two-directory form (each directory holding an `ngrok` and an `ngrokd`) prints
+`BASELINE | CURRENT | DELTA` and is the point of the thing: the pre-mux binaries
+live in `/tmp/bench-baseline` and the comparison is what says whether the
+multiplexing work paid off. Numbers also land in `/tmp/ngrok-bench-result.json`
+for anything that wants to parse them, and per-variant logs in
+`/tmp/ngrok-bench-*.log`.
+
+Three details that make the table readable, because each one is a way a
+benchmark lies:
+
+- The bulk body is random and seeded, so it is reproducible but cannot be
+  compressed into a flattering number; the request counts and body size are
+  constants, not flags, so two runs are comparable.
+- The keep-alive row reports connections opened next to req/s. `1000 requests
+  over 1 connection` and `1000 requests over 1000 connections` both produce a
+  large req/s, and only the second is a failure to reuse anything.
+- Scenarios validate themselves (byte counts and HTTP status codes are checked
+  before a number is reported) and the harness exits non-zero if one fails, so a
+  broken run fails loudly instead of printing a fast number.
+
+The harness owns ports 18180 / 15443 / 19101 / 19190, deliberately disjoint from
+`scripts/e2e.sh`'s 18080 / 14443 / 19001+, so both can run at once. Its own
+sanity check is to point it at the same binaries twice: on an idle machine the
+deltas sit near zero, and on a busy one they can still reach 10-15%, which is the
+noise floor a claimed win has to clear. The two directories are measured one
+after the other rather than side by side (they need the same ports), so a machine
+that changes speed mid-run shows up in the table as a delta -- worth knowing
+before reading a small one as a regression.
+
+### Measured (loopback, macOS)
+
+The harness was run twice in opposite orders and the results averaged: the
+measurement machine showed a sequential order effect of 20-40% between runs,
+so a single ordering's deltas are not trustworthy on their own.
+
+| scenario | pre-mux | mux | delta |
+|---|---:|---:|---:|
+| short-lived connections | 554 req/s | 641 req/s | **+15.7%** |
+| short-lived p95 latency | 2.95 ms | 1.86 ms | **-37%** |
+| keep-alive | ~3,500 req/s | ~3,450 req/s | neutral |
+| bulk 64 MiB | ~590 MiB/s | ~618 MiB/s | within noise |
+
+Interpretation: over loopback a TCP handshake already costs well under a
+millisecond, which bounds the multiplexing win; the p95 improvement is the
+part that survives. The win grows with network round-trip time: where a real
+connection pays two RTTs of setup, a stream pays one frame on an established
+session. The zero-copy `splice` leg cannot be measured on macOS at all -- it
+only fires on Linux with plain-TCP legs, and the bulk scenario's incompressible
+body is gzip-bound in both variants.
+
 ## 1.0.3 - 2026-09-27 - Internal endpoints, forward_to, endpoint pooling, response compression
 
 ### Added

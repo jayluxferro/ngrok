@@ -459,6 +459,14 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn) {
 
 	// To reduce latency handling tunnel connections, we employ the following curde heuristic:
 	// Whenever we take a proxy connection from the pool, replace it with a new one
+	//
+	// The pool does not care which transport a replacement arrives on: a client
+	// that multiplexes answers this ReqProxy with a stream on its mux session,
+	// a client that does not answers it with a fresh dial, and both are
+	// registered into the pool by the same RegisterProxy call (SPEC 3.1). The
+	// refill policy is therefore unchanged -- one conn per outstanding request,
+	// plus one when the pool is empty (GetProxy) -- and only the cost of a
+	// refill differs: no TCP+TLS handshake, no setup round trip.
 	util.PanicToError(func() { t.ctl.out <- &msg.ReqProxy{} })
 
 	// no timeouts while connections are joined
