@@ -167,46 +167,65 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Assemble release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          V="${VERSION#v}"
+          awk -v v="$V" '
+            /^## / {
+              if (found) exit
+              if (index($0, "## " v " ") == 1) { found = 1; print }
+              next
+            }
+            found { print }
+          ' docs/CHANGELOG.md > /tmp/release_notes.md
+
+          if [ ! -s /tmp/release_notes.md ]; then
+            printf '## Release %s\n\nSee the repository changelog for details.\n' "$VERSION" > /tmp/release_notes.md
+          fi
+
+          cat >> /tmp/release_notes.md <<'EOF'
+
+          ### Downloads
+
+          **Client and Server binaries for all supported platforms:**
+
+          | Platform | Architecture | Download |
+          |----------|-------------|----------|
+          | Linux | amd64 | [ngrok-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-amd64.tar.gz) |
+          | Linux | arm64 | [ngrok-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm64.tar.gz) |
+          | Linux | 386 | [ngrok-linux-386.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-386.tar.gz) |
+          | Linux | arm | [ngrok-linux-arm.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm.tar.gz) |
+          | macOS | amd64 | [ngrok-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-amd64.tar.gz) |
+          | macOS | arm64 | [ngrok-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-arm64.tar.gz) |
+          | Windows | amd64 | [ngrok-windows-amd64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-amd64.zip) |
+          | Windows | arm64 | [ngrok-windows-arm64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-arm64.zip) |
+          | Windows | 386 | [ngrok-windows-386.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-386.zip) |
+          | FreeBSD | amd64 | [ngrok-freebsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-amd64.tar.gz) |
+          | FreeBSD | arm64 | [ngrok-freebsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-arm64.tar.gz) |
+          | OpenBSD | amd64 | [ngrok-openbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-amd64.tar.gz) |
+          | OpenBSD | arm64 | [ngrok-openbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-arm64.tar.gz) |
+          | NetBSD | amd64 | [ngrok-netbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-amd64.tar.gz) |
+          | NetBSD | arm64 | [ngrok-netbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-arm64.tar.gz) |
+
+          ### Installation
+
+          Extract the archive for your platform and architecture, then:
+
+          - **Client**: `./ngrok` (or `ngrok.exe` on Windows)
+          - **Server**: `./ngrokd` (or `ngrokd.exe` on Windows)
+
+          ### Checksums
+
+          SHA256 checksums are included with each release archive.
+          EOF
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
-          body: |
-            ## Release ${{ steps.version.outputs.version }}
-
-            ### Downloads
-
-            **Client and Server binaries for all supported platforms:**
-
-            | Platform | Architecture | Download |
-            |----------|-------------|----------|
-            | Linux | amd64 | [ngrok-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-amd64.tar.gz) |
-            | Linux | arm64 | [ngrok-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm64.tar.gz) |
-            | Linux | 386 | [ngrok-linux-386.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-386.tar.gz) |
-            | Linux | arm | [ngrok-linux-arm.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-linux-arm.tar.gz) |
-            | macOS | amd64 | [ngrok-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-amd64.tar.gz) |
-            | macOS | arm64 | [ngrok-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-darwin-arm64.tar.gz) |
-            | Windows | amd64 | [ngrok-windows-amd64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-amd64.zip) |
-            | Windows | arm64 | [ngrok-windows-arm64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-arm64.zip) |
-            | Windows | 386 | [ngrok-windows-386.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-windows-386.zip) |
-            | FreeBSD | amd64 | [ngrok-freebsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-amd64.tar.gz) |
-            | FreeBSD | arm64 | [ngrok-freebsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-freebsd-arm64.tar.gz) |
-            | OpenBSD | amd64 | [ngrok-openbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-amd64.tar.gz) |
-            | OpenBSD | arm64 | [ngrok-openbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-openbsd-arm64.tar.gz) |
-            | NetBSD | amd64 | [ngrok-netbsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-amd64.tar.gz) |
-            | NetBSD | arm64 | [ngrok-netbsd-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/ngrok-netbsd-arm64.tar.gz) |
-
-            ### Installation
-
-            Extract the archive for your platform and architecture, then:
-
-            - **Client**: `./ngrok` (or `ngrok.exe` on Windows)
-            - **Server**: `./ngrokd` (or `ngrokd.exe` on Windows)
-
-            ### Checksums
-
-            SHA256 checksums are included with each release archive.
+          body_path: /tmp/release_notes.md
           files: |
             artifacts/**/*
           draft: false
