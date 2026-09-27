@@ -7,6 +7,8 @@ import (
 	"ngrok/conn"
 	"ngrok/log"
 	"ngrok/msg"
+	"ngrok/policy"
+	"ngrok/rewriter"
 	"ngrok/util"
 	"os"
 	"strconv"
@@ -51,6 +53,12 @@ type Tunnel struct {
 	// endpoints and scopes forward_to resolution.
 	owner string
 
+	// policy is this endpoint's traffic policy, compiled once at registration
+	// (SPEC 3.3). Nil means the endpoint has none. It is immutable and shared
+	// by every connection of the tunnel; the per-connection state a policy
+	// needs (its vars) lives in the hooks, which are built per connection.
+	policy *policy.Compiled
+
 	// logger
 	log.Logger
 
@@ -70,6 +78,44 @@ func (t *Tunnel) forwardTo() string {
 		return ""
 	}
 	return t.req.ForwardTo
+}
+
+// policyFor returns the compiled policy that governs a connection arriving at
+// this tunnel and terminating at target (which is this tunnel itself when it
+// has no forward_to).
+//
+// The entry endpoint's policy comes first, and the terminus's is the fallback.
+// The spec says "the target's policy", which is the right answer for the plain
+// case -- they are the same tunnel -- but an entry endpoint with a forward_to
+// would then silently skip its own policy, and an endpoint an operator has
+// written a policy for is the last one that should have it ignored. Since the
+// fallback only applies when the entry has no policy at all, nothing is
+// overridden by it: a policy the operator attached to a public endpoint keeps
+// running, and a policy attached only to the internal endpoint still protects
+// it.
+func (t *Tunnel) policyFor(target *Tunnel) *policy.Compiled {
+	if t != nil && t.policy != nil {
+		return t.policy
+	}
+	if target != nil {
+		return target.policy
+	}
+	return nil
+}
+
+// connectVerdict runs the endpoint's on_tcp_connect phase against a public
+// connection and returns what it decided. It is nil-safe in both the policy and
+// the receiver -- no policy is the common case and costs one nil check -- and
+// it does not log: the caller decides how a refusal looks in its protocol.
+func (t *Tunnel) connectVerdict(c conn.Conn) policy.ConnectVerdict {
+	if t == nil {
+		return policy.ConnectVerdict{}
+	}
+	pol := t.policyFor(t)
+	if pol == nil {
+		return policy.ConnectVerdict{}
+	}
+	return pol.EvaluateConnect(c.RemoteAddr().String())
 }
 
 // Common functionality for registering virtually hosted protocols
@@ -150,6 +196,17 @@ func NewTunnel(m *msg.ReqTunnel, ctl *Control) (t *Tunnel, err error) {
 
 	if err = t.validateRequest(); err != nil {
 		return
+	}
+
+	// Compile the traffic policy before the tunnel claims its url, so that a
+	// policy the server cannot enforce fails the registration instead of
+	// leaving an endpoint that looks protected and is not (SPEC 3.3). The
+	// work is done once per tunnel, not once per connection.
+	if !m.TrafficPolicy.IsZero() {
+		if t.policy, err = m.TrafficPolicy.Compile(); err != nil {
+			err = fmt.Errorf("invalid traffic policy: %w", err)
+			return
+		}
 	}
 
 	if err = t.register(); err != nil {
@@ -402,7 +459,19 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 						member = m
 					}
 				}
-				member.HandlePublicConnection(c)
+
+				// The endpoint's on_tcp_connect phase, before an agent is
+				// asked for a proxy connection at all (SPEC 3.3). A TCP
+				// client has no protocol to be answered in, so a refusal is
+				// the connection closing: the response the verdict carries is
+				// for the HTTP path, where it means something.
+				if v := member.connectVerdict(c); v.Deny {
+					c.Info("Traffic policy refused the connection: %s", v.Reason)
+					c.Close()
+					return
+				}
+
+				member.HandlePublicConnection(c, member.policyFor(member))
 			}(ip, publicConn)
 		}()
 
@@ -412,7 +481,14 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 	}
 }
 
-func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn) {
+// HandlePublicConnection serves one public connection over a proxy connection
+// taken from the pool, joining the two until either side closes.
+//
+// pol is the endpoint's compiled traffic policy (nil when it has none). It is
+// passed in rather than read off the receiver because the connection is served
+// by whichever tunnel terminates a forward_to chain, and the policy that
+// governs it was decided by the caller (see policyFor).
+func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compiled) {
 	defer publicConn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -473,7 +549,45 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn) {
 	proxyConn.SetDeadline(time.Time{})
 
 	// join the public and proxy connections
-	bytesIn, bytesOut := conn.Join(publicConn, proxyConn)
+	bytesIn, bytesOut := t.join(publicConn, proxyConn, pol)
 	metrics.CloseConnection(t, publicConn, startTime, bytesIn, bytesOut)
 	observe.onConnClose(t, bytesIn, bytesOut)
+}
+
+// join shuttles bytes between a public connection and the proxy connection
+// that carries it to the agent, running the endpoint's traffic policy over the
+// heads in both directions.
+//
+// The join direction mirrors the client's (client/model.go, relay): each
+// rewriter wraps the *source* end of the direction it rewrites -- the request
+// rewriter reads the public connection, the response rewriter reads the proxy
+// connection -- and conn.Join(fromUpstream, toUpstream) therefore reports
+// requests first and responses second, the same order the raw join reported,
+// so bytesIn keeps its meaning.
+//
+// The server's rewriter policy carries the hooks and nothing else. Host
+// rewriting, X-Forwarded-For injection and response compression are the
+// client's work (its own rewriter does them on the way out), and doing them
+// again here would do them twice on the same bytes. Without a policy the raw
+// join runs, which is the path this server took before policies existed.
+func (t *Tunnel) join(publicConn, proxyConn conn.Conn, pol *policy.Compiled) (bytesIn, bytesOut int64) {
+	if pol == nil {
+		return conn.Join(publicConn, proxyConn)
+	}
+
+	// The hooks are built per connection: they hold that connection's vars.
+	// A phase with no actions produces no hook, and if neither phase has any,
+	// the connection takes the raw join.
+	clientAddr := publicConn.RemoteAddr().String()
+	reqHook := pol.RequestHook(t, clientAddr)
+	respHook := pol.ResponseHook(t, clientAddr)
+	if reqHook == nil && respHook == nil {
+		return conn.Join(publicConn, proxyConn)
+	}
+
+	toUpstream, fromUpstream := rewriter.NewConnPair(publicConn, proxyConn, &rewriter.Policy{
+		RequestHook:  reqHook,
+		ResponseHook: respHook,
+	})
+	return conn.Join(fromUpstream, toUpstream)
 }

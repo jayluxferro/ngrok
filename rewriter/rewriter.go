@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/textproto"
 	"strconv"
 	"strings"
@@ -82,6 +83,139 @@ type Policy struct {
 	ClientAddr   string // from StartProxy.ClientAddr
 
 	XForwardedProto string // "http" | "https"
+
+	// RequestHook and ResponseHook are the extension points of the traffic
+	// policy engine (spec cluster 4, 3.1): the policy package implements them,
+	// this package only knows when to call them. Both are nil-safe -- a nil
+	// hook, or a hook returning a nil verdict, leaves the head exactly as the
+	// static policy left it -- and both are called with a head-only object
+	// built from the parsed head bytes.
+	//
+	// The objects are built with http.ReadRequest / http.ReadResponse over the
+	// head bytes alone, so the body fields are not meaningful: the stream is
+	// still sitting in this connection's buffer and is copied, or not, after
+	// the verdict is applied. For a request only Method, URL, Host, Header and
+	// Proto are populated; for a response only StatusCode, Header and Proto
+	// are. Anything else on the object -- Body, ContentLength, RemoteAddr,
+	// RequestURI, TLS -- is the zero value that reader produced, not something
+	// read from the wire.
+	//
+	// RequestHook may also terminate the request (see RequestVerdict): the
+	// connection is answered from the edge, the request never reaches the
+	// upstream, and the rest of the connection is closed rather than parsed.
+	RequestHook  func(req *http.Request) *RequestVerdict
+	ResponseHook func(resp *http.Response) *ResponseVerdict
+}
+
+// SyntheticResponse is a response the edge fabricates without consulting the
+// upstream: what a terminating traffic policy action (deny, custom-response, a
+// restrict-ips rejection) sends back to a public client.
+//
+// It is rendered as one complete HTTP/1.1 message -- status line, Headers,
+// Content-Length, Connection: close, Body -- because the connection ends with
+// it. Headers are "Key: value" entries, the same shape an add entry has; a
+// Content-Length or Connection entry of the caller's is ignored, since the
+// renderer writes its own. A zero StatusCode renders as 403.
+type SyntheticResponse struct {
+	StatusCode int
+	Headers    []string // "Key: value"
+	Body       string
+}
+
+// RequestVerdict is what a request hook returns: what to change about the
+// request head, or that the request must not be forwarded at all.
+type RequestVerdict struct {
+	// Terminate, when non-nil, means the request is answered by the edge: the
+	// head is not forwarded, the client gets this response instead, and the
+	// connection is closed after it. Nothing else in the verdict is applied.
+	Terminate *SyntheticResponse
+
+	// Add entries ("Key: value") are appended after the static policy's own
+	// adds; Remove names are dropped case-insensitively, before those adds.
+	Add    []string
+	Remove []string
+}
+
+// ResponseVerdict is what a response hook returns: what to change about the
+// response head. Add entries are appended after the static policy's, Remove
+// names are dropped case-insensitively before them.
+type ResponseVerdict struct {
+	Add    []string
+	Remove []string
+}
+
+// Render renders a synthetic response as one complete HTTP/1.1 message. It is
+// what the rewriter emits for a terminated request, and what a server writes
+// for a connection its connect phase refused, so both paths produce the same
+// bytes for the same verdict.
+//
+// HTTP/1.1 is used whatever the request's version was: every response field
+// here (Content-Length, Connection: close) is defined the same way in 1.0, and
+// a 1.0 client reads the message by its Content-Length regardless of the
+// version we name.
+//
+// Entries that Validate would have rejected -- an unsplittable string, a name
+// that is not a token, a value with a CR or LF in it -- are dropped rather than
+// emitted: this is the last place before the wire, and a smuggled CRLF would be
+// a response splitting bug, not a misconfiguration.
+func (s *SyntheticResponse) Render() []byte {
+	status := s.statusCode()
+	out := make([]byte, 0, 128+len(s.Body))
+	out = append(out, "HTTP/1.1 "...)
+	out = strconv.AppendInt(out, int64(status), 10)
+	out = append(out, ' ')
+	out = append(out, http.StatusText(status)...)
+	out = append(out, '\r', '\n')
+	for _, entry := range s.Headers {
+		name, value, ok := splitAddEntry(entry)
+		if !ok || !isToken(name) || strings.ContainsAny(value, "\r\n") {
+			continue
+		}
+		if strings.EqualFold(name, "content-length") || strings.EqualFold(name, "connection") {
+			continue // framing is ours to write, and only one of each is allowed
+		}
+		out = appendHeaderLine(out, name, value)
+	}
+	out = appendHeaderLine(out, "Content-Length", strconv.Itoa(len(s.Body)))
+	out = appendHeaderLine(out, "Connection", "close")
+	out = append(out, '\r', '\n')
+	return append(out, s.Body...)
+}
+
+// statusCode is the status this response is rendered with: Render's own default
+// of 403 for a zero. It is a method so that everything that describes the
+// response to someone else -- Render, and the head a response hook is asked
+// about (syntheticHead) -- agrees on what the client will actually receive. The
+// zero is what a deny action carries when its config names no status_code.
+func (s *SyntheticResponse) statusCode() int {
+	if s.StatusCode == 0 {
+		return http.StatusForbidden
+	}
+	return s.StatusCode
+}
+
+// syntheticHead builds the head-only *http.Response that a response hook is
+// asked about when the response is one the edge fabricated rather than one read
+// from the upstream (emitSynthetic). net/http would have canonicalized the field
+// names had the message come off the wire, so the same canonicalization is
+// applied here and repeated fields are kept as separate values; the framing
+// headers are not part of it, because the renderer writes those itself.
+func syntheticHead(s *SyntheticResponse) *http.Response {
+	header := make(http.Header, len(s.Headers))
+	for _, entry := range s.Headers {
+		name, value, ok := splitAddEntry(entry)
+		if !ok {
+			continue // Render drops these too; a hook should not see them either
+		}
+		header.Add(textproto.CanonicalMIMEHeaderKey(name), value)
+	}
+	return &http.Response{
+		StatusCode: s.statusCode(),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+	}
 }
 
 // Validate checks the policy for CR/LF injection, user-agent targets and
@@ -144,6 +278,13 @@ func (p *Policy) Validate() error {
 // flags were set. Only a policy with nothing in it at all -- or one that says
 // "preserve" and nothing else -- is a no-op.
 func (p *Policy) IsNoop() bool {
+	if p.RequestHook != nil || p.ResponseHook != nil {
+		// A hook is a transformation whether or not this connection's verdict
+		// turns out to change anything: what it will do is only known per
+		// message, and the wrapping it needs -- the terminate channel, the
+		// drain phase -- is not something to build on demand later.
+		return false
+	}
 	if len(p.RequestHeaderAdd) > 0 || len(p.RequestHeaderRemove) > 0 ||
 		len(p.ResponseHeaderAdd) > 0 || len(p.ResponseHeaderRemove) > 0 {
 		return false
@@ -246,6 +387,59 @@ type headerAdd struct {
 	value string
 }
 
+// hookRewrite is one hook verdict merged into the static policy for the head
+// being emitted: the names it drops, the entries it appends after the policy's
+// own, and (requests only) a Host override. A nil *hookRewrite is the
+// no-hook case and is what keeps a policy without hooks on exactly the bytes it
+// emitted before this existed.
+//
+// It is rebuilt per message rather than cached: a verdict is a function of the
+// message, which is the whole point of the hook.
+type hookRewrite struct {
+	// terminate is set when the request hook refused the request. It carries no
+	// rewrite: the head is never emitted, so there is nothing to merge into it.
+	// It is how the verdict travels from the point that asked for it (stepHead's
+	// hookRewrite) to the point that can carry it out (stepHead itself, which
+	// publishes it and switches to the drain phase).
+	terminate *SyntheticResponse
+
+	removes map[string]bool
+	adds    []headerAdd
+	host    string
+}
+
+// drops reports whether the hook removes a header, by its lowercased name.
+func (h *hookRewrite) drops(lower string) bool {
+	return h != nil && h.removes[lower]
+}
+
+// newHookRewrite compiles a verdict's Add/Remove entries. hostOverride says
+// whether a "host" entry means "replace the Host header" (requests, as for a
+// static add entry, 4.2) or is just another field to append (responses).
+//
+// Entries that are not usable -- no colon, a name that is not a token, a value
+// carrying a CR or LF -- are dropped. The policy package is where such an entry
+// is an error; by the time it reaches the wire the only safe thing to do with
+// one is not to write it.
+func newHookRewrite(add, remove []string, hostOverride bool) *hookRewrite {
+	h := &hookRewrite{}
+	if len(remove) > 0 {
+		h.removes = lowerSet(remove)
+	}
+	for _, entry := range add {
+		name, value, ok := splitAddEntry(entry)
+		if !ok || !isToken(name) || strings.ContainsAny(value, "\r\n") {
+			continue
+		}
+		if hostOverride && strings.EqualFold(name, "host") {
+			h.host = value
+			continue
+		}
+		h.adds = append(h.adds, headerAdd{name: textproto.CanonicalMIMEHeaderKey(name), value: value})
+	}
+	return h
+}
+
 // compiledPolicy is the per-connection view of a Policy: entries are split,
 // canonicalized and lowercased once when the connection is wrapped instead of
 // once per request, and the X-Forwarded wiring is resolved into plain values.
@@ -268,6 +462,12 @@ type compiledPolicy struct {
 	// X-Forwarded-Proto; "" injects nothing (4.3).
 	xffValue string
 	xfpValue string
+
+	// reqHook and respHook are Policy's extension hooks, nil when the policy
+	// has none. They are copied out of the Policy so that both directions read
+	// them from the one compiled value they already share.
+	reqHook  func(req *http.Request) *RequestVerdict
+	respHook func(resp *http.Response) *ResponseVerdict
 }
 
 // compilePolicy precomputes everything the per-request path needs. lg receives
@@ -281,6 +481,8 @@ func compilePolicy(p *Policy, lg log.Logger) *compiledPolicy {
 		compress:    p.Compress,
 		xffValue:    p.ClientAddr,
 		xfpValue:    p.XForwardedProto,
+		reqHook:     p.RequestHook,
+		respHook:    p.ResponseHook,
 	}
 
 	var hostOverride string
@@ -369,6 +571,8 @@ const (
 	stChunkTrailer              // reading trailer lines up to the blank line
 	stRaw                       // unparsed passthrough until EOF
 	stGzipClose                 // feeding a close-delimited body to the gzip stream
+	stDrain                     // request terminated: the source is read and discarded
+	stDone                      // a synthetic response was this direction's last message
 )
 
 // connState is the state one connection's two directions share. The request and
@@ -403,6 +607,81 @@ type connState struct {
 	// emitting its head), or a 101 response was seen (the response side goes raw,
 	// and the request side checks this flag before parsing its next head).
 	upgraded bool
+
+	// terminate carries a synthetic response from the direction that decided on
+	// it (the request side, whose hook terminated the request) to the direction
+	// that can put it on the wire (the response side, which owns everything the
+	// client reads after a request). It is buffered, size 1, and nil when the
+	// policy has no request hook: with no hook there is nothing that can
+	// terminate, and every field here stays out of the per-message path.
+	//
+	// One slot is the right size. The request side can only terminate the
+	// request it is currently parsing, and after a terminate it stops parsing
+	// altogether (it drains), so a second value could never be published.
+	terminate chan *SyntheticResponse
+
+	// wakeResponse unblocks the response side when a terminate is published
+	// while it is parked in a read of its own source. Without it the response
+	// side would sit in that read until the upstream answered -- and in the
+	// terminated case the upstream is never asked anything, so nothing would
+	// ever arrive. NewConnPair sets it (it has the source connections);
+	// NewPair leaves it nil, which is why the in-memory tests drive the request
+	// side first instead of relying on the wake.
+	//
+	// How it unblocks the read is NewConnPair's business, but it matters that it
+	// is closing the source and not setting a read deadline on it: see the wake
+	// there for the mux-path hang that rules deadlines out.
+	wakeResponse func()
+
+	// respParked is true while the response side is between messages and about
+	// to block in a read. That is the only state in which the wake is both
+	// needed (a read is in flight) and harmless (no message bytes have been
+	// read yet, so interrupting it cannot truncate one).
+	respParked bool
+}
+
+// setTerminate publishes a synthetic response for the response side to emit.
+// The first verdict wins: a terminate can only be published once per
+// connection, and the buffer is never full in practice.
+func (st *connState) setTerminate(s *SyntheticResponse) {
+	st.mu.Lock()
+	if st.terminate != nil {
+		select {
+		case st.terminate <- s:
+		default:
+		}
+	}
+	parked, wake := st.respParked, st.wakeResponse
+	st.mu.Unlock()
+
+	if parked && wake != nil {
+		wake()
+	}
+}
+
+// takeTerminate removes a pending synthetic response, or returns nil when there
+// is none. Non-blocking: this is consulted on the response side's message path,
+// which must never wait for a verdict that may never come.
+func (st *connState) takeTerminate() *SyntheticResponse {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.terminate == nil {
+		return nil
+	}
+	select {
+	case s := <-st.terminate:
+		return s
+	default:
+		return nil
+	}
+}
+
+// setRespParked records whether the response side is between messages and about
+// to block in a read of the source.
+func (st *connState) setRespParked(parked bool) {
+	st.mu.Lock()
+	st.respParked = parked
+	st.mu.Unlock()
 }
 
 // recordRequest publishes everything the response side needs to know about the
@@ -476,6 +755,11 @@ type streamRewriter struct {
 	chunkEnd   int   // stChunkDataEnd: framing bytes still to copy
 	failedOpen bool  // already warned about giving up on this direction
 
+	// hookWarned records that the policy hook already failed on this direction,
+	// so that a hook which panics on every message gets one WARN per connection
+	// rather than one per message.
+	hookWarned bool
+
 	// gz is the live gzip transform of the response body being copied, or nil.
 	// It is the only switch between the identity path and the transform: the
 	// phases that read and frame the input are the same either way, and the sink
@@ -495,8 +779,23 @@ func NewPair(reqSrc, respSrc io.Reader, p *Policy) (req, resp io.Reader) {
 // newPair is NewPair with an explicit logger per direction, so that the conn
 // adapter can log through the connections themselves (and thus with their ids).
 func newPair(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger) (req, resp io.Reader) {
+	return newPairWithWake(reqSrc, respSrc, p, reqLog, respLog, nil)
+}
+
+// newPairWithWake is newPair plus the wake handle that unblocks the response
+// side when the request side terminates: see connState.wakeResponse for why the
+// response side needs to be unblocked rather than merely signalled, and why
+// nil is the right value for an in-memory pair.
+func newPairWithWake(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger, wake func()) (req, resp io.Reader) {
 	cp := compilePolicy(p, reqLog)
-	st := &connState{}
+	st := &connState{wakeResponse: wake}
+
+	// The terminate channel exists only when something can terminate. A policy
+	// without a request hook -- every policy the client builds today -- keeps
+	// the response side's per-message path at the two nil checks it always had.
+	if cp.reqHook != nil {
+		st.terminate = make(chan *SyntheticResponse, 1)
+	}
 
 	req = &streamRewriter{
 		side: sideRequest, dir: "request",
@@ -585,8 +884,29 @@ func (r *streamRewriter) step() error {
 		return r.stepChunkTrailer()
 	case stGzipClose:
 		return r.stepGzipClose()
+	case stDrain:
+		return r.stepDrain()
+	case stDone:
+		return io.EOF
 	}
 	return r.stepRaw()
+}
+
+// stepDrain reads the source and throws the bytes away. It is where a
+// terminated request's direction ends up: the client is still sending -- it may
+// have a body to write, or a pipelined request -- and none of it can be
+// forwarded, because the request that would have framed it never left. Reading
+// is what keeps the client from blocking on a full socket buffer; discarding is
+// what keeps a request the policy refused from reaching the upstream.
+//
+// The phase ends where the connection does: the response side closes both
+// connections once it has emitted the synthetic response, and the read here
+// then fails, which unwinds the other half of the join.
+func (r *streamRewriter) stepDrain() error {
+	if _, err := r.br.Read(r.scratch[:]); err != nil {
+		return err
+	}
+	return nil
 }
 
 // stepRaw copies whatever the source has, verbatim. Read's fast path normally
@@ -649,6 +969,25 @@ func (r *streamRewriter) stepHead() error {
 		return nil
 	}
 
+	if r.side == sideResponse {
+		// A terminate that is already published is emitted before the source is
+		// read at all: there is no response to wait for, because the request it
+		// would have answered never left this process.
+		if term := r.st.takeTerminate(); term != nil {
+			r.emitSynthetic(term)
+			return nil
+		}
+		// From here until this function returns, this direction may block in a
+		// read. That is the window in which a terminate published by the request
+		// side is allowed to interrupt it -- and it is safe precisely here:
+		// nothing of a message has been read yet, so an interrupted read cannot
+		// truncate one. Between messages is also the only place the terminate is
+		// looked for, which is why a terminate that arrives while a response is
+		// streaming is answered after that response finishes (spec 3.1).
+		r.st.setRespParked(true)
+		defer r.st.setRespParked(false)
+	}
+
 	r.pending = r.pending[:0]
 	started := false
 	for {
@@ -659,6 +998,17 @@ func (r *streamRewriter) stepHead() error {
 		}
 		if err != nil {
 			if len(r.pending) == 0 {
+				// A terminate is one reason this read ended: the wake
+				// (connState.wakeResponse) ends a parked response side's read
+				// rather than waiting for an upstream that will never be asked.
+				// Whatever ended the read, the terminate is the answer the client
+				// is owed, and it is checked here as well as on entry.
+				if r.side == sideResponse {
+					if term := r.st.takeTerminate(); term != nil {
+						r.emitSynthetic(term)
+						return nil
+					}
+				}
 				return err // clean end of stream at a message boundary
 			}
 			// End of stream inside a head: the connection is over either way, but
@@ -709,10 +1059,23 @@ func (r *streamRewriter) stepHead() error {
 		return nil
 	}
 
+	hook := r.hookRewrite(head)
+	if hook != nil && hook.terminate != nil {
+		// The request is answered by the edge. The head is dropped -- the
+		// upstream must never see the request -- and the response side is the
+		// one that puts the answer on the wire: it owns everything the client
+		// reads after a request, and the two directions share the connection,
+		// so emitting here would interleave with a response in flight.
+		r.st.setTerminate(hook.terminate)
+		r.pending = r.pending[:0]
+		r.phase = stDrain
+		return nil
+	}
+
 	var rewritten []byte
 	switch {
 	case r.side == sideRequest:
-		rewritten = r.cp.rewriteRequestHead(head)
+		rewritten = r.cp.rewriteRequestHead(head, hook)
 	case head.status < 200:
 		// Interim 1xx heads (100 Continue, 101, ...) take no response policy:
 		// ngrok applies response actions to the final response only, and a 101
@@ -720,7 +1083,7 @@ func (r *streamRewriter) stepHead() error {
 		// set for these: gzipEligible requires a status >= 200.)
 		rewritten = head.raw
 	default:
-		rewritten = r.cp.rewriteResponseHead(head, gzip)
+		rewritten = r.cp.rewriteResponseHead(head, gzip, hook)
 	}
 
 	if gzip {
@@ -731,6 +1094,187 @@ func (r *streamRewriter) stepHead() error {
 	r.emit(rewritten)
 	r.phase = next
 	return nil
+}
+
+// hookRewrite consults the policy hook for this head, if the policy has one and
+// this head is one it applies to, and returns the verdict merged for the
+// rewrite -- or nil, which is the "nothing to change" answer every caller
+// handles as the no-hook case.
+//
+// It exists so that stepHead says what it does with a verdict and this says how
+// one is asked for: the request side runs its hook on every head (the request
+// is a fresh one each time), the response side only on final responses (1xx
+// heads are the interim answer or the upgrade handshake, not a response any
+// action describes).
+func (r *streamRewriter) hookRewrite(head *parsedHead) *hookRewrite {
+	if r.side == sideRequest {
+		if r.cp.reqHook == nil {
+			return nil
+		}
+		verdict := r.callRequestHook(head.raw)
+		if verdict == nil {
+			return nil
+		}
+		if verdict.Terminate != nil {
+			// Terminate is not a rewrite: it is carried out by stepHead, which
+			// has to skip the emit and change phase.
+			return &hookRewrite{terminate: verdict.Terminate}
+		}
+		return newHookRewrite(verdict.Add, verdict.Remove, true)
+	}
+	if head.status < 200 || r.cp.respHook == nil {
+		return nil
+	}
+	verdict := r.callResponseHook(head.raw)
+	if verdict == nil {
+		return nil
+	}
+	return newHookRewrite(verdict.Add, verdict.Remove, false)
+}
+
+// callRequestHook builds the head-only request and asks the policy about it.
+// The object is built from the head bytes alone -- see Policy.RequestHook for
+// what is populated -- and a hook that panics or a head that net/http cannot
+// read as a request is a skipped hook, never a broken connection: the request
+// is forwarded exactly as the static policy left it.
+func (r *streamRewriter) callRequestHook(raw []byte) (verdict *RequestVerdict) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			verdict = nil
+			r.hookFailed("request hook panicked: %v", rec)
+		}
+	}()
+	// ReadRequest is given the head alone, so the request it returns has no
+	// body: the bytes behind the head are still in this direction's reader and
+	// are copied, or not, according to what the verdict says.
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+	if err != nil {
+		r.hookFailed("request head is not readable by net/http (%v)", err)
+		return nil
+	}
+	return r.cp.reqHook(req)
+}
+
+// callResponseHook is callRequestHook for the response side.
+func (r *streamRewriter) callResponseHook(raw []byte) (verdict *ResponseVerdict) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			verdict = nil
+			r.hookFailed("response hook panicked: %v", rec)
+		}
+	}()
+	// The request argument is nil: it only tells ReadResponse whether the
+	// response may carry a body, and this Object is never read from anyway.
+	// (A response to a HEAD request is still re-emitted byte for byte by the
+	// head rewrite, which is where that distinction matters.)
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), nil)
+	if err != nil {
+		r.hookFailed("response head is not readable by net/http (%v)", err)
+		return nil
+	}
+	return r.callResponseHookObject(resp)
+}
+
+// callResponseHookObject is the hook call itself, for a response object that
+// was not parsed from head bytes: today the synthetic response the edge
+// fabricated for a terminated request (emitSynthetic). The recover is here as
+// well as in callResponseHook so that both callers get the fail-open rule -- a
+// hook that panics is a skipped hook, warned about once per direction, never a
+// broken connection. emitSynthetic only runs on the response side, so the warn
+// this can set is the response direction's -- the same flag a panic on a real
+// response head would set, which is what "once per direction" should mean here.
+func (r *streamRewriter) callResponseHookObject(resp *http.Response) (verdict *ResponseVerdict) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			verdict = nil
+			r.hookFailed("response hook panicked: %v", rec)
+		}
+	}()
+	return r.cp.respHook(resp)
+}
+
+// hookFailed reports a hook that could not be used, once per direction per
+// connection: a hook that panics on every message is one bug, and the log
+// should say so once rather than once per request. The connection is
+// unaffected -- this is the fail-open rule applied to hooks.
+func (r *streamRewriter) hookFailed(format string, args ...interface{}) {
+	if r.hookWarned {
+		return
+	}
+	r.hookWarned = true
+	r.lg.Warn("%s hook failed (%s); the connection continues without it",
+		r.dir, fmt.Sprintf(format, args...))
+}
+
+// emitSynthetic queues a fabricated response and ends this direction: the
+// message is the last thing the client reads, and the next Read reports EOF so
+// that Join unwinds and both connections close (spec 3.1).
+//
+// The response hook runs on the way out, so a response-phase action transforms
+// an edge answer exactly like an upstream one (see applyResponseHook).
+func (r *streamRewriter) emitSynthetic(s *SyntheticResponse) {
+	r.applyResponseHook(s)
+	r.emit(s.Render())
+	r.phase = stDone
+}
+
+// applyResponseHook gives the response phase the same say over an answer the
+// edge fabricated as over one the upstream wrote: it is what lets a
+// response-phase remove-headers or add-headers action transform a deny or a
+// custom-response. That is the documented ngrok behavior for the terminating
+// action this build answers with most often -- the custom-response page says it
+// outright, "When this policy is executed in the on_http_request phase, actions
+// defined in the on_http_response phase will still be executed" -- and the deny
+// page's "no further actions or rules will be executed" describes the phase the
+// action terminated, since the same sentence appears on the page that does spell
+// out that the response phase still runs.
+//
+// The hook is asked about a head-only *http.Response built from s
+// (syntheticHead), whose status is the one the client will see rather than the
+// zero a default-403 verdict carries, so a rule written against res.status_code
+// matches what it looks like it should.
+//
+// A hook that panics or returns nothing usable is a skipped hook and the
+// terminate still goes out: same fail-open rule as the real response path, and
+// the same reason for it -- a policy must never be able to break the connection
+// it is describing. What a verdict can change is headers, which is all
+// ResponseVerdict carries: the status and the body of an edge answer are the
+// terminating action's to decide, and there is no upstream response to replace.
+func (r *streamRewriter) applyResponseHook(s *SyntheticResponse) {
+	if r.cp.respHook == nil {
+		return
+	}
+	verdict := r.callResponseHookObject(syntheticHead(s))
+	if verdict == nil {
+		return
+	}
+
+	// The same order rewriteResponseHead uses: the fields the hook removes are
+	// dropped first, by lowercased name, and the entries it adds are appended
+	// after the response's own. Both come out of newHookRewrite, so an entry
+	// that is unusable -- no colon, a name that is not a token, a value carrying
+	// a CR or LF -- is dropped rather than written, and add names are
+	// canonicalized the way net/http would have written them.
+	//
+	// The result is a new slice rather than an edit of s.Headers in place: the
+	// verdict belongs to the caller that produced it, and today's policy package
+	// happens to hand out a fresh one per evaluation, but a hook is free to reuse
+	// an object -- and the rewriter has no business writing into it either way.
+	hook := newHookRewrite(verdict.Add, verdict.Remove, false)
+	if len(hook.removes) == 0 && len(hook.adds) == 0 {
+		return // a hook that matched but changed nothing: leave the bytes alone
+	}
+	headers := make([]string, 0, len(s.Headers)+len(hook.adds))
+	for _, entry := range s.Headers {
+		if name, _, ok := splitAddEntry(entry); ok && hook.drops(strings.ToLower(name)) {
+			continue
+		}
+		headers = append(headers, entry)
+	}
+	for _, add := range hook.adds {
+		headers = append(headers, add.name+": "+add.value)
+	}
+	s.Headers = headers
 }
 
 // readLine reads one CRLF-terminated line and appends it to pending, returning
@@ -1598,44 +2142,66 @@ func isHexDigit(c byte) bool {
 // order 4.4 lays out: removals, then the Host (plus X-Forwarded-Host), then the
 // configured additions, then X-Forwarded-For and X-Forwarded-Proto.
 //
+// hook is the merged request hook verdict, appended after the policy's own
+// additions and merged into the same removal set; nil -- no hook, or a verdict
+// that changed nothing -- emits exactly the bytes this function emitted before
+// hooks existed.
+//
 // Untouched fields are re-emitted from their original bytes, so their order,
 // casing, spacing and line endings survive exactly. Only the fields the policy
 // names are re-rendered, and only their values change.
-func (cp *compiledPolicy) rewriteRequestHead(h *parsedHead) []byte {
+func (cp *compiledPolicy) rewriteRequestHead(h *parsedHead, hook *hookRewrite) []byte {
 	out := make([]byte, 0, len(h.raw)+128)
 	out = append(out, h.prefix...)
 	out = append(out, h.startLine...)
 
+	// A hook's Host entry overrides the static policy's, the same way a static
+	// add entry does (4.2): "host" names one field, not one more copy of it.
+	hostValue := cp.hostValue
+	if hook != nil && hook.host != "" {
+		hostValue = hook.host
+	}
+
 	origHost := h.firstValue("host")
 	xForwardedHost := ""
-	if cp.hostValue != "" && origHost != "" {
+	if hostValue != "" && origHost != "" {
 		xForwardedHost = origHost // 4.1: the original Host is saved, not lost
 	}
 
 	hostWritten := false
 	for _, f := range h.fields {
-		if cp.reqRemoves[f.lower] {
+		if cp.reqRemoves[f.lower] || hook.drops(f.lower) {
 			continue
 		}
-		if f.lower == "host" && cp.hostValue != "" {
-			out = appendFieldValue(out, f.raw, cp.hostValue)
+		if f.lower == "host" && hostValue != "" {
+			out = appendFieldValue(out, f.raw, hostValue)
 			hostWritten = true
 			continue
 		}
 		out = append(out, f.raw...)
 	}
 
-	if cp.hostValue != "" && !hostWritten {
+	if hostValue != "" && !hostWritten {
 		// No Host field to replace (an HTTP/1.0 request). The policy still says
 		// which host the upstream should see, so add one rather than silently
 		// dropping the rewrite.
-		out = appendHeaderLine(out, "Host", cp.hostValue)
+		out = appendHeaderLine(out, "Host", hostValue)
 	}
 	if xForwardedHost != "" {
 		out = appendHeaderLine(out, "X-Forwarded-Host", xForwardedHost)
 	}
+	// The hook's entries come after the policy's own, and in the order the hook
+	// returned them: a later action that adds the same name appends rather than
+	// replaces (ngrok parity), and the two loops keep the hook's slice from
+	// ever being appended into the policy's -- cp is shared by every message on
+	// this connection, both directions included.
 	for _, add := range cp.reqAdds {
 		out = appendHeaderLine(out, add.name, add.value)
+	}
+	if hook != nil {
+		for _, add := range hook.adds {
+			out = appendHeaderLine(out, add.name, add.value)
+		}
 	}
 	// 4.4 step 4: these two go last, so an upstream that keeps the last value of
 	// a repeated header sees ours rather than anything the client sent.
@@ -1651,7 +2217,13 @@ func (cp *compiledPolicy) rewriteRequestHead(h *parsedHead) []byte {
 // rewriteResponseHead re-emits a response head with the response half of the
 // policy applied. Responses have no Host or X-Forwarded semantics: only the
 // configured additions and removals (4.2). It is only ever called for final
-// responses: interim 1xx heads are re-emitted verbatim by stepHead.
+// responses: interim 1xx heads are re-emitted verbatim by stepHead, and the
+// response hook is not consulted for them either (1xx is the upgrade handshake
+// and the interim answer, not the response a policy action describes).
+//
+// hook is the merged response hook verdict, appended after the policy's own
+// additions; nil emits exactly the bytes this function emitted before hooks
+// existed.
 //
 // gzip says the body behind this head is being compressed, which makes the head
 // describe a body the upstream never sent. Three things change, and they are the
@@ -1669,14 +2241,14 @@ func (cp *compiledPolicy) rewriteRequestHead(h *parsedHead) []byte {
 //
 // Content-Encoding: gzip and Vary: Accept-Encoding are appended. Every other
 // field, including one the upstream sent folded or oddly cased, keeps its bytes.
-func (cp *compiledPolicy) rewriteResponseHead(h *parsedHead, gzip bool) []byte {
+func (cp *compiledPolicy) rewriteResponseHead(h *parsedHead, gzip bool, hook *hookRewrite) []byte {
 	out := make([]byte, 0, len(h.raw)+128)
 	out = append(out, h.prefix...)
 	out = append(out, h.startLine...)
 
 	chunkedDeclared := false
 	for _, f := range h.fields {
-		if cp.respRemoves[f.lower] {
+		if cp.respRemoves[f.lower] || hook.drops(f.lower) {
 			continue
 		}
 		if gzip {
@@ -1698,6 +2270,11 @@ func (cp *compiledPolicy) rewriteResponseHead(h *parsedHead, gzip bool) []byte {
 
 	for _, add := range cp.respAdds {
 		out = appendHeaderLine(out, add.name, add.value)
+	}
+	if hook != nil {
+		for _, add := range hook.adds {
+			out = appendHeaderLine(out, add.name, add.value)
+		}
 	}
 	if gzip {
 		if !chunkedDeclared {

@@ -408,7 +408,10 @@ func (c *ClientModel) control() {
 // reqTunnelFromConfig builds the ReqTunnel that asks the server for one
 // configured tunnel (SPEC 3.5), carrying the endpoint settings added by
 // cluster 2 -- binding, pooling and forward_to -- along with the fields the
-// client has always sent. It is split out of control() so that the request,
+// client has always sent, and the traffic policy (SPEC 3.4), which is the one
+// of them the client never evaluates: it validates the policy at load time and
+// passes it on, and the server compiles it once at registration and enforces it
+// on every connection. It is split out of control() so that the request,
 // which is otherwise only observable over a live control connection, can be
 // asserted on directly.
 //
@@ -435,6 +438,11 @@ func reqTunnelFromConfig(reqId string, config *TunnelConfiguration) *msg.ReqTunn
 		Binding:   config.Binding,
 		Pooling:   config.Pooling,
 		ForwardTo: config.ForwardTo,
+
+		// Nil when the tunnel has no policy, which is the common case and the
+		// value every pre-cluster-4 client sends: the field is additive, and
+		// the server's no-policy path is the one it always took.
+		TrafficPolicy: config.TrafficPolicy,
 	}
 }
 

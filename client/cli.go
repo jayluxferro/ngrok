@@ -20,6 +20,7 @@ Examples:
 	ngrok -hostname="example.com" -httpauth="user:password" 10.0.0.1
 	ngrok -binding=internal -hostname=svc.internal 8080
 	ngrok -forward-to=https://svc.internal 80
+	ngrok -traffic-policy-file=policy.yml -hostname=guarded 8080
 
 
 Advanced usage: ngrok [OPTIONS] <command> [command args] [...]
@@ -68,6 +69,14 @@ type Options struct {
 	pooling     bool
 	forwardTo   string
 	compression bool
+
+	// trafficPolicyFile is the path given by -traffic-policy-file. Like the
+	// flags above it only feeds the synthesized "default" tunnel; config-file
+	// tunnels name their own traffic_policy. Only the path is kept here: the
+	// file is read and validated in LoadConfiguration, so that a policy is
+	// checked by exactly one code path whether it came from a flag or from a
+	// config file.
+	trafficPolicyFile string
 }
 
 // stringList is a flag.Value that accumulates each occurrence of a repeatable
@@ -185,6 +194,11 @@ func ParseArgs() (opts *Options, err error) {
 		true,
 		"Gzip-compress compressible responses sent to clients that accept gzip. Set -compression=false to send responses exactly as your local server wrote them. (HTTP only)")
 
+	trafficPolicyFile := flag.String(
+		"traffic-policy-file",
+		"",
+		"Path to a YAML traffic policy file to enforce on the server for this endpoint. The policy is validated at startup: a rule the server cannot enforce is a startup error, not a control that silently does nothing. (HTTP only)")
+
 	flag.Parse()
 
 	opts = &Options{
@@ -206,6 +220,7 @@ func ParseArgs() (opts *Options, err error) {
 		pooling:              *pooling,
 		forwardTo:            *forwardTo,
 		compression:          *compression,
+		trafficPolicyFile:    *trafficPolicyFile,
 		command:              flag.Arg(0),
 	}
 

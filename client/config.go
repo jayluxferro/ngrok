@@ -1,11 +1,13 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 	"gopkg.in/yaml.v1"
 	"net"
 	"net/url"
 	"ngrok/log"
+	"ngrok/policy"
 	"os"
 	"os/user"
 	"path"
@@ -61,6 +63,19 @@ type TunnelConfiguration struct {
 	// at all" and "compression: false" have to be distinguishable, and a plain
 	// bool cannot tell them apart. Compress reports the resolved value.
 	Compression *bool `yaml:"compression,omitempty"`
+
+	// TrafficPolicy is this endpoint's traffic policy (SPEC 3.4): the client
+	// reads and validates it here, and the server compiles and enforces it --
+	// the policy travels in the tunnel registration, so nothing on this side
+	// evaluates it. Nil is the case every pre-cluster-4 config has; an empty
+	// policy document is normalized to nil so that it takes exactly the same
+	// path (validateTrafficPolicy).
+	//
+	// The rule shape is this build's flat one -- one action per rule, each with
+	// name, expressions and config -- not ngrok's list of actions inside a named
+	// rule, because the config file is parsed by yaml.v1, which cannot decode
+	// that shape into a typed struct.
+	TrafficPolicy *policy.TrafficPolicy `yaml:"traffic_policy,omitempty"`
 }
 
 // Compress reports whether responses on this tunnel may be gzip-compressed
@@ -212,6 +227,10 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
+		if err = validateTrafficPolicy(name, t); err != nil {
+			return
+		}
+
 		// use the name of the tunnel as the subdomain if none is specified
 		if t.Hostname == "" && t.Subdomain == "" {
 			// XXX: a crude heuristic, really we should be checking if the last part
@@ -234,6 +253,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	switch opts.command {
 	// start a single tunnel, the default, simple ngrok behavior
 	case "default":
+		// The flag's policy file is read before the tunnel is synthesized, so
+		// that a missing or malformed file names the file the user passed
+		// rather than the tunnel it would have been attached to.
+		var filePolicy *policy.TrafficPolicy
+		if filePolicy, err = loadTrafficPolicyFile(opts.trafficPolicyFile); err != nil {
+			return
+		}
+
 		config.Tunnels = make(map[string]*TunnelConfiguration)
 		config.Tunnels["default"] = &TunnelConfiguration{
 			Subdomain:      opts.subdomain,
@@ -248,7 +275,8 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			ForwardTo:      opts.forwardTo,
 			// The flag defaults to true, so the pointer always has the value
 			// the user asked for -- there is no "unset" for a flag.
-			Compression: &opts.compression,
+			Compression:   &opts.compression,
+			TrafficPolicy: filePolicy,
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -268,6 +296,25 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 		if err = validateHeaderPolicy("default", config.Tunnels["default"]); err != nil {
+			return
+		}
+
+		// -traffic-policy-file is documented HTTP-only, like -hostname: a tcp
+		// tunnel carries no requests or responses for the policy's HTTP phases
+		// to act on. A config-file tunnel may still carry an on_tcp_connect-only
+		// policy (the accept path evaluates that phase for tcp as well), but the
+		// flag refuses tcp outright rather than meaning two things depending on
+		// where the policy was written.
+		if filePolicy != nil {
+			for proto := range config.Tunnels["default"].Protocols {
+				if !isHttpProtocol(proto) {
+					err = fmt.Errorf("-traffic-policy-file is only supported for http and https tunnels, not %s (put the policy in a config file tunnel if you want an on_tcp_connect-only policy)", proto)
+					return
+				}
+			}
+		}
+
+		if err = validateTrafficPolicy("default", config.Tunnels["default"]); err != nil {
 			return
 		}
 
@@ -634,6 +681,202 @@ func isHttpProtocol(proto string) bool {
 	}
 
 	return true
+}
+
+// hasHTTPProtocol reports whether a tunnel serves at least one http or https
+// leg, which is the question that decides whether a policy's HTTP phases can
+// ever run on it.
+func hasHTTPProtocol(t *TunnelConfiguration) bool {
+	for proto := range t.Protocols {
+		if isHttpProtocol(proto) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// validateTrafficPolicy validates one tunnel's traffic policy (SPEC 3.4). Like
+// validateHeaderPolicy it is called for tunnels read from the config file and
+// for the CLI-synthesized "default" tunnel, so a policy is checked by exactly
+// one code path no matter what wrote it.
+//
+// What a policy may say -- the action names, the phase each action may appear
+// in, the CEL expressions, every per-action config field -- belongs to package
+// policy, which fails loudly and names the rule. This wrapper adds the two
+// things that package cannot know: which tunnel the operator wrote the policy
+// under, and whether the tunnel can run the phases it asks for. Everything
+// rejected here is a startup error: a policy that does not mean what its author
+// thinks must not reach the edge, where its only symptom would be traffic the
+// operator believes is policed and is not.
+func validateTrafficPolicy(tunnelName string, t *TunnelConfiguration) error {
+	if t.TrafficPolicy == nil {
+		return nil
+	}
+
+	// An empty policy document ("traffic_policy:" with nothing under it, or
+	// only empty phases) has no rules to enforce and no hooks to build, so it is
+	// normalized away: the tunnel then takes exactly the path it takes without
+	// the key, wire included.
+	if t.TrafficPolicy.IsZero() {
+		t.TrafficPolicy = nil
+		return nil
+	}
+
+	// Normalize before validating, so that what is checked is what will be
+	// sent. See normalizeTrafficPolicy for what there is to normalize.
+	normalizeTrafficPolicy(t.TrafficPolicy)
+
+	if err := t.TrafficPolicy.Validate(); err != nil {
+		return fmt.Errorf("Tunnel %s: invalid traffic policy: %v", tunnelName, err)
+	}
+
+	// The HTTP phases act on requests and responses, so they only fire on a
+	// connection that carries HTTP. A policy that has them on a tunnel with no
+	// http or https leg is a control that can never run: refuse it rather than
+	// let it sit in a config file looking like it is enforcing something. The
+	// on_tcp_connect phase is real on both kinds of tunnel (the server evaluates
+	// it at accept time, and again in the HTTP handler), so a connect-only
+	// policy is allowed on tcp.
+	if !hasHTTPProtocol(t) && (len(t.TrafficPolicy.OnHTTPRequest) > 0 || len(t.TrafficPolicy.OnHTTPResponse) > 0) {
+		return fmt.Errorf("Tunnel %s: traffic policy has on_http_request/on_http_response rules, which only run on http and https tunnels, and this tunnel has neither", tunnelName)
+	}
+
+	return nil
+}
+
+// normalizeTrafficPolicy rewrites a policy's config values into the map shapes
+// the control channel can carry. yaml.v1 decodes a nested map into
+// map[interface{}]interface{}, which has no key type and which encoding/json
+// therefore refuses to marshal at all -- and the tunnel registration is a JSON
+// envelope. A policy straight out of a YAML file would otherwise fail at the
+// first ReqTunnel and take the whole control connection down with it, retrying
+// forever: the e2e found this, and the unit tests could not, because they built
+// their policies in Go, where the maps are already map[string]interface{}.
+//
+// A key that is not a string is rendered with %v and left to validation to
+// judge (it will not match any config field an action documents). It is
+// unreachable for a policy that validates, since the policy package's asMap
+// refuses a nested map with a non-string key wherever it reads one.
+func normalizeTrafficPolicy(tp *policy.TrafficPolicy) {
+	if tp == nil {
+		return
+	}
+
+	for _, rules := range [][]*policy.Action{tp.OnTCPConnect, tp.OnHTTPRequest, tp.OnHTTPResponse} {
+		for _, r := range rules {
+			if r == nil || r.Config == nil {
+				continue
+			}
+			r.Config = normalizePolicyMap(r.Config)
+		}
+	}
+}
+
+// normalizePolicyMap rebuilds one map with every nested value normalized.
+func normalizePolicyMap(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = normalizePolicyValue(v)
+	}
+
+	return out
+}
+
+// normalizePolicyValue is normalizePolicyMap's recursion: it converts the YAML
+// map shape and leaves every other value as it is, including the numbers YAML
+// and JSON decode differently (configStatus reads both).
+func normalizePolicyValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[interface{}]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			key, ok := k.(string)
+			if !ok {
+				key = fmt.Sprintf("%v", k)
+			}
+			out[key] = normalizePolicyValue(val)
+		}
+		return out
+
+	case map[string]interface{}:
+		return normalizePolicyMap(t)
+
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, val := range t {
+			out[i] = normalizePolicyValue(val)
+		}
+		return out
+	}
+
+	return v
+}
+
+// loadTrafficPolicyFile reads the file named by -traffic-policy-file. YAML is
+// the documented format and is what the config file's traffic_policy key is
+// written in; a JSON policy document is tolerated, because JSON is a subset of
+// YAML and yaml.v1 parses it as one (there is a test for the spelling).
+//
+// The policy is validated here, not later: the point of validating at load time
+// is that a control which does not mean what its author thinks never reaches a
+// tunnel. The errors name the file the user passed, and -- through package
+// policy -- the rule inside it.
+//
+// An empty path (the flag was not given) and an empty document both load to a
+// nil policy, which is what the tunnel registration sends when there is no
+// policy at all.
+func loadTrafficPolicyFile(path string) (*policy.TrafficPolicy, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	log.Info("Reading traffic policy file %s", path)
+
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read traffic policy file %s: %v", path, err)
+	}
+
+	tp := new(policy.TrafficPolicy)
+	if err = yaml.Unmarshal(buf, tp); err != nil {
+		// A document that looks like JSON but did not parse as YAML gets a
+		// second attempt through encoding/json, whose error names the offset:
+		// the YAML parser's complaint about flow syntax is not much help to
+		// someone who wrote a JSON file.
+		if tp = parseJSONPolicy(buf); tp == nil {
+			return nil, fmt.Errorf("Error parsing traffic policy file %s: %v", path, err)
+		}
+	}
+
+	normalizeTrafficPolicy(tp)
+
+	if err = tp.Validate(); err != nil {
+		return nil, fmt.Errorf("Traffic policy file %s: %v", path, err)
+	}
+
+	if tp.IsZero() {
+		return nil, nil
+	}
+
+	return tp, nil
+}
+
+// parseJSONPolicy is the second attempt described above. It returns nil for a
+// document that does not look like JSON, or that JSON cannot parse, so that the
+// caller reports the YAML parser's error rather than two guesses.
+func parseJSONPolicy(buf []byte) *policy.TrafficPolicy {
+	trimmed := strings.TrimSpace(string(buf))
+	if trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return nil
+	}
+
+	tp := new(policy.TrafficPolicy)
+	if err := json.Unmarshal([]byte(trimmed), tp); err != nil {
+		return nil
+	}
+
+	return tp
 }
 
 func SaveAuthToken(configPath, authtoken string) (err error) {

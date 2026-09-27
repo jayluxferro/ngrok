@@ -3,6 +3,8 @@ package msg
 import (
 	"encoding/json"
 	"reflect"
+
+	"ngrok/policy"
 )
 
 var TypeMap map[string]reflect.Type
@@ -90,6 +92,13 @@ type ReqTunnel struct {
 	// ForwardTo routes this endpoint's traffic to an internal endpoint
 	// ("https://svc.internal") instead of to this client's own upstream.
 	ForwardTo string
+
+	// TrafficPolicy is the endpoint's edge policy, enforced by the server
+	// (SPEC 3.3). Nil means the endpoint has none, which is what every client
+	// that does not configure one sends: the field is additive, so an old
+	// client and a policy-free endpoint take exactly the path they took
+	// before. The server compiles it once, when the tunnel is registered.
+	TrafficPolicy *policy.TrafficPolicy
 }
 
 // When the server opens a new tunnel on behalf of

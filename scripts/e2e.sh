@@ -433,4 +433,293 @@ if [[ "$CODE" != "404" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Traffic policy (SPEC 3.4, cluster 4): the edge enforces a policy the client
+# sent with its tunnel registration. Every action this cluster implements runs
+# through a live tunnel here -- deny and custom-response terminate at the edge,
+# restrict-ips decides before an agent is asked for anything, add/remove-headers
+# transform both directions, set-vars feeds ${vars} into a later action, and log
+# writes a line into ngrokd's log.
+#
+# One thing about the policy file below is not the order the docs introduce
+# these actions in: set-vars comes *before* add-headers. Actions run in the
+# order they are written, so a ${vars.who} in a header value is empty until
+# set-vars has run -- the ordering is the feature, and this file is what proves
+# it end to end.
+# ---------------------------------------------------------------------------
+
+# Every policy request below is bounded, and one that is never answered comes
+# back as the status code 000 instead of hanging the script. The bound is not
+# defensive padding: the edge answers a terminated request through the response
+# side of its rewriter, and that side has to be woken for the answer to be
+# emitted at all. A wake that does not work does not fail an assertion -- it
+# stops the harness from ever reaching one, which is how the first run of this
+# section presented itself (curl waiting on /blocked forever). The bound turns
+# that into a wrong-status failure with a message.
+POLICY_CURL_TIMEOUT="${POLICY_CURL_TIMEOUT:-15}"
+
+# policy_curl echoes the response's status code (000 when curl never got one)
+# and leaves the body in the -o file the caller named. The `|| true` is what
+# keeps `set -e` from aborting on curl's nonzero exit before the caller can
+# report the code it got.
+policy_curl() {
+  curl -sS --max-time "$POLICY_CURL_TIMEOUT" -w '%{http_code}' "$@" || true
+}
+
+echo "[e2e] starting the policy upstream (answers with the request headers it saw)"
+cat > "$TMPDIR/policy_upstream.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        # The body carries the headers the policy is supposed to have added, so
+        # the assertion reads them from the response the public client gets
+        # instead of from a log the agent writes. BaseHTTPRequestHandler also
+        # sends its own Server header, which is what the response-phase
+        # remove-headers rule has to take away.
+        body = ("x-policy=%s;x-who=%s" % (
+            self.headers.get("X-Policy", ""), self.headers.get("X-Who", ""))).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_): pass
+HTTPServer(("127.0.0.1", 19006), H).serve_forever()
+PY
+python3 "$TMPDIR/policy_upstream.py" >/tmp/ngrok-e2e-policy-app.log 2>&1 &
+
+cat > "$TMPDIR/ngrok-policy.yml" <<'YAML'
+server_addr: 127.0.0.1:14443
+trust_host_root_certs: true
+tunnels:
+  guarded:
+    hostname: guarded
+    proto:
+      http: 19006
+    traffic_policy:
+      on_tcp_connect:
+        - name: restrict-ips
+          config:
+            allow:
+              - 127.0.0.0/8
+              - "::1/128"
+      on_http_request:
+        - name: deny
+          expressions:
+            - 'req.url.path == "/blocked"'
+        - name: set-vars
+          config:
+            vars:
+              - who: policy
+        - name: add-headers
+          config:
+            headers:
+              X-Policy: checked
+              X-Who: "${vars.who}"
+        - name: custom-response
+          expressions:
+            - 'req.url.path == "/teapot"'
+          config:
+            status_code: 418
+            body: "short and stout"
+            headers:
+              X-Flavour: tea
+        - name: log
+          config:
+            metadata:
+              hit: "${vars.who}"
+      on_http_response:
+        - name: remove-headers
+          config:
+            headers:
+              - Server
+        - name: add-headers
+          config:
+            headers:
+              X-Edge: ngrokd
+  restricted:
+    hostname: restricted
+    proto:
+      http: 19006
+    traffic_policy:
+      on_tcp_connect:
+        - name: restrict-ips
+          config:
+            deny:
+              - 127.0.0.0/8
+YAML
+
+echo "[e2e] starting the policy tunnels (guarded, restricted)"
+# One client, two tunnels: the config file carries both policies, so this also
+# checks that a policy is attached per tunnel rather than per client.
+./bin/ngrok -config="$TMPDIR/ngrok-policy.yml" -log=/tmp/ngrok-e2e-policy-client.log start guarded restricted >/tmp/ngrok-e2e-policy-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-policy-client.log "guarded+restricted"
+wait_for_public guarded
+wait_for_public restricted
+
+echo "[e2e] policy: an allowed path reaches the upstream, carrying the added headers"
+# X-Policy comes from add-headers, X-Who from ${vars.who} -- so this single
+# assertion covers the request-phase add-headers, set-vars and the order they
+# run in. The upstream echoes both back in the body.
+RESP="$(curl -fsS -H 'Host: guarded' http://127.0.0.1:18080/allowed)"
+if [[ "$RESP" != "x-policy=checked;x-who=policy" ]]; then
+  echo "[e2e] the request-phase headers did not reach the upstream: got \"$RESP\""
+  exit 1
+fi
+
+echo "[e2e] policy: deny terminates /blocked at the edge, before the upstream"
+# -f is deliberately absent: a 403 is the answer under test. The request is
+# bounded because this is the assertion whose failure mode is "no answer at
+# all", and 000 names it.
+CODE="$(policy_curl -o "$TMPDIR/policy-blocked.body" -H 'Host: guarded' http://127.0.0.1:18080/blocked)"
+if [[ "$CODE" != "403" ]]; then
+  echo "[e2e] expected the deny action to answer 403, got $CODE"
+  if [[ "$CODE" == "000" ]]; then
+    echo "[e2e] the edge never answered: the terminated request was not written back to the public client"
+    echo "[e2e] (see the response-side wake in rewriter/conn.go: a parked read of a mux stream is not interrupted by SetReadDeadline)"
+  fi
+  exit 1
+fi
+# A denied request must not be answered by the app: the upstream always writes
+# a body, so an empty one is the evidence that the edge answered instead.
+if [[ -s "$TMPDIR/policy-blocked.body" ]]; then
+  echo "[e2e] the denied request reached the upstream:"
+  cat "$TMPDIR/policy-blocked.body"
+  exit 1
+fi
+
+echo "[e2e] policy: custom-response answers /teapot with its own status, header and body"
+TEAPOT_CODE="$(policy_curl -D "$TMPDIR/policy-teapot.headers" -o "$TMPDIR/policy-teapot.body" -H 'Host: guarded' http://127.0.0.1:18080/teapot)"
+if [[ "$TEAPOT_CODE" != "418" ]]; then
+  echo "[e2e] expected the custom-response status_code 418, got $TEAPOT_CODE"
+  exit 1
+fi
+if ! grep -qi '^X-Flavour: tea' "$TMPDIR/policy-teapot.headers"; then
+  echo "[e2e] the custom-response headers did not reach the public client:"
+  cat "$TMPDIR/policy-teapot.headers"
+  exit 1
+fi
+if [[ "$(cat "$TMPDIR/policy-teapot.body")" != "short and stout" ]]; then
+  echo "[e2e] the custom-response body did not reach the public client:"
+  cat "$TMPDIR/policy-teapot.body"
+  exit 1
+fi
+# The 418 is the edge's own answer, and it still runs the response phase: ngrok
+# documents this for a terminating on_http_request action ("actions defined in
+# the on_http_response phase will still be executed"), and the guarded tunnel's
+# response-phase add-headers is what makes it observable here. Headers are all
+# the response phase can change on an edge answer -- the status and the body
+# belong to the terminating action's config.
+if ! grep -qi '^X-Edge: ngrokd' "$TMPDIR/policy-teapot.headers"; then
+  echo "[e2e] the response phase did not run on the edge's own 418:"
+  cat "$TMPDIR/policy-teapot.headers"
+  exit 1
+fi
+
+echo "[e2e] policy: restrict-ips allows 127.0.0.0/8 on one tunnel and refuses it on the other"
+# The allow half is the /allowed request above (it got through). On its own that
+# proves nothing -- it would pass with no policy at all -- so the deny half is
+# here too: the same client, the same source address, and a tunnel whose policy
+# denies it.
+RESTRICTED_CODE="$(policy_curl -o /dev/null -H 'Host: restricted' http://127.0.0.1:18080/)"
+if [[ "$RESTRICTED_CODE" != "403" ]]; then
+  echo "[e2e] expected restrict-ips to refuse 127.0.0.1 with 403, got $RESTRICTED_CODE"
+  exit 1
+fi
+
+echo "[e2e] policy: the response phase removed the upstream's Server header and added X-Edge"
+PUBLIC_HEADERS="$(curl -fsS -D - -o /dev/null -H 'Host: guarded' http://127.0.0.1:18080/allowed)"
+if ! grep -qi '^X-Edge: ngrokd' <<<"$PUBLIC_HEADERS"; then
+  echo "[e2e] the response-phase add-headers did not reach the public client:"
+  echo "$PUBLIC_HEADERS"
+  exit 1
+fi
+if grep -qi '^Server:' <<<"$PUBLIC_HEADERS"; then
+  echo "[e2e] the response-phase remove-headers did not take the Server header away:"
+  echo "$PUBLIC_HEADERS"
+  exit 1
+fi
+
+echo "[e2e] policy: the log action wrote its metadata into ngrokd's log"
+if ! grep -q 'traffic policy log action' /tmp/ngrok-e2e-ngrokd.log; then
+  echo "[e2e] the log action wrote nothing to the server log"
+  exit 1
+fi
+# The metadata is interpolated, like every other value in the phase: hit="policy"
+# is ${vars.who}, which set-vars assigned earlier in the same phase.
+if ! grep -q 'hit="policy"' /tmp/ngrok-e2e-ngrokd.log; then
+  echo "[e2e] the log action's interpolated metadata is not in the server log"
+  exit 1
+fi
+
+echo "[e2e] policy: -traffic-policy-file feeds a policy to the default tunnel"
+# The file's top level *is* the policy document: the flag is not a folder of
+# endpoints, it is one endpoint's policy.
+cat > "$TMPDIR/policy-file.yml" <<'YAML'
+on_tcp_connect:
+  - name: restrict-ips
+    config:
+      allow:
+        - 127.0.0.0/8
+on_http_request:
+  - name: deny
+    expressions:
+      - 'req.url.path == "/blocked"'
+  - name: add-headers
+    config:
+      headers:
+        # X-Policy, not a name of its own: the policy upstream echoes exactly
+        # X-Policy and X-Who (policy_upstream.py), so a header under any other
+        # name is invisible to the assertion below. The *value* is what shows
+        # this header came from the file rather than from the guarded tunnel.
+        X-Policy: from-file
+YAML
+
+./bin/ngrok -config="$TMPDIR/ngrok-cli.yml" -log=/tmp/ngrok-e2e-policy-file-client.log -proto=http -hostname=policyfile -traffic-policy-file="$TMPDIR/policy-file.yml" 19006 >/tmp/ngrok-e2e-policy-file-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-policy-file-client.log "policyfile (-traffic-policy-file)"
+wait_for_public policyfile
+
+FILE_CODE="$(policy_curl -o /dev/null -H 'Host: policyfile' http://127.0.0.1:18080/blocked)"
+if [[ "$FILE_CODE" != "403" ]]; then
+  echo "[e2e] the file-fed policy did not deny /blocked: got $FILE_CODE"
+  exit 1
+fi
+
+# x-who is empty here on purpose: this policy has no set-vars, and the empty
+# value is what proves the header came from this file rather than from the
+# guarded tunnel's policy.
+FILE_RESP="$(curl -fsS -H 'Host: policyfile' http://127.0.0.1:18080/allowed)"
+if [[ "$FILE_RESP" != "x-policy=from-file;x-who=" ]]; then
+  echo "[e2e] the file-fed policy's add-headers did not reach the upstream: got \"$FILE_RESP\""
+  exit 1
+fi
+
+echo "[e2e] policy: a policy file the client cannot enforce stops it at startup"
+# The client must refuse to start rather than come up with a rule that does less
+# than it says: this is the same load-time validation the unit tests cover,
+# driven through the real binary and the real flag.
+cat > "$TMPDIR/policy-broken.yml" <<'YAML'
+on_http_request:
+  - name: rate-limit
+    config:
+      rate: 10
+YAML
+
+if ./bin/ngrok -config="$TMPDIR/ngrok-cli.yml" -proto=http -hostname=broken -traffic-policy-file="$TMPDIR/policy-broken.yml" 19006 >"$TMPDIR/policy-broken.out" 2>&1; then
+  echo "[e2e] the client started with a policy it cannot enforce:"
+  cat "$TMPDIR/policy-broken.out"
+  exit 1
+fi
+if ! grep -q 'policy-broken.yml' "$TMPDIR/policy-broken.out"; then
+  echo "[e2e] the startup failure does not name the policy file:"
+  cat "$TMPDIR/policy-broken.out"
+  exit 1
+fi
+if ! grep -q 'on_http_request\[0\] (rate-limit)' "$TMPDIR/policy-broken.out"; then
+  echo "[e2e] the startup failure does not name the rule at fault:"
+  cat "$TMPDIR/policy-broken.out"
+  exit 1
+fi
+
 echo "[e2e] PASS"

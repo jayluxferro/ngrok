@@ -1,4 +1,231 @@
 # Changelog
+## 1.0.5 - 2026-09-27 - Traffic policy engine (server-side): restrict-ips, deny, custom-response, header and log actions
+
+A tunnel can now carry a **traffic policy**: rules that ngrokd evaluates against
+each connection, each request and each response, at the edge, before and after
+the traffic reaches the agent. The policy is authored once -- as `traffic_policy`
+on a tunnel in the config file, or in a file named by `-traffic-policy-file` --
+and travels with the tunnel registration. The agent validates it, forwards it,
+and never evaluates it: an agent that is stale, restarted or compromised cannot
+change what the policy does, and a denied request never reaches your local
+service at all.
+
+A tunnel with no policy costs nothing and takes the path it always took: no hook
+is built and `conn.Join` runs the raw join. That is not an optimization but the
+review gate this work was held to, because the whole point of an edge control is
+that adding it is not allowed to change the traffic of the endpoints that did
+not ask for it.
+
+Every action runs over both transports this server serves: the multiplexed path
+every current client negotiates and the per-connection path older agents still
+use. That includes the two actions that answer a request from the edge (`deny`
+and `custom-response`), and the response phase runs on the answer they fabricate
+as well as on one the upstream wrote -- both are exercised end to end by the
+harness, over the mux path.
+
+### Where a policy is written, and how it fails
+
+Two spellings, one validation path:
+
+```yaml
+tunnels:
+  guarded:
+    hostname: guarded
+    proto:
+      http: 8080
+    traffic_policy:      # one endpoint's policy
+      on_http_request:
+        - name: add-headers
+          config:
+            headers:
+              X-From: policy
+```
+
+```bash
+ngrok -traffic-policy-file=policy.yml -hostname=guarded 8080
+```
+
+The file given to the flag *is* the policy document -- its top level is the
+`on_*` phases, not a `tunnels:` map -- and it applies to the endpoint the command
+line describes. The path is the only thing the flag records: the file is read and
+validated in `LoadConfiguration`, which is also where a config-file policy is
+validated, so a policy is checked by exactly one code path no matter how it was
+written. The flag is refused on a `tcp` tunnel (`-traffic-policy-file is only
+supported for http and https, not tcp...`), because two of its three phases
+cannot run there.
+
+Validation is the loud kind, on purpose. A control the server cannot enforce must
+not load, because the alternative -- an endpoint that looks protected and is not
+-- is worse than a startup failure. At config load:
+
+- the rule is checked against the actions this build implements, the phases each
+  action may appear in, that action's own config fields, and its CEL
+  expressions, and the message names all four:
+  `Tunnel web: invalid traffic policy: on_http_request[0] (deny): unknown config field "body"`;
+- a tunnel with no HTTP leg is refused a policy with request/response rules
+  (`... traffic policy has on_http_request/on_http_response rules, which only run
+  on http and https, and this tunnel has neither`);
+- the same policy is compiled again by ngrokd when the tunnel registers, before
+  the tunnel claims its URL, so a policy this build's server cannot compile fails
+  the registration rather than leaving a half-protected endpoint up.
+
+### The rule shape, and where it differs from ngrok
+
+One action per rule, with the rule's name, its conditions and its config at the
+same level:
+
+```yaml
+- name: add-headers        # the action's name, from the documented set
+  expressions:             # optional CEL conditions, ANDed
+    - 'req.url.path == "/api"'
+  config:                  # the action's own fields
+    headers:
+      X-From: policy
+```
+
+ngrok nests instead -- a rule is a name plus an `actions:` list of
+`{type, config}`. **This build cannot read that shape, and the way it fails
+matters.** The YAML decoder here is yaml.v1, which has no strict mode: keys it
+does not know about are dropped in silence. An unnamed nested rule therefore
+fails loudly (`on_http_request[0]: action has no name`), but a nested rule that
+*is* named after a real action -- `- name: deny` with an `actions:` list under it
+-- decodes as that action with no conditions and no config, i.e. as a rule that
+applies to everything. An ngrok policy pasted into this build can end up
+denying all traffic. Keep the flat form; do not nest.
+
+Per-action config field names mirror ngrok (`headers` as a name-to-value object
+for `add-headers`, as a list of names for `remove-headers`, `vars` as a list of
+one-entry maps for `set-vars`, `metadata` as an object for `log`, `status_code`,
+`body`, `allow`/`deny`/`enforce` for `restrict-ips`), so a policy migrated from
+ngrok mostly needs its envelope rewritten. Three shapes in the worked example
+this cluster was specified with do not load as written, all for the same reason
+-- yaml.v1's flow-mapping rules. `proto: {http: 8080}` fails to parse at all
+(`found unexpected ':'`, a colon inside a plain scalar in a flow mapping);
+`headers: {"X-Policy: checked"}` is read as a set entry with a null value and
+then rejected (`"X-Policy: checked" is not a valid header name`); and
+`vars: {who: policy}` is rejected because `vars` must be a list of one-entry
+maps. The example above, and the one in the e2e script, is the shape that works.
+
+### The actions, by phase
+
+Rules run in the order they are written. Phases run in the order
+`on_tcp_connect`, `on_http_request`, `on_http_response`; a rule with no
+`expressions` always applies.
+
+| action | `on_tcp_connect` | `on_http_request` | `on_http_response` | config |
+| --- | --- | --- | --- | --- |
+| `restrict-ips` | yes | -- | -- | `allow`/`deny` CIDR lists, `enforce` (default true; false logs without refusing) |
+| `deny` | yes | yes | -- | `status_code` (request phase, default 403); no config at connect: there is no HTTP response to give a status to |
+| `custom-response` | -- | yes | -- | `status_code` (default 200), `body`, `headers`; `content-type` is sniffed from the body when not given |
+| `add-headers` | -- | yes | yes | `headers`: name -> value |
+| `remove-headers` | -- | yes | yes | `headers`: list of names |
+| `set-vars` | -- | yes | -- | `vars`: list of one-entry maps, referenced later as `${vars.name}` |
+| `log` | yes | yes | yes | `metadata`: name -> value, interpolated, written to the server log |
+
+`ip_policies` is recognized and refused at load (`... is not implemented in this
+build (it needs the ngrok API); use allow/deny CIDRs`) rather than accepted and
+ignored.
+
+### The CEL variables
+
+`conn.client_ip` and `conn.remote_addr` exist in every phase. `on_http_request`
+adds `req.method`, `req.url.path`, `req.url.query`, `req.url.raw` (the request
+target as it arrived), `req.headers`, `req.cookies` and `vars`.
+`on_http_response` adds `res.status_code` and `vars` -- and deliberately not
+`req.*`: the response hook is handed a head-only response and has no request to
+read, so a policy that refers to the request there fails to compile at load time
+instead of evaluating against a zero value that would quietly be wrong.
+
+The subset is the whole environment. `conn.geo.*`, `endpoint.*`, `conn.tls.*` and
+the rest of ngrok's surface are not declared, so a policy that names one fails to
+load with a compile error naming the action. That is the same trade this package
+makes everywhere: a rule that silently never matches is worse than a rule that
+refuses to load.
+
+### Parity notes worth knowing before you write a policy
+
+- **A synthesized response ends the connection.** The edge frames it with
+  `Content-Length` and `Connection: close`, so there is no keep-alive through a
+  terminate and a pipelining client must reconnect. This is 1.0-compatible
+  framing, and it is what the response rewriter can emit without a body-length
+  guess.
+- **A synthesized response runs the response phase too.** A `deny` or a
+  `custom-response` is answered by the edge without an upstream ever being
+  asked, and the response phase then runs on the answer it fabricated, exactly
+  as it does on a real one -- ngrok's custom-response page says so outright. The
+  hook is asked about a head-only response whose status is the one the client
+  will see, so a rule written against `res.status_code` matches what it looks
+  like it should. Headers are all it can change: the status and the body of an
+  edge answer belong to the terminating action's config, and there is no
+  upstream response to replace. A connection refused at `on_tcp_connect` is the
+  exception -- it is answered before a request is parsed, so no request or
+  response phase runs for it at all.
+- **`${...}` interpolation renders strings only.** There is no typed
+  substitution: a value set to a number is interpolated in its string form.
+- **`req.headers` joins repeated fields with `", "`** and lower-cases the names.
+  ngrok's is `map[string][]string`; this build's is `map[string]string`, so a
+  header sent twice is one string with a comma in it -- which is also what makes
+  `req.headers["x-forwarded-for"].contains(...)` work the way people expect.
+- **`custom-response` is request-phase only in this release** (ngrok also allows
+  it on the response phase).
+- **`${vars.x}` is set by `set-vars` in the same phase**, in written order: a
+  header value that uses a var must come after the `set-vars` rule that defines
+  it. The e2e file is ordered that way deliberately, and it is the ordering that
+  proves interpolation reads the current phase's vars rather than the previous
+  request's.
+
+### What the e2e covers
+
+`scripts/e2e.sh` runs the whole set through a live tunnel: `restrict-ips`
+two-sided (an allow-only test would pass with no policy at all, so the same
+client address is also denied by a second tunnel's policy), a request-phase
+`deny` terminating `/blocked` at the edge with an empty body, a
+`custom-response` answering `/teapot` with its own status, header and body, the
+response phase running on that fabricated answer (the `X-Edge` header it adds is
+asserted on the 418 as well as on a real response), request-phase `set-vars` +
+`add-headers` reaching the upstream, response-phase `remove-headers` +
+`add-headers` reaching the public client, `log` writing interpolated metadata
+into ngrokd's log, `-traffic-policy-file` feeding a policy to the default
+tunnel, and a policy file the client cannot enforce stopping the client at
+startup with a message naming the file and the rule.
+
+Every policy request in the harness is bounded (15s), so a rule that never
+answers fails an assertion with a status code and a message rather than hanging
+the script. That bound is not padding: see the note on the wake below.
+
+### The terminate wake, and why the harness is the only thing that caught it
+
+The edge answers a terminated request through the *response* side of the
+rewriter, which is usually already parked in a read of its upstream -- the
+request that would have provoked a response was never forwarded. Waking that
+read is the whole trick, and the first implementation got it wrong in a way no
+unit test could see: it woke it with `SetReadDeadline(time.Now())`. That works on
+a `net.TCPConn` and on `net.Pipe`, and does not work on a **smux stream**, which
+is what the server hands the rewriter on the mux path every current client
+negotiates. `smux.Stream.SetReadDeadline` only stores the value
+(`stream.go:339`), and `waitRead` samples it **once, at entry**
+(`stream.go:194`), so a read already parked never learns a deadline was set. The
+response side stayed parked, the request side kept draining a public connection
+that never EOFs, the client got zero bytes, and `conn.Join` waited on both legs
+forever, leaking the handler goroutine.
+
+The unit test passed because its test double implements `SetReadDeadline` by
+closing a channel -- which is how a TCP conn behaves, and not how a mux stream
+does. The e2e found it through a real tunnel, and a goroutine dump of the hung
+ngrokd named both parked legs (`stepDrain` on the public conn,
+`smux.Stream.waitRead` on the proxy stream).
+
+The wake is now `Close()` on the source being abandoned: it needs no
+per-implementation rule to get right, it is how every `conn.Conn` in this
+program ends anyway, and a terminate makes that source disposable -- the
+synthetic response is the last message of the connection and `conn.Join` would
+close that leg moments later. (`CloseRead` would have been the tidier half-close
+and is not available: `loggedConn.CloseRead` calls `tcp.CloseRead()` on a
+`*net.TCPConn` that is nil for a mux-wrapped conn, and `smux.Stream` has no
+`CloseRead` at all.) The lesson worth keeping: a test double that mocks a
+transport's *timeout* semantics has to be as pessimistic as the oddest transport
+in the system, or it will pass exactly the case the real one deadlocks on.
+
 ## 1.0.4 - 2026-09-27 - Throughput: stream multiplexing, zero-copy legs, bench harness
 
 All three changes go after the same cost: the per-connection setup that every

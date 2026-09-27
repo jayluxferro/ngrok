@@ -7,6 +7,7 @@ import (
 	//"net"
 	"ngrok/conn"
 	"ngrok/log"
+	"ngrok/policy"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -164,6 +165,28 @@ func httpHandler(c conn.Conn, proto string) {
 		return
 	}
 
+	// The endpoint's on_tcp_connect phase runs before an agent is asked for a
+	// proxy connection. The connection is nominally past "connect" by now --
+	// the mux handler read the request head to find the tunnel -- but the
+	// phase's only input is the source address, which has not changed, so the
+	// verdict is the one an operator would get at accept time (SPEC 3.3).
+	pol := tunnel.policyFor(target)
+	if v := tunnel.connectVerdict(c); v.Deny {
+		respondPolicyDeny(c, v)
+		return
+	}
+
 	// let the tunnel handle the connection now
-	target.HandlePublicConnection(c)
+	target.HandlePublicConnection(c, pol)
+}
+
+// respondPolicyDeny answers a connection the traffic policy refused. An HTTP
+// client gets the synthetic response the verdict carries (the policy's 403 by
+// default); the connection is closed either way, because a denied request must
+// not reach an agent.
+func respondPolicyDeny(c conn.Conn, v policy.ConnectVerdict) {
+	c.Info("Traffic policy refused the request: %s", v.Reason)
+	if v.Response != nil {
+		c.Write(v.Response.Render())
+	}
 }

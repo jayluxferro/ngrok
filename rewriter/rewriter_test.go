@@ -4,13 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/xtaci/smux/v2"
 
 	"ngrok/conn"
 )
@@ -1283,5 +1289,719 @@ func TestCompressibleTypes(t *testing.T) {
 		if got := compressibleType(tc.contentType); got != tc.want {
 			t.Fatalf("compressibleType(%q) = %v, want %v", tc.contentType, got, tc.want)
 		}
+	}
+}
+
+// --- policy hooks (SPEC 3.1) ------------------------------------------------
+//
+// The hook extension is the seam the traffic policy engine plugs into, and the
+// tests below are its contract: a hook changes the head it is asked about,
+// terminating from a hook ends the connection with a fabricated response, and a
+// hook that fails -- panics, panics every time, or hands back a verdict nobody
+// can read -- never costs a connection a byte it would otherwise have carried.
+//
+// They drive NewPair/NewConnPair rather than the state machine's internals,
+// because "what the client reads" is the only thing a hook is allowed to change.
+
+// syntheticTermination is one fabricated response used across the terminate
+// tests: a status, a caller header, an inferred content-type and a body.
+func syntheticTermination() *SyntheticResponse {
+	return &SyntheticResponse{
+		StatusCode: 503,
+		Headers:    []string{"Retry-After: 60"},
+		Body:       "maintenance\n",
+	}
+}
+
+// TestHookNilSafety: a policy without hooks and a policy whose hooks decline
+// every message must produce identical bytes. This is what makes the no-policy
+// path the same path -- a hook that returns nil is a hook that cost one call.
+func TestHookNilSafety(t *testing.T) {
+	reqIn := "GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"
+	respIn := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+
+	declining := &Policy{
+		ClientAddr:      "203.0.113.7",
+		XForwardedProto: "http",
+		RequestHook:     func(*http.Request) *RequestVerdict { return nil },
+		ResponseHook:    func(*http.Response) *ResponseVerdict { return nil },
+	}
+	plain := tunnelPolicy()
+
+	gotReq, gotResp := pair(t, declining, reqIn, respIn)
+	wantReq, wantResp := pair(t, plain, reqIn, respIn)
+	check(t, "request", gotReq, wantReq)
+	check(t, "response", gotResp, wantResp)
+
+	// A hook is a transformation even when it declines: IsNoop must not let a
+	// caller skip the wrapping the hook path needs.
+	if declining.IsNoop() {
+		t.Fatalf("a policy with hooks reports itself a no-op")
+	}
+}
+
+// TestHookRewritesMergeWithTheStaticPolicy: the hook's adds and removes are
+// merged into the same head rewrite as the static ones, removes first, and the
+// host entry of a request add overrides the host rather than adding a second
+// one.
+func TestHookRewritesMergeWithTheStaticPolicy(t *testing.T) {
+	p := &Policy{
+		HostHeader:           "rewrite",
+		UpstreamHost:         "upstream.example",
+		XForwardedProto:      "http",
+		ClientAddr:           "203.0.113.7",
+		RequestHeaderAdd:     []string{"X-Static: 1"},
+		RequestHeaderRemove:  []string{"X-Drop-Me"},
+		ResponseHeaderAdd:    []string{"X-Static: resp"},
+		ResponseHeaderRemove: []string{"X-Res-Drop"},
+		RequestHook: func(req *http.Request) *RequestVerdict {
+			return &RequestVerdict{
+				Add:    []string{"X-Hook: 2", "Host: hook.example"},
+				Remove: []string{"X-Hook-Drop"},
+			}
+		},
+		ResponseHook: func(resp *http.Response) *ResponseVerdict {
+			return &ResponseVerdict{
+				Add:    []string{"X-Hook: resp"},
+				Remove: []string{"X-Res-Hook-Drop"},
+			}
+		},
+	}
+
+	reqIn := "GET /a HTTP/1.1\r\nHost: a.example\r\nX-Drop-Me: yes\r\nX-Hook-Drop: yes\r\n\r\n"
+	respIn := "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Res-Drop: yes\r\nX-Res-Hook-Drop: yes\r\n\r\n"
+
+	gotReq, gotResp := pair(t, p, reqIn, respIn)
+
+	// Both sources of change are present in the same head: the static rewrite
+	// (the X-Forwarded pair, the static add, the upstream host) and the hook's
+	// (its add, its override of the host). The exact field order among them is
+	// the static rewrite's business and is pinned by cases 1-5; what is
+	// asserted here is that neither source swallowed the other.
+	for _, want := range []string{
+		"Host: hook.example", "X-Forwarded-Host: a.example", "X-Forwarded-For: 203.0.113.7",
+		"X-Forwarded-Proto: http", "X-Static: 1", "X-Hook: 2",
+	} {
+		if !strings.Contains(gotReq, want) {
+			t.Fatalf("request rewrite dropped %q:\n%q", want, gotReq)
+		}
+	}
+	for _, gone := range []string{"X-Drop-Me", "X-Hook-Drop"} {
+		if strings.Contains(gotReq, gone) {
+			t.Fatalf("request rewrite kept %q, which was removed:\n%q", gone, gotReq)
+		}
+	}
+	// The hook's "Host: hook.example" replaced the host rather than adding a
+	// second Host field: the merge has to be by name, not by append.
+	if strings.Count(gotReq, "\r\nHost:") != 1 {
+		t.Fatalf("the hook's host add did not override the existing Host field: %q", gotReq)
+	}
+
+	for _, want := range []string{"X-Static: resp", "X-Hook: resp"} {
+		if !strings.Contains(gotResp, want) {
+			t.Fatalf("response rewrite dropped %q:\n%q", want, gotResp)
+		}
+	}
+	for _, gone := range []string{"X-Res-Drop", "X-Res-Hook-Drop"} {
+		if strings.Contains(gotResp, gone) {
+			t.Fatalf("response rewrite kept %q, which was removed:\n%q", gone, gotResp)
+		}
+	}
+}
+
+// TestHookSeesHeadOnlyObjects: the hook is handed what the head bytes can
+// describe, and nothing is invented for the fields they cannot.
+func TestHookSeesHeadOnlyObjects(t *testing.T) {
+	var gotMethod, gotPath, gotHost, gotProto, gotURI, gotHeader string
+	var gotTLS *tls.ConnectionState
+	var gotBody io.ReadCloser
+	p := &Policy{
+		RequestHook: func(req *http.Request) *RequestVerdict {
+			gotMethod = req.Method
+			gotPath = req.URL.Path
+			gotHost = req.Host
+			gotProto = req.Proto
+			gotURI = req.RequestURI
+			gotHeader = req.Header.Get("X-Probe")
+			gotTLS = req.TLS
+			gotBody = req.Body
+			return nil
+		},
+	}
+	respIn := "HTTP/1.1 204 No Content\r\n\r\n"
+	gotReq, _ := pair(t, p, "POST /deep/path?q=1 HTTP/1.1\r\nHost: a.example\r\nX-Probe: yes\r\nContent-Length: 4\r\n\r\nbody", respIn)
+
+	if gotMethod != "POST" || gotPath != "/deep/path" || gotHost != "a.example" ||
+		gotProto != "HTTP/1.1" || gotURI != "/deep/path?q=1" || gotHeader != "yes" {
+		t.Fatalf("the hook did not see the request it describes: %q %q %q %q %q %q",
+			gotMethod, gotPath, gotHost, gotProto, gotURI, gotHeader)
+	}
+	if gotTLS != nil {
+		t.Fatalf("TLS was populated from a plaintext head: %v", gotTLS)
+	}
+	// "Body fields are not meaningful" has a precise meaning: the object is
+	// built from the head bytes, so a body reader on it reads the head buffer,
+	// not the live stream. Reading it yields nothing, and -- the invariant that
+	// matters -- the rewriter still copies the body it never gave the hook.
+	if gotBody != nil && gotBody != http.NoBody {
+		if n, err := io.ReadAll(gotBody); err == nil && len(n) > 0 {
+			t.Fatalf("the hook's body reader handed over live stream bytes: %q", n)
+		}
+	}
+	if !strings.HasSuffix(gotReq, "\r\n\r\nbody") {
+		t.Fatalf("the body did not reach the upstream: %q", gotReq)
+	}
+}
+
+// TestHookTerminateEmitsSyntheticResponse: a terminating verdict drops the
+// request -- the upstream is never handed it, and never asked anything -- and
+// answers the client with a response net/http can read, after which the
+// connection ends.
+func TestHookTerminateEmitsSyntheticResponse(t *testing.T) {
+	term := syntheticTermination()
+	p := &Policy{
+		RequestHook: func(req *http.Request) *RequestVerdict {
+			if req.URL.Path == "/maintenance" {
+				return &RequestVerdict{Terminate: term}
+			}
+			return nil
+		},
+	}
+
+	reqIn := "POST /maintenance HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nbody"
+	// The upstream says nothing, because it is never spoken to.
+	req, resp := NewPair(strings.NewReader(reqIn), strings.NewReader(""), p)
+
+	// The request side forwards nothing: the head is dropped, and the body the
+	// client keeps sending is drained rather than passed on.
+	if got := drain(t, req); got != "" {
+		t.Fatalf("a terminated request reached the upstream: %q", got)
+	}
+
+	s := newHTTPStream(t, resp)
+	got, body := s.next()
+	if got.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503", got.StatusCode)
+	}
+	if got.Header.Get("Retry-After") != "60" {
+		t.Fatalf("the verdict's header was not emitted: %v", got.Header)
+	}
+	if string(body) != "maintenance\n" {
+		t.Fatalf("body = %q, want %q", body, "maintenance\n")
+	}
+	// net/http reads Connection: close as "this message ends the connection",
+	// which is the framing the renderer promised (and which
+	// TestSyntheticResponseRender pins byte for byte).
+	if !got.Close {
+		t.Fatalf("a synthetic response must be the last message on the connection")
+	}
+	s.done()
+}
+
+// TestHookTerminateBeatsAnAvailableResponse: the pending termination is emitted
+// before the source is read, so a response that is already sitting in the
+// upstream's buffer is not delivered to a client whose request was refused.
+func TestHookTerminateBeatsAnAvailableResponse(t *testing.T) {
+	p := &Policy{
+		RequestHook: func(req *http.Request) *RequestVerdict {
+			if req.URL.Path == "/admin" {
+				return &RequestVerdict{Terminate: &SyntheticResponse{StatusCode: 403}}
+			}
+			return nil
+		},
+	}
+
+	reqIn := "GET /ok HTTP/1.1\r\nHost: a.example\r\n\r\n" +
+		"GET /admin HTTP/1.1\r\nHost: a.example\r\n\r\n"
+	respIn := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" +
+		"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nleaked!"
+
+	req, resp := NewPair(strings.NewReader(reqIn), strings.NewReader(respIn), p)
+
+	// First message: an ordinary request, and the response it asked for. One
+	// read per step, in the order a live connection produces them.
+	check(t, "request 1", readOnce(t, req), "GET /ok HTTP/1.1\r\nHost: a.example\r\n\r\n")
+	check(t, "response 1 head", readOnce(t, resp), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+	check(t, "response 1 body", readOnce(t, resp), "ok")
+
+	// Second message: refused. The request is dropped and the answer is the
+	// 403, not the "leaked!" response the upstream had already sent.
+	if got := drain(t, req); got != "" {
+		t.Fatalf("the refused request was forwarded: %q", got)
+	}
+	got := drain(t, resp)
+	if !strings.Contains(got, "403") {
+		t.Fatalf("the synthetic response was not emitted: %q", got)
+	}
+	if strings.Contains(got, "leaked!") {
+		t.Fatalf("an upstream response was delivered for a refused request: %q", got)
+	}
+}
+
+// TestSyntheticResponseGoesThroughTheResponseHook: an answer the edge fabricated
+// is still a response, so the response-phase policy gets to change it -- that is
+// how a remove-headers or add-headers action reaches a deny or a custom-response.
+// ngrok documents this for a request-phase custom-response ("actions defined in
+// the on_http_response phase will still be executed"), and it is what workstream
+// B's e2e expected of the mux path.
+func TestSyntheticResponseGoesThroughTheResponseHook(t *testing.T) {
+	var saw *http.Response
+	p := &Policy{
+		RequestHook: func(req *http.Request) *RequestVerdict {
+			if req.URL.Path != "/admin" {
+				return nil
+			}
+			// No StatusCode: the documented default 403. The hook must be told
+			// the status the client is going to get, not the zero it was built
+			// with, or a rule written against res.status_code would miss it.
+			return &RequestVerdict{Terminate: &SyntheticResponse{
+				Headers: []string{"Server: ngrok/edge", "Content-Type: text/plain"},
+				Body:    "no",
+			}}
+		},
+		ResponseHook: func(resp *http.Response) *ResponseVerdict {
+			saw = resp
+			return &ResponseVerdict{
+				// "server" is not the casing the response carries, and "x-absent"
+				// is not on the response at all: both are how a policy names a
+				// header, and neither may go wrong.
+				Remove: []string{"server", "x-absent"},
+				Add:    []string{"X-Policy: applied"},
+			}
+		},
+	}
+
+	public := &fakeConn{src: strings.NewReader("GET /admin HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+	upstream := &fakeConn{src: strings.NewReader(""), id: "http:upstream"}
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("a terminated request reached the upstream: %q", got)
+	}
+	check(t, "response", drain(t, fromUpstream),
+		"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nX-Policy: applied\r\n"+
+			"Content-Length: 2\r\nConnection: close\r\n\r\nno")
+
+	if saw == nil {
+		t.Fatal("the response hook was never asked about the synthetic response")
+	}
+	if saw.StatusCode != 403 {
+		t.Fatalf("the hook saw status %d, want the 403 the client is sent", saw.StatusCode)
+	}
+	if got := saw.Header.Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("the hook saw Content-Type %q, want the response's own header", got)
+	}
+	if got := saw.Header.Get("Server"); got != "ngrok/edge" {
+		t.Fatalf("the hook saw Server %q, want the response's own header", got)
+	}
+	if len(upstream.warned) != 0 {
+		t.Fatalf("a hook that worked must not warn: %v", upstream.warned)
+	}
+}
+
+// TestSyntheticResponseHookPanicIsFailOpen: the fail-open rule reaches the
+// synthetic path too. A response hook that panics on a fabricated response
+// cannot cost the client the answer it was refused with -- the terminate goes out
+// unmodified, and the failure is logged on the connection's response side.
+func TestSyntheticResponseHookPanicIsFailOpen(t *testing.T) {
+	term := syntheticTermination()
+	p := &Policy{
+		RequestHook: func(*http.Request) *RequestVerdict {
+			return &RequestVerdict{Terminate: term}
+		},
+		ResponseHook: func(*http.Response) *ResponseVerdict { panic("response hook boom") },
+	}
+
+	public := &fakeConn{src: strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+	upstream := &fakeConn{src: strings.NewReader(""), id: "http:upstream"}
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("a terminated request reached the upstream: %q", got)
+	}
+	check(t, "response", drain(t, fromUpstream), string(term.Render()))
+
+	if len(upstream.warned) != 1 || !strings.Contains(upstream.warned[0], "response hook panicked") {
+		t.Fatalf("want one warning about the panicking response hook, got %v", upstream.warned)
+	}
+}
+
+// TestHookPanicFailsOpen: a hook that panics is a hook that does not apply. The
+// connection keeps going with the static rewrite, and the failure is logged
+// once per direction on the connection it happened on.
+func TestHookPanicFailsOpen(t *testing.T) {
+	p := &Policy{
+		ClientAddr:      "203.0.113.7",
+		XForwardedProto: "http",
+		RequestHook:     func(*http.Request) *RequestVerdict { panic("request hook boom") },
+		ResponseHook:    func(*http.Response) *ResponseVerdict { panic("response hook boom") },
+	}
+
+	public := &fakeConn{src: strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+	upstream := &fakeConn{src: strings.NewReader("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"), id: "http:upstream"}
+
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	check(t, "request", drain(t, toUpstream),
+		"GET /a HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 203.0.113.7\r\nX-Forwarded-Proto: http\r\n\r\n")
+	check(t, "response", drain(t, fromUpstream), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+	if len(public.warned) != 1 || !strings.Contains(public.warned[0], "request hook panicked") {
+		t.Fatalf("want one warning about the request hook, got %v", public.warned)
+	}
+	if len(upstream.warned) != 1 || !strings.Contains(upstream.warned[0], "response hook panicked") {
+		t.Fatalf("want one warning about the response hook, got %v", upstream.warned)
+	}
+}
+
+// TestHookNotCalledOn1xx: interim responses are not responses any action
+// describes, and the 1xx rule has to survive the hook path.
+func TestHookNotCalledOn1xx(t *testing.T) {
+	calls := 0
+	var statuses []int
+	p := &Policy{
+		RequestHook: func(*http.Request) *RequestVerdict { return nil },
+		ResponseHook: func(resp *http.Response) *ResponseVerdict {
+			calls++
+			statuses = append(statuses, resp.StatusCode)
+			return nil
+		},
+	}
+
+	respIn := "HTTP/1.1 100 Continue\r\n\r\n" +
+		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" +
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" +
+		"HTTP/1.1 204 No Content\r\n\r\n"
+
+	req, resp := NewPair(strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), strings.NewReader(respIn), p)
+
+	check(t, "request", readOnce(t, req), "GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n")
+	check(t, "100", readOnce(t, resp), "HTTP/1.1 100 Continue\r\n\r\n")
+	check(t, "200 head", readOnce(t, resp), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+	check(t, "200 body", readOnce(t, resp), "ok")
+	check(t, "101", readOnce(t, resp),
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+
+	if calls != 1 || len(statuses) != 1 || statuses[0] != 200 {
+		t.Fatalf("the response hook ran %d time(s) on %v; only the 200 is a response", calls, statuses)
+	}
+}
+
+// TestHookHostAddNeedsNoHostOverrideOnResponses: a "Host" add is a host override
+// on the request side and an ordinary header on the response side, which is
+// what the two directions' rewrites do with it.
+func TestHookHostAddOnResponseIsJustAHeader(t *testing.T) {
+	p := &Policy{
+		ResponseHook: func(*http.Response) *ResponseVerdict {
+			return &ResponseVerdict{Add: []string{"X-Served: yes"}}
+		},
+	}
+	gotReq, gotResp := pair(t, p, "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+	check(t, "request", gotReq, "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n")
+	check(t, "response", gotResp, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Served: yes\r\n\r\n")
+}
+
+// TestSyntheticResponseRender pins the fabricated message itself: framing the
+// caller cannot break, a status the caller cannot omit, and CR/LF in a header
+// value dropped rather than smuggled.
+func TestSyntheticResponseRender(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *SyntheticResponse
+		want string
+	}{
+		{
+			"deny",
+			&SyntheticResponse{StatusCode: 403},
+			"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		},
+		{
+			"zero status is a 403",
+			&SyntheticResponse{},
+			"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		},
+		{
+			"headers and body",
+			&SyntheticResponse{
+				StatusCode: 503,
+				Headers:    []string{"Retry-After: 60", "Content-Type: text/plain"},
+				Body:       "down",
+			},
+			"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 60\r\nContent-Type: text/plain\r\n" +
+				"Content-Length: 4\r\nConnection: close\r\n\r\ndown",
+		},
+		{
+			"framing is the renderer's to write",
+			&SyntheticResponse{
+				StatusCode: 200,
+				Headers:    []string{"Content-Length: 999", "Connection: keep-alive", "X-Ok: 1"},
+				Body:       "hi",
+			},
+			"HTTP/1.1 200 OK\r\nX-Ok: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+		},
+		{
+			"unusable entries are dropped",
+			&SyntheticResponse{
+				StatusCode: 200,
+				Headers:    []string{"no colon", "Bad Name: x", "X-CRLF: a\r\nX-Injected: b", "X-Good: 1"},
+			},
+			"HTTP/1.1 200 OK\r\nX-Good: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check(t, "rendered", string(tt.resp.Render()), tt.want)
+		})
+	}
+}
+
+// blockingConn is a conn.Conn whose Read parks until it is closed: the upstream
+// that will never answer, in the shape the wake exists for. It is also the guard
+// against a test that hangs instead of failing: the timeout read returns an error
+// saying so.
+//
+// SetReadDeadline stores the deadline and deliberately does NOT wake the parked
+// read. That is not a shortcut, it is a model of the transport the terminate hang
+// was found on: smux's Stream.SetReadDeadline only stores the value and
+// Stream.Read samples it once, on entry (smux/v2 stream.go, waitRead), so a read
+// already parked never learns that one was set. A TCP socket would wake -- the
+// kernel does that -- and an earlier version of this fake woke too, which is
+// exactly why the deadline-based wake passed here while the mux path hung. The
+// wake closes the source now (NewConnPair), so closing must wake this read.
+type blockingConn struct {
+	conn.Conn
+	entered  chan struct{}
+	closed   chan struct{}
+	enterOne sync.Once
+	closeOne sync.Once
+	dst      bytes.Buffer
+
+	// deadline is written and never read: the point of the fake is what the
+	// connection does with one, which is nothing.
+	deadline time.Time
+}
+
+func newBlockingConn() *blockingConn {
+	return &blockingConn{entered: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (c *blockingConn) Read(p []byte) (int, error) {
+	c.enterOne.Do(func() { close(c.entered) })
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-time.After(5 * time.Second):
+		return 0, errors.New("the parked read was never woken")
+	}
+}
+
+func (c *blockingConn) Write(p []byte) (int, error) { return c.dst.Write(p) }
+
+func (c *blockingConn) Close() error {
+	c.closeOne.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blockingConn) SetReadDeadline(d time.Time) error {
+	c.deadline = d
+	return nil
+}
+
+// TestHookWakeUnblocksParkedResponseSide is the race the spec's terminate model
+// has to solve: conn.Join drives both directions at once, so the response side
+// is usually already parked in a read of its upstream when the request side
+// decides to terminate -- and in the terminated case the upstream is never
+// asked anything, so that read would never return. The wake (closing the
+// response side's source, see NewConnPair) is what turns "wait forever" into
+// "emit the synthetic response now".
+//
+// The connection this parks in is the fake above, which wakes on Close only, and
+// the response is waited for with a bound rather than until it arrives. That
+// bound is not decoration: a deadline-based wake leaves the read parked until the
+// fake's own five-second give-up (it has to return something), so the response
+// still lands, five seconds late, and a test that only waits for the bytes passes
+// on the bug. The wake has to work, not merely not-forever.
+// TestHookTerminateOverMuxStream is the same case on a real smux stream, where
+// nothing gives up and the read never ends at all.
+func TestHookWakeUnblocksParkedResponseSide(t *testing.T) {
+	term := syntheticTermination()
+	p := &Policy{
+		RequestHook: func(*http.Request) *RequestVerdict {
+			return &RequestVerdict{Terminate: term}
+		},
+	}
+
+	public := &fakeConn{src: strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+	upstream := newBlockingConn()
+
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	type result struct {
+		out string
+		err error
+	}
+	respOut := make(chan result, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- result{b.String(), err}
+	}()
+
+	// Wait until the response side really is parked in the blocking read, so
+	// that the wake is exercised rather than the check-before-read path.
+	<-upstream.entered
+
+	// The request side terminates the connection.
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("the terminated request was forwarded: %q", got)
+	}
+
+	select {
+	case got := <-respOut:
+		if got.err != nil {
+			t.Fatalf("the response side did not end cleanly: %v", got.err)
+		}
+		check(t, "response", got.out, string(term.Render()))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the parked response side was not woken promptly: a deadline set on " +
+			"a connection whose read is already waiting is stored and never seen")
+	}
+}
+
+// observedStream reports the first read the rewriter makes of it, then delegates.
+// It is how the mux test below knows the response side reached its parked read:
+// nothing in smux reports that, and the read has to be parked before the wake is
+// what ends it -- otherwise the terminate is taken on the way in (stepHead's
+// entry check) and the case the test exists for is not exercised.
+type observedStream struct {
+	conn.Conn
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *observedStream) Read(p []byte) (int, error) {
+	s.once.Do(func() { close(s.entered) })
+	return s.Conn.Read(p)
+}
+
+// TestHookTerminateOverMuxStream: the terminate case above, on the transport the
+// hang was actually reported on.
+//
+// The response source is a real smux stream over an in-memory pipe, wrapped with
+// conn.Wrap exactly as the server wraps one (server/mux.go, handleStream), and the
+// response side is parked in a read of it when the request side terminates. With
+// a deadline-based wake it stays parked there -- smux's Stream.SetReadDeadline
+// cannot end a read that is already waiting, which the fake above cannot show
+// but this does -- so this is the test that fails ("the synthetic response was
+// never delivered") on the bug workstream B hit in its e2e, and the reason the
+// wake closes the source instead.
+func TestHookTerminateOverMuxStream(t *testing.T) {
+	term := syntheticTermination()
+	p := &Policy{
+		RequestHook: func(*http.Request) *RequestVerdict {
+			return &RequestVerdict{Terminate: term}
+		},
+	}
+
+	// The smux session: the client end of the pipe is the upstream that says
+	// nothing, the server end is what the tunnel reads responses from.
+	clientPipe, serverPipe := net.Pipe()
+	sess, err := smux.Server(serverPipe, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Server: %v", err)
+	}
+	defer sess.Close()
+	clientSess, err := smux.Client(clientPipe, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	defer clientSess.Close()
+
+	upstreamStream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer upstreamStream.Close()
+
+	// AcceptStream has no deadline of its own, so bound it here rather than
+	// letting a session that never comes up hang the suite.
+	accepted := make(chan *smux.Stream, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		stream, err := sess.AcceptStream()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- stream
+	}()
+	var stream *smux.Stream
+	select {
+	case stream = <-accepted:
+	case err := <-acceptErr:
+		t.Fatalf("AcceptStream: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mux session never accepted the stream")
+	}
+	defer stream.Close()
+
+	respSrc := &observedStream{Conn: conn.Wrap(stream, "pxy"), entered: make(chan struct{})}
+	public := &fakeConn{src: strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+
+	toUpstream, fromUpstream := NewConnPair(public, respSrc, p)
+
+	type result struct {
+		out string
+		err error
+	}
+	respOut := make(chan result, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- result{b.String(), err}
+	}()
+
+	// Wait for the response side to reach the stream, then let that read settle
+	// into the wait smux parks it in. The sleep is a settle, not a
+	// synchronization: no API reports "this stream read is now parked". It only
+	// has to be long enough for the reported case to be the likely one -- the
+	// fake above is where the same path is exact.
+	select {
+	case <-respSrc.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never read the stream")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// The request side terminates: the request is dropped, and the read parked on
+	// the smux stream is ended by closing that stream rather than by a deadline
+	// smux would never notice.
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("the terminated request was forwarded: %q", got)
+	}
+
+	select {
+	case got := <-respOut:
+		if got.err != nil {
+			t.Fatalf("the response side did not end cleanly: %v", got.err)
+		}
+		check(t, "response", got.out, string(term.Render()))
+	case <-time.After(5 * time.Second):
+		t.Fatal("the synthetic response was never delivered: the response side is still parked in the stream read")
+	}
+
+	// And nothing was ever written to the upstream's end of the stream. The read
+	// below reports EOF (the tunnel end closed it) or its deadline, never a byte;
+	// which of the two depends on how the close and the read interleave.
+	if err := upstreamStream.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline on the upstream end: %v", err)
+	}
+	switch n, err := upstreamStream.Read(make([]byte, 64)); {
+	case n != 0:
+		t.Fatalf("the terminated request reached the upstream: %d bytes", n)
+	case err == nil:
+		t.Fatalf("the upstream read returned (0, nil), which is not an ending")
 	}
 }
