@@ -168,7 +168,7 @@ func (s *SyntheticResponse) Render() []byte {
 	out = append(out, '\r', '\n')
 	for _, entry := range s.Headers {
 		name, value, ok := splitAddEntry(entry)
-		if !ok || !isToken(name) || strings.ContainsAny(value, "\r\n") {
+		if !ok || !ValidHeaderToken(name) || !ValidHeaderValue(value) {
 			continue
 		}
 		if strings.EqualFold(name, "content-length") || strings.EqualFold(name, "connection") {
@@ -221,8 +221,17 @@ func syntheticHead(s *SyntheticResponse) *http.Response {
 // Validate checks the policy for CR/LF injection, user-agent targets and
 // malformed add entries. Errors name the offending entry, so a typo'd config
 // fails loudly at load time instead of silently mangling traffic later.
+//
+// This is the one gate for a Policy, whatever built it: the client's config
+// loader validates the header fields of every tunnel by building the Policy it
+// would run and calling this (client/config.go, validateHeaderPolicy), so the
+// rules a config has to satisfy and the rules the rewriter relies on at runtime
+// are the same rules, checked by the same function. The alternative -- the
+// rules spelled again in the loader -- is what let a policy the runtime
+// refuses to compile load as a startup success; see the fuzzing report's R1,
+// which this closes.
 func (p *Policy) Validate() error {
-	if err := validateHostHeader(p.HostHeader); err != nil {
+	if err := ValidateHostHeader(p.HostHeader); err != nil {
 		return err
 	}
 
@@ -234,28 +243,28 @@ func (p *Policy) Validate() error {
 		{"client_addr", p.ClientAddr},
 		{"x_forwarded_proto", p.XForwardedProto},
 	} {
-		if strings.ContainsAny(f.value, "\r\n") {
+		if !ValidHeaderValue(f.value) {
 			return fmt.Errorf("%s %q must not contain CR or LF", f.name, f.value)
 		}
 	}
 
 	for _, entry := range p.RequestHeaderAdd {
-		if err := validateAddEntry("request_header", entry); err != nil {
+		if err := ValidateAddEntry("request_header", entry); err != nil {
 			return err
 		}
 	}
 	for _, entry := range p.ResponseHeaderAdd {
-		if err := validateAddEntry("response_header", entry); err != nil {
+		if err := ValidateAddEntry("response_header", entry); err != nil {
 			return err
 		}
 	}
 	for _, name := range p.RequestHeaderRemove {
-		if err := validateRemoveName("request_header", name); err != nil {
+		if err := ValidateRemoveName("request_header", name); err != nil {
 			return err
 		}
 	}
 	for _, name := range p.ResponseHeaderRemove {
-		if err := validateRemoveName("response_header", name); err != nil {
+		if err := ValidateRemoveName("response_header", name); err != nil {
 			return err
 		}
 	}
@@ -305,48 +314,92 @@ func (p *Policy) IsNoop() bool {
 	return false
 }
 
-// validateHostHeader accepts the two keywords and any explicit hostname that
-// cannot be used to inject a header (spec 4.1). The keywords are matched
-// case-insensitively; any other non-empty value is taken as the hostname to
-// send, so "REWRITE" is not reachable as a host.
-func validateHostHeader(v string) error {
+// ValidateHostHeader checks a host_header configuration value: the two
+// keywords, or an explicit hostname that cannot be used to inject a header
+// (spec 4.1). The keywords are matched case-insensitively; any other non-empty
+// value is taken as the hostname to send, so "REWRITE" is not reachable as a
+// host.
+//
+// It is exported because the value is validated in two places that must agree:
+// here, where it becomes a Host header on the wire, and in the client's config
+// loader, where the user wrote it (client/config.go). A value the loader
+// accepts and this rejects (or the reverse) is a tunnel that either fails to
+// load for no reason or rewrites a Host no upstream will match.
+func ValidateHostHeader(v string) error {
 	switch strings.ToLower(v) {
 	case "", "rewrite", "preserve":
 		return nil
 	}
 	if strings.ContainsAny(v, " \t\r\n/") {
-		return fmt.Errorf("host_header %q is not a valid hostname: no spaces, '/' or CR/LF", v)
+		return fmt.Errorf("invalid host_header %q: must be 'rewrite', 'preserve' or a hostname with no spaces, no '/' and no CR/LF", v)
 	}
 	return nil
 }
 
-// validateAddEntry checks one "Key: value" entry: it must split at a colon,
-// carry a valid field name, and neither name nor value may smuggle a header.
-func validateAddEntry(scope, entry string) error {
-	name, value, ok := splitAddEntry(entry)
-	if !ok {
-		return fmt.Errorf("%s add entry %q must be \"Key: value\"", scope, entry)
+// ValidateAddEntry checks one "Key: value" header entry as a user writes it: in
+// a policy's add list, or in a config file's request_header/response_header
+// add list. It must split at a colon, carry a field name that is an RFC 7230
+// token, must not be user-agent, and must not smuggle a CR or LF onto the wire.
+//
+// scope names the list the entry came from ("request_header", "response_header",
+// ...) so the error says which one to edit. Exported for the same reason
+// ValidateHostHeader is: the config loader and this package have to agree on
+// what an entry may say, and the rules used to exist as three copies -- one per
+// caller -- which is how a value that loads can stop being one that runs.
+func ValidateAddEntry(scope, entry string) error {
+	if err := validateNoCRLF(scope, "add", entry); err != nil {
+		return err
 	}
-	if !isToken(name) {
-		return fmt.Errorf("%s add entry %q: %q is not a valid header name", scope, entry, name)
+
+	colon := strings.IndexByte(entry, ':')
+	if colon < 0 {
+		return fmt.Errorf("%s add entry %q must be formatted as 'key:value'", scope, entry)
+	}
+
+	name := strings.TrimSpace(entry[:colon])
+	if name == "" {
+		return fmt.Errorf("%s add entry %q has an empty header name", scope, entry)
+	}
+	if !ValidHeaderToken(name) {
+		return fmt.Errorf("%s add entry %q: %q is not a valid HTTP header name", scope, entry, name)
 	}
 	if strings.EqualFold(name, "user-agent") {
-		return fmt.Errorf("%s add entry %q: user-agent cannot be added (ngrok parity)", scope, entry)
+		return fmt.Errorf("%s add entry %q: user-agent may not be added or removed (ngrok parity)", scope, entry)
 	}
-	if strings.ContainsAny(value, "\r\n") {
-		return fmt.Errorf("%s add entry %q: value must not contain CR or LF", scope, entry)
-	}
+
+	// The value keeps everything after the first colon -- "X-Url: http://h" is
+	// one entry -- and its own CR/LF check is the whole-entry one above.
 	return nil
 }
 
-// validateRemoveName checks a header name that a policy wants to drop.
-func validateRemoveName(scope, name string) error {
-	if !isToken(name) {
-		return fmt.Errorf("%s remove entry %q is not a valid header name", scope, name)
+// ValidateRemoveName checks a header name a caller wants dropped, on the same
+// terms as ValidateAddEntry.
+func ValidateRemoveName(scope, name string) error {
+	if err := validateNoCRLF(scope, "remove", name); err != nil {
+		return err
+	}
+
+	if name == "" {
+		return fmt.Errorf("%s remove entry %q has an empty header name", scope, name)
+	}
+	if !ValidHeaderToken(name) {
+		return fmt.Errorf("%s remove entry %q is not a valid HTTP header name", scope, name)
 	}
 	if strings.EqualFold(name, "user-agent") {
-		return fmt.Errorf("%s remove entry %q: user-agent cannot be removed (ngrok parity)", scope, name)
+		return fmt.Errorf("%s remove entry %q: user-agent may not be added or removed (ngrok parity)", scope, name)
 	}
+
+	return nil
+}
+
+// validateNoCRLF is the header-injection guard for a configured entry: nothing
+// written in a list may contain a CR or an LF, wherever in the string it
+// appears. verb is the list's operation ("add"/"remove"), for the message.
+func validateNoCRLF(scope, verb, entry string) error {
+	if !ValidHeaderValue(entry) {
+		return fmt.Errorf("%s %s entry %q contains a CR or LF (header injection)", scope, verb, entry)
+	}
+
 	return nil
 }
 
@@ -362,9 +415,26 @@ func splitAddEntry(entry string) (name, value string, ok bool) {
 	return strings.TrimSpace(entry[:i]), strings.TrimSpace(entry[i+1:]), true
 }
 
-// isToken reports whether s is a non-empty RFC 7230 token, the only thing a
-// header name may be.
-func isToken(s string) bool {
+// ValidHeaderValue reports whether v may be written as an HTTP field value:
+// everything except CR and LF, which are the two bytes that end a field line
+// and therefore the two that turn a value into a second, attacker-chosen
+// header. Every check of a configured value in this repository is this rule --
+// the add-list entries here, the headers map of a policy's add-headers action,
+// the interpolated values the hooks produce -- so it is exported and spelled
+// once.
+func ValidHeaderValue(v string) bool {
+	return !strings.ContainsAny(v, "\r\n")
+}
+
+// ValidHeaderToken reports whether s is a non-empty RFC 7230 token, the only
+// thing a header name may be -- on the wire, in a policy's add list, in a
+// config file's header lists, and as the name a policy wants removed.
+//
+// Exported because that last part is not this package's private business: the
+// grammar is the protocol's, and a caller that accepts a name this would refuse
+// (or the reverse) is a header that either never reaches the upstream or does
+// so under a name nobody validated.
+func ValidHeaderToken(s string) bool {
 	if s == "" {
 		return false
 	}
@@ -428,7 +498,7 @@ func newHookRewrite(add, remove []string, hostOverride bool) *hookRewrite {
 	}
 	for _, entry := range add {
 		name, value, ok := splitAddEntry(entry)
-		if !ok || !isToken(name) || strings.ContainsAny(value, "\r\n") {
+		if !ok || !ValidHeaderToken(name) || !ValidHeaderValue(value) {
 			continue
 		}
 		if hostOverride && strings.EqualFold(name, "host") {
@@ -528,7 +598,7 @@ func resolveHost(hostHeader, upstreamHost string) string {
 func compileAdds(scope string, entries []string, lg log.Logger, hostOverrides bool) (adds []headerAdd, hostValue string) {
 	for _, entry := range entries {
 		name, value, ok := splitAddEntry(entry)
-		if !ok || !isToken(name) || strings.ContainsAny(value, "\r\n") {
+		if !ok || !ValidHeaderToken(name) || !ValidHeaderValue(value) {
 			lg.Warn("%s add entry %q is not usable; ignoring it", scope, entry)
 			continue
 		}
@@ -609,16 +679,19 @@ type connState struct {
 	upgraded bool
 
 	// terminate carries a synthetic response from the direction that decided on
-	// it (the request side, whose hook terminated the request) to the direction
-	// that can put it on the wire (the response side, which owns everything the
-	// client reads after a request). It is buffered, size 1, and nil when the
-	// policy has no request hook: with no hook there is nothing that can
-	// terminate, and every field here stays out of the per-message path.
+	// it (the request side: a hook terminated the request, or a head the policy
+	// could not read was refused) to the direction that can put it on the wire
+	// (the response side, which owns everything the client reads after a
+	// request). terminateGen is the request generation it answers -- see reqGen
+	// and respGen below -- and it is what keeps a terminate for a request that
+	// is not the one the response side is answering right now from being
+	// delivered in its place.
 	//
 	// One slot is the right size. The request side can only terminate the
 	// request it is currently parsing, and after a terminate it stops parsing
 	// altogether (it drains), so a second value could never be published.
-	terminate chan *SyntheticResponse
+	terminate    *SyntheticResponse
+	terminateGen int
 
 	// wakeResponse unblocks the response side when a terminate is published
 	// while it is parked in a read of its own source. Without it the response
@@ -634,54 +707,133 @@ type connState struct {
 	wakeResponse func()
 
 	// respParked is true while the response side is between messages and about
-	// to block in a read. That is the only state in which the wake is both
-	// needed (a read is in flight) and harmless (no message bytes have been
-	// read yet, so interrupting it cannot truncate one).
+	// to block in a read of the source; parkedGen is the request generation it
+	// is about to answer. That is the only state in which the wake is both
+	// needed (a read is in flight) and harmless (no message bytes have been read
+	// yet, so interrupting it cannot truncate one).
+	//
+	// The pair is written by parkResponse in the same critical section that
+	// looks for a pending terminate, and that atomicity is the whole point. Split
+	// into "is there a terminate?" and "I am about to block", a terminate
+	// published between the two answers ends up in a slot whose owner is already
+	// asleep: no wake is sent, the read never returns, and the connection hangs
+	// until the client gives up. Set next to a generation, the same state also
+	// keeps the wake from firing for a terminate that belongs to a *later*
+	// request than the one being waited for: that wake would close the source
+	// mid-read and throw away a response that was on its way.
 	respParked bool
+	parkedGen  int
+
+	// reqGen counts the request heads the request side has begun, this one
+	// included. It is the connection's request clock. A generation is claimed by
+	// beginRequest before the head is read, so a head that never becomes a
+	// message (an oversized one, refused under a policy) still has one.
+	reqGen int
+
+	// respGen counts the final response heads the response side has emitted. The
+	// response it is about to look for answers request respGen+1, which is
+	// therefore the generation a terminate has to carry to be its answer: the
+	// two counters are the same clock read from the two ends of a connection
+	// where one request is answered by one final response.
+	respGen int
 }
 
-// setTerminate publishes a synthetic response for the response side to emit.
-// The first verdict wins: a terminate can only be published once per
-// connection, and the buffer is never full in practice.
-func (st *connState) setTerminate(s *SyntheticResponse) {
+// beginRequest claims the generation of the request head the request side is
+// about to read. It is called once per head, before the head is assembled.
+func (st *connState) beginRequest() int {
 	st.mu.Lock()
-	if st.terminate != nil {
-		select {
-		case st.terminate <- s:
-		default:
-		}
+	defer st.mu.Unlock()
+	st.reqGen++
+	return st.reqGen
+}
+
+// nextResponseGen is the generation of the request whose answer the response
+// side is about to look for.
+func (st *connState) nextResponseGen() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.respGen + 1
+}
+
+// recordResponse counts one final response head. Interim 1xx heads are not
+// responses to a request in their own right -- they are the interim answer or
+// the upgrade handshake -- so they leave the clock alone.
+func (st *connState) recordResponse() {
+	st.mu.Lock()
+	st.respGen++
+	st.mu.Unlock()
+}
+
+// setTerminate publishes a synthetic response for the response side to emit,
+// tagged with the request generation it answers. The first verdict wins: a
+// terminate can only be published once per connection (the request side drains
+// after one), and the slot is never full in practice.
+//
+// The wake is sent only when the response side is parked and this terminate is
+// the answer to the request it is parked on. A terminate for a later request
+// must not wake it: the response it is waiting for is a real one, from an
+// upstream that was asked, and closing the source under that read would
+// truncate it. The terminate is not lost by waiting -- the response side looks
+// for it again at the start of every message, which is when its generation has
+// caught up (parkResponse).
+func (st *connState) setTerminate(s *SyntheticResponse, gen int) {
+	st.mu.Lock()
+	if st.terminate == nil {
+		st.terminate, st.terminateGen = s, gen
 	}
-	parked, wake := st.respParked, st.wakeResponse
+	parked, want, wake := st.respParked, st.parkedGen, st.wakeResponse
 	st.mu.Unlock()
 
-	if parked && wake != nil {
+	if parked && gen == want && wake != nil {
 		wake()
 	}
 }
 
-// takeTerminate removes a pending synthetic response, or returns nil when there
-// is none. Non-blocking: this is consulted on the response side's message path,
-// which must never wait for a verdict that may never come.
-func (st *connState) takeTerminate() *SyntheticResponse {
+// parkResponse is the response side's entry into one message: one atomic step
+// that either takes the terminate published for the generation it is about to
+// answer, or records that it is about to block in a read of its source. Doing
+// both under one lock is what makes a terminate published *during* the step
+// impossible to lose -- whichever order the two sides get the lock in, the
+// response side either finds the terminate or is registered as parked before it
+// is (see the respParked field comment).
+//
+// A terminate for a generation that has already gone by is taken too: it cannot
+// be answered by a later message, and refusing it would leave the response side
+// parked on an upstream that is no longer being asked anything.
+func (st *connState) parkResponse(gen int) *SyntheticResponse {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.terminate == nil {
-		return nil
-	}
-	select {
-	case s := <-st.terminate:
+	if st.terminate != nil && st.terminateGen <= gen {
+		s := st.terminate
+		st.terminate, st.terminateGen = nil, 0
 		return s
-	default:
-		return nil
 	}
+	st.respParked, st.parkedGen = true, gen
+	return nil
 }
 
-// setRespParked records whether the response side is between messages and about
-// to block in a read of the source.
-func (st *connState) setRespParked(parked bool) {
+// unparkResponse leaves the parked window: the response side is committed to a
+// message (or done with one) and no longer needs to be woken out of a read.
+func (st *connState) unparkResponse() {
 	st.mu.Lock()
-	st.respParked = parked
+	st.respParked, st.parkedGen = false, 0
 	st.mu.Unlock()
+}
+
+// takeTerminate removes the pending terminate when it answers gen, and returns
+// nil otherwise. This is the read-error path's version of parkResponse -- the
+// wake ends the read, and this is how the response side finds what the wake was
+// sent for -- so it is consulted non-blockingly on a message path that must
+// never wait for a verdict that may never come.
+func (st *connState) takeTerminate(gen int) *SyntheticResponse {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.terminate == nil || st.terminateGen > gen {
+		return nil
+	}
+	s := st.terminate
+	st.terminate, st.terminateGen = nil, 0
+	return s
 }
 
 // recordRequest publishes everything the response side needs to know about the
@@ -760,6 +912,12 @@ type streamRewriter struct {
 	// rather than one per message.
 	hookWarned bool
 
+	// gen is the request generation of the head the request side is assembling,
+	// as connState.beginRequest gave it out, or 0 on the response side and on a
+	// connection whose policy has no request hook -- nothing can terminate
+	// there, so no generation is ever read.
+	gen int
+
 	// gz is the live gzip transform of the response body being copied, or nil.
 	// It is the only switch between the identity path and the transform: the
 	// phases that read and frame the input are the same either way, and the sink
@@ -789,13 +947,6 @@ func newPair(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger) (
 func newPairWithWake(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger, wake func()) (req, resp io.Reader) {
 	cp := compilePolicy(p, reqLog)
 	st := &connState{wakeResponse: wake}
-
-	// The terminate channel exists only when something can terminate. A policy
-	// without a request hook -- every policy the client builds today -- keeps
-	// the response side's per-message path at the two nil checks it always had.
-	if cp.reqHook != nil {
-		st.terminate = make(chan *SyntheticResponse, 1)
-	}
 
 	req = &streamRewriter{
 		side: sideRequest, dir: "request",
@@ -969,23 +1120,48 @@ func (r *streamRewriter) stepHead() error {
 		return nil
 	}
 
-	if r.side == sideResponse {
+	// gen is the request generation this call is about: on the request side the
+	// generation of the head being assembled, on the response side the
+	// generation of the request whose answer is being looked for. It is claimed
+	// before the head is read, so that a head which never becomes a message can
+	// still be tagged (see refuseHead).
+	var gen int
+	if r.side == sideRequest {
+		// A generation is only ever read by a terminate, and only a request hook
+		// can publish one: a policy without one -- every policy the client
+		// builds today -- keeps this off the per-request path entirely.
+		if r.cp.reqHook != nil {
+			gen = r.st.beginRequest()
+			r.gen = gen
+		}
+	} else {
+		gen = r.st.nextResponseGen()
+		// Test-only window into the park: the race this package has to survive
+		// is a terminate published in the instant between deciding there is
+		// nothing pending and registering as parked, and nothing else can open
+		// that instant on purpose. See testParkGapHook.
+		if testParkGapHook != nil {
+			testParkGapHook(r.st)
+		}
 		// A terminate that is already published is emitted before the source is
 		// read at all: there is no response to wait for, because the request it
-		// would have answered never left this process.
-		if term := r.st.takeTerminate(); term != nil {
+		// would have answered never left this process. From here until this
+		// function returns, this direction may block in a read, which is the
+		// window in which a terminate published by the request side is allowed
+		// to interrupt it -- and it is safe precisely here: nothing of a message
+		// has been read yet, so an interrupted read cannot truncate one.
+		// Between messages is also the only place the terminate is looked for,
+		// which is why a terminate that arrives while a response is streaming is
+		// answered after that response finishes (spec 3.1).
+		//
+		// Both halves happen under one lock (parkResponse): taken separately,
+		// a terminate published between them is a terminate whose wake nobody
+		// sends, and the connection hangs.
+		if term := r.st.parkResponse(gen); term != nil {
 			r.emitSynthetic(term)
 			return nil
 		}
-		// From here until this function returns, this direction may block in a
-		// read. That is the window in which a terminate published by the request
-		// side is allowed to interrupt it -- and it is safe precisely here:
-		// nothing of a message has been read yet, so an interrupted read cannot
-		// truncate one. Between messages is also the only place the terminate is
-		// looked for, which is why a terminate that arrives while a response is
-		// streaming is answered after that response finishes (spec 3.1).
-		r.st.setRespParked(true)
-		defer r.st.setRespParked(false)
+		defer r.st.unparkResponse()
 	}
 
 	r.pending = r.pending[:0]
@@ -993,6 +1169,9 @@ func (r *streamRewriter) stepHead() error {
 	for {
 		line, err := r.readLine()
 		if err == errLineTooLong {
+			if r.refuseHead("head line longer than 64 KiB", syntheticHeadTooLargeBody) {
+				return nil
+			}
 			r.failOpen("head line longer than 64 KiB")
 			return nil
 		}
@@ -1002,9 +1181,11 @@ func (r *streamRewriter) stepHead() error {
 				// (connState.wakeResponse) ends a parked response side's read
 				// rather than waiting for an upstream that will never be asked.
 				// Whatever ended the read, the terminate is the answer the client
-				// is owed, and it is checked here as well as on entry.
+				// is owed, and it is checked here as well as on entry -- against
+				// this message's generation, so a terminate for a later request
+				// is left for that request (see connState.parkResponse).
 				if r.side == sideResponse {
-					if term := r.st.takeTerminate(); term != nil {
+					if term := r.st.takeTerminate(gen); term != nil {
 						r.emitSynthetic(term)
 						return nil
 					}
@@ -1017,6 +1198,9 @@ func (r *streamRewriter) stepHead() error {
 			return nil
 		}
 		if len(r.pending) > maxHeadBytes {
+			if r.refuseHead("head larger than 64 KiB", syntheticHeadTooLargeBody) {
+				return nil
+			}
 			r.failOpen("head larger than 64 KiB")
 			return nil
 		}
@@ -1033,6 +1217,21 @@ func (r *streamRewriter) stepHead() error {
 
 	head, err := parseHead(r.pending, r.side)
 	if err != nil {
+		// The same rule as an oversized head, for the same reason and at a much
+		// lower price to the attacker: a head this package cannot parse is a head
+		// no request-phase action runs on, so failing open forwards a request the
+		// policy would have refused. One obs-fold continuation line, or a header
+		// line with no colon, is enough -- and it is sticky, because failOpen
+		// leaves the whole connection in stRaw, so every later request on it is
+		// unpoliced as well. Padding a head past 64 KiB is not the only way to
+		// buy a bypass; it was only the most expensive one.
+		//
+		// The reason is formatted here rather than at the call so that the
+		// peer-controlled text is an argument to the logger, never a format
+		// string (failOpen does the same).
+		if r.refuseHead(fmt.Sprintf("malformed head: %v", err), syntheticMalformedHeadBody) {
+			return nil
+		}
 		r.failOpen("malformed head: %v", err)
 		return nil
 	}
@@ -1044,6 +1243,13 @@ func (r *streamRewriter) stepHead() error {
 		if head.isUpgrade() {
 			r.st.setUpgraded()
 		}
+	} else if head.status >= 200 {
+		// A final response is one answer to one request, so this is where the
+		// response side's generation advances: the next message is the answer to
+		// the next request, and that is the generation a terminate has to carry
+		// to be delivered there rather than here. Interim 1xx heads (100
+		// Continue) are part of the answer being read and leave the clock alone.
+		r.st.recordResponse()
 	}
 
 	// The transform decision is made here, before the head is re-emitted, because
@@ -1065,8 +1271,10 @@ func (r *streamRewriter) stepHead() error {
 		// upstream must never see the request -- and the response side is the
 		// one that puts the answer on the wire: it owns everything the client
 		// reads after a request, and the two directions share the connection,
-		// so emitting here would interleave with a response in flight.
-		r.st.setTerminate(hook.terminate)
+		// so emitting here would interleave with a response in flight. The
+		// generation this request claimed is what says which of the response
+		// side's messages the answer belongs to.
+		r.st.setTerminate(hook.terminate, gen)
 		r.pending = r.pending[:0]
 		r.phase = stDrain
 		return nil
@@ -1095,6 +1303,88 @@ func (r *streamRewriter) stepHead() error {
 	r.phase = next
 	return nil
 }
+
+// syntheticHeadTooLargeBody and syntheticMalformedHeadBody are the bodies of the
+// two refusals below. They are static strings: the reason a head was refused can
+// contain peer-controlled bytes, and those go to the log line, not back out onto
+// the wire.
+const (
+	syntheticHeadTooLargeBody  = "request header fields too large: the head exceeds the limit this proxy can parse\n"
+	syntheticMalformedHeadBody = "malformed request head: it is not one this proxy can parse, so the request was not forwarded\n"
+)
+
+// refuseHead is what the request side does with a head it cannot process when a
+// policy is watching: instead of failing open, the head is dropped and the
+// client is answered with 431. It returns true when the request was refused --
+// the caller must then return, the direction is draining -- and false when the
+// caller should fail open exactly as it did before policies existed.
+//
+// "Cannot process" has two routes into it, and they are one rule: a head past
+// this package's 64 KiB read limit, and a head that parseHead refuses (an
+// obs-fold continuation line, a header line with no colon, a space in a field
+// name, a request line that is not one). The second is by far the cheaper
+// bypass -- one malformed line versus 64 KiB of padding -- and it is stickier,
+// because the fail-open path leaves the connection in stRaw for good: every
+// later request on that keep-alive connection is forwarded unpoliced too.
+//
+// The rule is the whole point of a policy, and it is worth stating plainly.
+// Every request-phase action -- deny, custom-response, add-headers,
+// remove-headers, log -- runs on a parsed head, so a head that is not parsed
+// skips all of them. Failing *open* there does not leave the connection
+// unrewritten; it forwards the request. The audit's shape is a request the
+// policy would have refused, carried in a head the proxy cannot read, and the
+// only honest answers are "refuse it" and "admit the policy does not apply".
+// Refusing is chosen because the alternative is a policy an attacker decides
+// whether to be subject to, by choosing the shape of their head.
+//
+// Three things this deliberately does not do:
+//
+//   - It does not apply to the response side. A response head over the cap (or
+//     malformed) is an upstream problem, not an attacker-controlled bypass, and
+//     the edge cannot answer a request it has already forwarded with anything
+//     better than the origin's own answer.
+//   - It does not apply when no request hook is armed: there is nothing to
+//     bypass, the connection is on the byte-identical path, and a 64 KiB head
+//     from a client that simply writes long headers -- or a stream that is not
+//     HTTP at all, which fails the same parse -- must keep working. That is the
+//     documented fail-open rule of the package, and this function is the one
+//     place where a policy changes it.
+//   - It does not try to tell a hostile malformed head from a stream that was
+//     never HTTP (an SSH banner, say). It cannot, and the two are the same
+//     thing to a proxy that has no parsed request to police: on a connection
+//     whose policy has a request hook, such a stream is refused with one 431
+//     rather than forwarded unpoliced. A tunnel that carries a non-HTTP
+//     protocol should not be configured with a traffic policy, and the cost of
+//     being wrong is a connection that does not work rather than a rule that
+//     silently does not run.
+func (r *streamRewriter) refuseHead(reason, body string) bool {
+	if r.side != sideRequest || r.cp.reqHook == nil {
+		return false
+	}
+	// The warn is unconditional rather than once-per-direction: the request
+	// side drains after a refusal and never parses another head, so this runs at
+	// most once per connection.
+	r.lg.Warn("%s: %s; a request hook is armed, so the request is refused with %d and never forwarded",
+		r.dir, reason, http.StatusRequestHeaderFieldsTooLarge)
+	r.st.setTerminate(&SyntheticResponse{
+		StatusCode: http.StatusRequestHeaderFieldsTooLarge,
+		Headers:    []string{"Content-Type: text/plain"},
+		Body:       body,
+	}, r.gen)
+	r.pending = r.pending[:0]
+	r.phase = stDrain
+	return true
+}
+
+// testParkGapHook is a test-only window into the response side's park, and it
+// is the only one in the package that is not on the wire path. The atomicity
+// parkResponse documents is unobservable from outside -- both sides have to be
+// threaded into the same instant, deterministically, for the regression test of
+// the M3 race to mean anything -- so the instant is exposed here and the test
+// publishes a terminate from inside it. It is nil in production, and the
+// branch that reads it is one predictable load on a path that is about to
+// block in a read.
+var testParkGapHook func(*connState)
 
 // hookRewrite consults the policy hook for this head, if the policy has one and
 // this head is one it applies to, and returns the verdict merged for the
@@ -1883,7 +2173,7 @@ func parseRequestLine(line []byte) (method, version string, ok bool) {
 		return "", "", false
 	}
 	method = string(parts[0])
-	if !isToken(method) || len(parts[1]) == 0 || !isHTTPVersion(parts[2]) {
+	if !ValidHeaderToken(method) || len(parts[1]) == 0 || !isHTTPVersion(parts[2]) {
 		return "", "", false
 	}
 	return method, string(parts[2]), true
@@ -1930,7 +2220,7 @@ func parseHeaderField(line []byte) (headerField, bool) {
 		return headerField{}, false
 	}
 	name := string(bytes.TrimRight(line[:colon], " \t"))
-	if !isToken(name) {
+	if !ValidHeaderToken(name) {
 		return headerField{}, false
 	}
 	term := len(lineTerminator(line))
@@ -2168,8 +2458,37 @@ func (cp *compiledPolicy) rewriteRequestHead(h *parsedHead, hook *hookRewrite) [
 		xForwardedHost = origHost // 4.1: the original Host is saved, not lost
 	}
 
+	// A message that carries both framings is a request-smuggling vector and
+	// this package is an intermediary on it, so RFC 7230 3.3.3's "a sender MUST
+	// NOT send a Content-Length header field in any message that contains a
+	// Transfer-Encoding header field" applies to what is emitted here. The
+	// framing this direction copies the body with is chunked whenever the token
+	// is there (nextPhase), so the Content-Length is not merely redundant: it is
+	// a second, disagreeing statement of where the body ends, and the next hop
+	// is free to believe it. Dropping it leaves the head saying exactly one
+	// thing, which is what the body bytes behind it actually are.
+	//
+	// The test is the token, not the field. A Transfer-Encoding without the
+	// chunked token names a coding this build cannot frame with, so the body
+	// behind it is copied by Content-Length and the head keeps the field that
+	// describes what was copied. (RFC 7230 3.3.3 calls such a message unreliable
+	// and has the next hop reject it; forwarding a length the origin cannot
+	// agree with is the one outcome worse than forwarding a length it can.)
+	//
+	// The decision does not consult what the policy removes. A policy that
+	// strips Transfer-Encoding still gets a chunk-framed body -- the removes
+	// shape the head, and the framing was decided by the input (nextPhase) --
+	// so keeping the Content-Length would leave the head claiming a length the
+	// bytes behind it do not have. Stripping the field is the policy author's
+	// choice and this package does not second-guess it; it just refuses to put a
+	// second lie in the head on top of the one that removal already told.
+	dropCL := h.chunked()
+
 	hostWritten := false
 	for _, f := range h.fields {
+		if dropCL && f.lower == "content-length" {
+			continue
+		}
 		if cp.reqRemoves[f.lower] || hook.drops(f.lower) {
 			continue
 		}
@@ -2246,8 +2565,20 @@ func (cp *compiledPolicy) rewriteResponseHead(h *parsedHead, gzip bool, hook *ho
 	out = append(out, h.prefix...)
 	out = append(out, h.startLine...)
 
+	// The request side's rule, for the request side's reason: a response that
+	// declares both framings must go out declaring one (RFC 7230 3.3.3, and see
+	// rewriteRequestHead for how the token decides it, including why the removes
+	// do not enter into it). It matters in this direction too -- the client is
+	// the next hop and a smuggled response is as good as a smuggled request to
+	// anything behind it, a cache included. gzip drops every Content-Length on
+	// its own, below, so the two never disagree about the field.
+	dropCL := h.chunked()
+
 	chunkedDeclared := false
 	for _, f := range h.fields {
+		if dropCL && f.lower == "content-length" {
+			continue
+		}
 		if cp.respRemoves[f.lower] || hook.drops(f.lower) {
 			continue
 		}

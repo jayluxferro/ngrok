@@ -3,6 +3,7 @@ package client
 import (
 	"net"
 	"ngrok/client/mvc"
+	"ngrok/msg"
 	"ngrok/rewriter"
 	"strings"
 )
@@ -45,9 +46,9 @@ func policyFromTunnel(tunnel mvc.Tunnel, clientAddr string) *rewriter.Policy {
 	// The local leg is always plain HTTP -- the client terminates TLS, the
 	// upstream never speaks it -- so the value comes from the public URL and
 	// not from LocalAddr.
-	xForwardedProto := "http"
-	if strings.HasPrefix(tunnel.PublicUrl, "https://") {
-		xForwardedProto = "https"
+	xForwardedProto := msg.ProtoHTTP
+	if strings.HasPrefix(tunnel.PublicUrl, msg.ProtoHTTPS+"://") {
+		xForwardedProto = msg.ProtoHTTPS
 	}
 
 	// X-Forwarded-For carries the bare client IP: the server sends

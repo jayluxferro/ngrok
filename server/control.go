@@ -55,8 +55,27 @@ type Control struct {
 	muxMu sync.Mutex
 	mux   *MuxSession
 
-	// identifier
+	// identifier: the client id this session was registered under. It is
+	// immutable from the moment NewControl has decided it -- the affinity
+	// cache, the metrics and the admin snapshots all read it from other
+	// goroutines -- and the one thing that changes about a control's identity
+	// over its life, being replaced by a newer connection for the same id, is
+	// recorded in the replaced flag below instead of by mutating this field.
 	id string
+
+	// secret is the session secret that goes with id: the proof a later
+	// connection claiming this id has to present (Auth.Secret, RegProxy.Secret,
+	// RegMux.Secret). Like id it is set once, before the session is announced
+	// anywhere, and never mutated. It is a credential and is never logged.
+	secret string
+
+	// replaced is set when a newer connection takes this control's id over.
+	// The replaced control keeps its id -- so it keeps logging and reporting as
+	// itself, which is what it still is -- and consults this flag where the old
+	// code relied on the id having been cleared: stopper() must not evict its
+	// replacement from the control registry (see ControlRegistry.Del, which
+	// also re-checks the identity under the registry lock).
+	replaced int32
 
 	// synchronizer for controlled shutdown of writer()
 	writerShutdown *util.Shutdown
@@ -117,26 +136,12 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 		atomic.AddInt64(&controlConnCount, -1)
 	}
 
-	// register the clientid
-	c.id = authMsg.ClientId
-	if c.id == "" {
-		// it's a new session, assign an ID
-		if c.id, err = util.SecureRandId(16); err != nil {
-			failAuth(err)
-			return
-		}
-	}
-
-	// set logging prefix
-	ctlConn.SetType("ctl")
-	ctlConn.AddLogPrefix(c.id)
-
-	if authMsg.Version != version.Proto {
-		failAuth(fmt.Errorf("Incompatible versions. Server %s, client %s. Download a new version at http://ngrok.com", version.MajorMinor(), authMsg.Version))
-		return
-	}
-
-	// Validate auth token if tokens are configured
+	// Validate the auth token before anything else the caller could learn
+	// from: version negotiation in particular tells an unauthenticated caller
+	// what software the server runs (and, through the error text, invites it to
+	// download a different one), so a wrong token has to be answered with the
+	// auth error and nothing else. Token validation is also the cheapest check,
+	// which is a happy accident rather than the reason.
 	if len(opts.authTokens) > 0 {
 		clientToken := authMsg.User
 		validToken := false
@@ -150,11 +155,79 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 			if warnSampler.allow("auth-invalid") {
 				ctlConn.Warn("Authentication failed: invalid token")
 			}
-			observe.events.publish(map[string]interface{}{"type": "auth_reject", "reason": "invalid_token", "at": time.Now().UTC()})
+			observe.events.publishAuthReject(reasonInvalidToken)
 			failAuth(fmt.Errorf("Invalid authentication token"))
 			return
 		}
 		ctlConn.Info("Authenticated with valid token")
+	}
+
+	// Establish the session identity (SPEC cluster 3 hardening): a client that
+	// names a client id is resuming that session, and resuming one is a claim
+	// on its tunnels, its proxy pool and its mux session. The claim is only
+	// honoured with the secret the server minted for that id, compared in
+	// constant time.
+	//
+	// The three outcomes are deliberately different:
+	//
+	//   - no id: a new session. A fresh id and a fresh secret are minted; an
+	//     old client that sends no id keeps working exactly as it always did.
+	//   - an id this server still has a live control for: the secret decides.
+	//     A missing or wrong secret is refused, without touching the live
+	//     control, which is what makes id guessing useless (the id is public:
+	//     it is logged and cached in the clear).
+	//   - an id with no live control (the server restarted, or the session
+	//     ended): a new id and secret are minted. The requested id is not
+	//     reused, so this cannot be used to take over an id either -- it is the
+	//     same "stale id" case the old code handled by assigning a fresh one.
+	//
+	// The secret is not rotated on resume: the session keeps one credential for
+	// its whole life, which is what makes the replacement window below sane
+	// (both the old and the new control of one session accept the same proof
+	// while the old one drains).
+	c.id = authMsg.ClientId
+	if c.id != "" {
+		if existing := controlRegistry.Get(c.id); existing != nil {
+			if !secretMatches(existing.secret, authMsg.Secret) {
+				if warnSampler.allow("auth-secret") {
+					ctlConn.Warn("Authentication failed: session %s presented no valid session secret", c.id)
+				}
+				observe.events.publishAuthReject(reasonInvalidSessionSecret)
+				failAuth(fmt.Errorf("Session %s cannot be resumed: a valid session secret is required", c.id))
+				return
+			}
+			// the resumed session keeps the secret it already had
+			c.secret = existing.secret
+		} else {
+			ctlConn.Debug("No live session for client id, assigning a new one")
+			c.id = ""
+		}
+	}
+
+	if c.secret == "" {
+		// a new session: mint both halves of its identity
+		if c.id == "" {
+			if c.id, err = util.SecureRandId(16); err != nil {
+				failAuth(err)
+				return
+			}
+		}
+		if c.secret, err = newSessionSecret(); err != nil {
+			failAuth(err)
+			return
+		}
+	}
+
+	// set logging prefix (the id, never the secret)
+	ctlConn.SetType("ctl")
+	ctlConn.AddLogPrefix(c.id)
+
+	// Version negotiation comes last of the checks: everything above is
+	// authentication, and an unauthenticated caller does not get to learn the
+	// server version.
+	if authMsg.Version != version.Proto {
+		failAuth(fmt.Errorf("Incompatible versions. Server %s, client %s. Download a new version at http://ngrok.com", version.MajorMinor(), authMsg.Version))
+		return
 	}
 
 	// register the control
@@ -168,13 +241,18 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	// Respond to authentication
 	//
 	// The advertised capabilities are additive: a client that does not know one
-	// ignores it (this client included, until muxCapability arrived), and a
+	// ignores it (this client included, until msg.MuxCapability arrived), and a
 	// client that knows none of them keeps using the transports it always did.
+	//
+	// Secret is the session secret the client must present to resume this id
+	// and to register proxy connections and mux sessions for it. It is written
+	// to the control channel and nowhere else.
 	c.out <- &msg.AuthResp{
 		Version:   version.Proto,
 		MmVersion: version.MajorMinor(),
 		ClientId:  c.id,
-		Caps:      []string{"sha256_tokens", "rate_limits", muxCapability},
+		Secret:    c.secret,
+		Caps:      []string{"sha256_tokens", "rate_limits", msg.MuxCapability},
 	}
 
 	// As a performance optimization, ask for a proxy connection up front
@@ -195,7 +273,19 @@ func (c *Control) registerTunnel(rawTunnelReq *msg.ReqTunnel) {
 		c.conn.Debug("Registering new tunnel")
 		t, err := NewTunnel(&tunnelReq, c)
 		if err != nil {
-			c.out <- &msg.NewTunnel{Error: err.Error()}
+			// A registration failure is answered with the request it belongs
+			// to. The client matches NewTunnel against the ReqTunnel it sent by
+			// ReqId; without one it cannot tell which of its requests this
+			// answer is for, and a rejected tunnel looks like a tunnel that
+			// never got an answer at all. The error text names the endpoint
+			// (hostname or port) as well, because the client may be
+			// multiplexing several requests and the id is its only handle on
+			// them.
+			c.out <- &msg.NewTunnel{
+				ReqId:    rawTunnelReq.ReqId,
+				Protocol: proto,
+				Error:    err.Error(),
+			}
 			if len(c.tunnels) == 0 {
 				c.shutdown.Begin()
 			}
@@ -323,8 +413,15 @@ func (c *Control) stopper() {
 	// wait until we're instructed to shutdown
 	c.shutdown.WaitBegin()
 
-	// remove ourself from the control registry
-	controlRegistry.Del(c.id)
+	// remove ourself from the control registry. A control that was replaced
+	// (the client reconnected before this connection noticed) must leave the
+	// replacement in place; Del decides that under the registry lock, and the
+	// replaced flag is the local shortcut for the common case.
+	if c.wasReplaced() {
+		c.conn.Debug("Replaced by a newer control; not removing the control registry entry")
+	} else if err := controlRegistry.Del(c.id, c); err != nil {
+		c.conn.Debug("Control registry entry not removed: %v", err)
+	}
 
 	// shutdown manager() so that we have no more work to do
 	close(c.in)
@@ -410,10 +507,18 @@ func (c *Control) clearMuxSession(m *MuxSession) {
 	c.muxMu.Unlock()
 }
 
+// RegisterProxy puts a proxy connection into this control's pool.
+//
+// No staleness deadline is stamped here. The conn is not used while it waits in
+// the pool, so a deadline starting now would measure the wrong thing: a conn
+// that waited 59 of its 60 seconds would be handed out with a second of budget
+// left, and the StartProxy write -- the first thing that happens to it --
+// would fail on a conn that is perfectly healthy. The deadline is stamped at
+// handout instead (GetProxy), where the clock starts when the conn is asked to
+// do something.
 func (c *Control) RegisterProxy(conn conn.Conn) {
 	conn.AddLogPrefix(c.id)
 
-	conn.SetDeadline(time.Now().Add(proxyStaleDuration))
 	select {
 	case c.proxies <- conn:
 		conn.Info("Registered")
@@ -428,6 +533,15 @@ func (c *Control) RegisterProxy(conn conn.Conn) {
 // and wait until it is available
 // Returns an error if we couldn't get a proxy because it took too long
 // or the tunnel is closing
+//
+// Every conn this hands out carries a fresh proxyStaleDuration deadline, which
+// is the budget for the StartProxy handshake that follows. It is deliberately
+// not a lease on the whole connection: HandlePublicConnection clears the
+// deadline once the handshake is done, because a proxied connection has no
+// business timing out while the rewriter policies are running over it (a
+// long-lived stream, an idle websocket). What bounds a conn that died while
+// nobody was looking is the fresh deadline here -- the write below it fails
+// against a peer that is gone -- rather than the dwell time it accumulated.
 func (c *Control) GetProxy() (proxyConn conn.Conn, err error) {
 	var ok bool
 
@@ -457,19 +571,35 @@ func (c *Control) GetProxy() (proxyConn conn.Conn, err error) {
 			return
 		}
 	}
+
+	// stamped here, not at registration: this is the moment the conn stops
+	// waiting and starts working
+	proxyConn.SetDeadline(time.Now().Add(proxyStaleDuration))
 	return
 }
 
 // Called when this control is replaced by another control
 // this can happen if the network drops out and the client reconnects
 // before the old tunnel has lost its heartbeat
+//
+// The id is NOT cleared. It used to be, so that the stopper's
+// registry.Del(c.id) would miss the replacement -- but c.id is read
+// concurrently by the affinity cache, the metrics and every admin snapshot, so
+// writing to it here was a data race (and made a replaced control report itself
+// as the empty id in all of those places). The replacement signal is the
+// replaced flag now, and ControlRegistry.Del re-checks the identity under the
+// registry lock, which closes the window between this call and the stopper
+// running even if the flag is somehow missed.
 func (c *Control) Replaced(replacement *Control) {
 	c.conn.Info("Replaced by control: %s", replacement.conn.Id())
 
-	// set the control id to empty string so that when stopper()
-	// calls registry.Del it won't delete the replacement
-	c.id = ""
+	atomic.StoreInt32(&c.replaced, 1)
 
 	// tell the old one to shutdown
 	c.shutdown.Begin()
+}
+
+// wasReplaced reports whether this control lost its id to a newer connection.
+func (c *Control) wasReplaced() bool {
+	return atomic.LoadInt32(&c.replaced) == 1
 }

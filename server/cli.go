@@ -71,10 +71,7 @@ func parseArgs() *Options {
 		os.Exit(0)
 	}
 
-	seen := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) {
-		seen[f.Name] = true
-	})
+	seen := explicitFlags()
 
 	if *configPath != "" {
 		cfg, err := loadServerConfig(*configPath)
@@ -82,60 +79,30 @@ func parseArgs() *Options {
 			fmt.Fprintln(os.Stderr, "Failed to read config:", err.Error())
 			os.Exit(1)
 		}
-		if !seen["httpAddr"] && cfg.HttpAddr != "" {
-			*httpAddr = cfg.HttpAddr
-		}
-		if !seen["httpsAddr"] && cfg.HTTPSAddr != "" {
-			*httpsAddr = cfg.HTTPSAddr
-		}
-		if !seen["tunnelAddr"] && cfg.TunnelAddr != "" {
-			*tunnelAddr = cfg.TunnelAddr
-		}
-		if !seen["adminAddr"] && cfg.AdminAddr != "" {
-			*adminAddr = cfg.AdminAddr
-		}
-		if !seen["adminAuth"] && cfg.AdminAuth != "" {
-			*adminAuth = cfg.AdminAuth
-		}
-		if !seen["adminToken"] && cfg.AdminToken != "" {
-			*adminToken = cfg.AdminToken
-		}
-		if !seen["adminRate"] && cfg.AdminRate >= 0 {
-			*adminRate = cfg.AdminRate
-		}
-		if !seen["domain"] && cfg.Domain != "" {
-			*domain = cfg.Domain
-		}
-		if !seen["tlsCrt"] && cfg.TLSCrt != "" {
-			*tlsCrt = cfg.TLSCrt
-		}
-		if !seen["tlsKey"] && cfg.TLSKey != "" {
-			*tlsKey = cfg.TLSKey
-		}
-		if !seen["log"] && cfg.LogTo != "" {
-			*logto = cfg.LogTo
-		}
-		if !seen["log-level"] && cfg.LogLevel != "" {
-			*loglevel = cfg.LogLevel
-		}
-		if !seen["log-format"] && cfg.LogFormat != "" {
-			*logformat = cfg.LogFormat
-		}
-		if !seen["maxMsgBytes"] && cfg.MaxMsgBytes > 0 {
-			*maxMsgBytes = cfg.MaxMsgBytes
-		}
-		if !seen["authRate"] && cfg.AuthRate >= 0 {
-			*authRate = cfg.AuthRate
-		}
-		if !seen["publicRate"] && cfg.PublicRate >= 0 {
-			*publicRate = cfg.PublicRate
-		}
-		if !seen["maxConnPerIP"] && cfg.MaxConnPerIP >= 0 {
-			*maxConnPerIP = cfg.MaxConnPerIP
-		}
-		if !seen["pprof"] && cfg.EnablePprof {
-			*enablePprof = true
-		}
+		// Precedence: an explicit command-line flag beats the config file
+		// (the flag is the more recent, more specific statement of intent),
+		// and a config file beats the flag's built-in default. The helpers
+		// below are what keep that rule in one place; before them this was 20
+		// hand-written `if !seen[...] && ...` branches, which is how the rate
+		// limits came to be silently disabled (see overrides.num).
+		seen.str(httpAddr, cfg.HttpAddr, "httpAddr")
+		seen.str(httpsAddr, cfg.HTTPSAddr, "httpsAddr")
+		seen.str(tunnelAddr, cfg.TunnelAddr, "tunnelAddr")
+		seen.str(adminAddr, cfg.AdminAddr, "adminAddr")
+		seen.str(adminAuth, cfg.AdminAuth, "adminAuth")
+		seen.str(adminToken, cfg.AdminToken, "adminToken")
+		seen.num(adminRate, cfg.AdminRate, "adminRate")
+		seen.str(domain, cfg.Domain, "domain")
+		seen.str(tlsCrt, cfg.TLSCrt, "tlsCrt")
+		seen.str(tlsKey, cfg.TLSKey, "tlsKey")
+		seen.str(logto, cfg.LogTo, "log")
+		seen.str(loglevel, cfg.LogLevel, "log-level")
+		seen.str(logformat, cfg.LogFormat, "log-format")
+		seen.positive(maxMsgBytes, cfg.MaxMsgBytes, "maxMsgBytes")
+		seen.num(authRate, cfg.AuthRate, "authRate")
+		seen.num(publicRate, cfg.PublicRate, "publicRate")
+		seen.num(maxConnPerIP, cfg.MaxConnPerIP, "maxConnPerIP")
+		seen.yes(enablePprof, cfg.EnablePprof, "pprof")
 		if len(cfg.AuthTokens) > 0 && !seen["authToken"] {
 			*authTokensFlag = strings.Join(cfg.AuthTokens, ",")
 		}
@@ -176,5 +143,60 @@ func parseArgs() *Options {
 		publicRate:   *publicRate,
 		maxConnPerIP: *maxConnPerIP,
 		enablePprof:  *enablePprof,
+	}
+}
+
+// overrides is the set of flag names the operator actually typed on the
+// command line. Everything else in a flag's value comes from either the config
+// file or the flag's built-in default, in that order.
+type overrides map[string]bool
+
+func explicitFlags() overrides {
+	o := overrides{}
+	flag.Visit(func(f *flag.Flag) {
+		o[f.Name] = true
+	})
+
+	return o
+}
+
+// str applies a config-file string. An empty value means "the file did not set
+// this key", so it never clears a flag default -- which is why httpsAddr can be
+// set in the config file but not unset there (pass -httpsAddr= to disable).
+func (o overrides) str(dst *string, val, flagName string) {
+	if !o[flagName] && val != "" {
+		*dst = val
+	}
+}
+
+// num applies a config-file integer. val is a *int because the zero value is a
+// meaningful setting for every rate limit here (0 disables the limit), so the
+// config loader has to report "unset" out of band.
+//
+// This is where the old hand-written chain went wrong: the check used to read
+// `cfg.AdminRate >= 0` against a plain int, which is true even when the key is
+// absent, so *any* -config file silently reset -adminRate to 0 and -authRate to
+// 0. Both defaults are the single-IP rate limits; loading a config file
+// therefore turned the admin- and auth-brute-force throttles off, and nothing
+// said so.
+func (o overrides) num(dst *int, val *int, flagName string) {
+	if !o[flagName] && val != nil {
+		*dst = *val
+	}
+}
+
+// positive applies a config-file count where 0 means "unset" rather than
+// "disabled" (a zero-byte message cap is not a setting anyone wants).
+func (o overrides) positive(dst *int64, val int64, flagName string) {
+	if !o[flagName] && val > 0 {
+		*dst = val
+	}
+}
+
+// yes applies a config-file bool. There is no way to turn a flag off from the
+// config file, only on; that matches the bool defaults here, which are all off.
+func (o overrides) yes(dst *bool, val bool, flagName string) {
+	if !o[flagName] && val {
+		*dst = true
 	}
 }

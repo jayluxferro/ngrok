@@ -66,8 +66,8 @@ var _ log.Logger = (*testLogger)(nil)
 // --- document builders ------------------------------------------------------
 
 // rule builds one rule the way a policy document would, with config given as a
-// plain map (the callers below use the same shapes yaml.v1 and encoding/json
-// produce: ints, strings, nested maps).
+// plain map (the callers below use the same shapes the YAML decoder and
+// encoding/json produce: ints, strings, nested maps).
 func rule(name string, expressions []string, config map[string]interface{}) *Action {
 	return &Action{Name: name, Expressions: expressions, Config: config}
 }
@@ -127,8 +127,12 @@ func TestValidateRejects(t *testing.T) {
 		},
 		{
 			// A literal has a known type, so this one is refused at load time.
-			// A variable that is dyn (any field of a declared map) can only be
-			// checked when it is read; see TestRequestHookFailsOpenOnRuntimeErrors.
+			// (Everything a policy can name is typed now, so this is the common
+			// case rather than the special one; the dyn carve-out exists for
+			// shapes like `[1, 'a'][0]`, whose type the compiler will not pin
+			// down, and those are checked when they are read --
+			// TestCompileExprRejectsNonBoolOnlyWhenKnown and
+			// TestPolicyConditionThatIsNotABoolIsRefusedAtLoad.)
 			"condition that is not a condition",
 			reqPolicy(rule("deny", []string{"1 + 1"}, nil)),
 			`expression "1 + 1" is not a condition: it evaluates to int, not bool`,
@@ -680,17 +684,24 @@ func TestLogAction(t *testing.T) {
 }
 
 func TestRequestHookFailsOpenOnRuntimeErrors(t *testing.T) {
-	// Every expression here compiles but fails at evaluation: the map key does
-	// not exist (CEL's `no such key` is a runtime error, not a compile one),
-	// and the dynamic value is not a bool, which only shows up when it is read.
+	// Both expressions compile and both fail at evaluation. With every name
+	// declared by its own dotted name these are the two shapes that are left,
+	// and neither can be moved to load time: a map key that is not there (CEL's
+	// `no such key` is a runtime error, not a compile one), and a conversion
+	// whose input the compiler cannot see -- int() of a header value is
+	// well-typed and fails on the value itself. (This test used to carry a third
+	// shape, `req.headers[req.method]`, which was dyn under the map-typed
+	// declarations and is a load-time type error now; that it moved is the point
+	// of the strict variable set, and TestCompileExprRejectsNonBoolOnlyWhenKnown
+	// asserts it.)
 	doc := reqPolicy(
 		rule("deny", []string{"req.headers['x-missing'] == 'yes'"}, nil),
-		rule("deny", []string{"req.headers[req.method]"}, nil),
+		rule("deny", []string{"int(req.headers['x-count']) > 3"}, nil),
 	)
 	c, lg := compileRequest(t, doc)
 	hook := c.RequestHook(lg, "1.2.3.4:1")
 
-	if v := hook(get("/", nil)); v != nil {
+	if v := hook(get("/", map[string]string{"x-count": "many"})); v != nil {
 		t.Fatalf("a failing expression must not apply the rule, got %+v", v)
 	}
 	if warns := lg.lines(lg.warn); !strings.Contains(warns, "on_http_request[0] (deny)") ||
@@ -702,7 +713,7 @@ func TestRequestHookFailsOpenOnRuntimeErrors(t *testing.T) {
 	// not write another line. Two rules with the same action name are two
 	// rules, which is why the warning is keyed on the rule's position.
 	before := len(lg.warn)
-	hook(get("/", nil))
+	hook(get("/", map[string]string{"x-count": "many"}))
 	if len(lg.warn) != before {
 		t.Fatalf("the same failure was logged again: %v", lg.warn[before:])
 	}
@@ -711,22 +722,34 @@ func TestRequestHookFailsOpenOnRuntimeErrors(t *testing.T) {
 	}
 }
 
-func TestUnknownNestedVariableFailsOpen(t *testing.T) {
-	// conn, req and vars are declared as maps, so a name inside them that does
-	// not exist (req.geo) is CEL's dyn: it compiles, and reading it fails at
-	// evaluation time. That failure is absorbed like any other -- the rule does
-	// not apply and the request is carried -- and the warning is what tells the
-	// operator their expression never matches. This is the documented cost of
-	// the cheap map-typed variable declarations; a policy that relies on a name
-	// this build does not provide is refused when the name is a top-level one
-	// (req, res, conn, vars, time, endpoint) and fails open when it is nested.
+// TestUnknownNestedVariableIsRefusedAtLoad is the same mistake the test below
+// used to demonstrate *failing open*, and it is the finding that changed: with
+// the phase variables declared as maps, req.geo was an ordinary key lookup, so
+// a policy that relies on a field this build does not provide (geo, endpoint,
+// time) compiled and then never matched -- one warning per connection as its
+// only trace. The dotted declarations make every one of those an undeclared
+// reference at load time, so the operator sees it where they can fix it.
+//
+// Failing load is the *stronger* behavior for a rule: the alternative is a
+// control the operator believes is running and that serves every request. What
+// has to hold is that the error names the action, names the field, and lists
+// what does exist -- otherwise the operator is left guessing which build has
+// which variables, which is the complaint the hint exists to answer.
+func TestUnknownNestedVariableIsRefusedAtLoad(t *testing.T) {
 	doc := reqPolicy(rule("deny", []string{"req.geo.country == 'US'"}, nil))
-	c, lg := compileRequest(t, doc)
-	if v := c.RequestHook(lg, "1.2.3.4:1")(get("/", nil)); v != nil {
-		t.Fatalf("a rule whose expression cannot be evaluated must not apply, got %+v", v)
+	if _, err := doc.Compile(); err == nil {
+		t.Fatal("a rule matching on a field this build does not provide compiled; it would serve every request")
+	} else {
+		for _, want := range []string{"on_http_request[0] (deny)", "does not compile", "req.geo.country", "req.headers (map(string, string))"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not cite %q, so the operator has to guess: %v", want, err)
+			}
+		}
 	}
-	if warns := lg.lines(lg.warn); !strings.Contains(warns, "no such key: geo") {
-		t.Fatalf("want a warning naming the missing key, got:\n%q", warns)
+	if verr := doc.Validate(); verr == nil {
+		t.Error("Compile refused the rule and Validate accepted it")
+	} else if !strings.Contains(verr.Error(), "req.geo.country") {
+		t.Errorf("Validate refused it for a different reason than Compile: %v", verr)
 	}
 }
 
@@ -914,5 +937,220 @@ func TestConnectDenyFromConfigStatusIsIgnored(t *testing.T) {
 	doc := &TrafficPolicy{OnTCPConnect: []*Action{rule("deny", nil, map[string]interface{}{"status_code": 404})}}
 	if err := doc.Validate(); err == nil {
 		t.Fatalf("want the config to be refused")
+	}
+}
+
+// TestConnectDenyAnswersWithTheCompiledStatus is the Q-M12 regression test: the
+// deny branch of EvaluateConnect used to answer with the package's hardcoded
+// default (403) rather than the status the compiled action carries, which is
+// where the config's status_code -- or the default, when it names none -- was
+// resolved at load time. In the HTTP phases the two agree by construction
+// (a.statusCode is what the hook answers with), so the connect phase was the
+// one place the drift could live: a rule the operator configured, validated,
+// and then never got.
+//
+// The loader cannot build the interesting shape today: connect-phase deny
+// documents no config at all (the test above pins that), so a.statusCode is
+// always defaultDenyStatus there. That is exactly why the second half of this
+// test constructs the compiled form by hand rather than loading it. It is a
+// drift guard, and it is the assertion that fails on the hardcoded-default
+// implementation: the day the connect phase learns status_code, this test fails
+// if the branch was not reading the field.
+func TestConnectDenyAnswersWithTheCompiledStatus(t *testing.T) {
+	// The reachable shape: no config, so the default is the answer.
+	doc := &TrafficPolicy{OnTCPConnect: []*Action{rule("deny", nil, nil)}}
+	c, err := doc.Compile()
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	v := c.EvaluateConnect("203.0.113.9:1000")
+	if !v.Deny {
+		t.Fatalf("deny in on_tcp_connect must refuse the connection: %+v", v)
+	}
+	if v.Response == nil || v.Response.StatusCode != defaultDenyStatus {
+		t.Fatalf("want the default %d, got %+v", defaultDenyStatus, v.Response)
+	}
+
+	// The drift guard: a compiled connect-phase deny whose status is not the
+	// default. Nothing but this test can produce one today.
+	const want = http.StatusTeapot
+	hand := &Compiled{connect: []*compiledAction{
+		{action: ActionDeny, where: "on_tcp_connect[0] (deny)", statusCode: want},
+	}}
+	hv := hand.EvaluateConnect("203.0.113.9:1000")
+	if !hv.Deny {
+		t.Fatalf("the hand-built deny did not refuse the connection: %+v", hv)
+	}
+	if hv.Response == nil || hv.Response.StatusCode != want {
+		t.Fatalf("EvaluateConnect answered %+v; the deny branch must answer with the compiled action's status (%d), not the package default (%d)",
+			hv.Response, want, defaultDenyStatus)
+	}
+}
+
+// TestActionCountIsCappedAtLoad is the FZ-M1 regression test. A policy is
+// enforced on the data path -- every action is evaluated against every message
+// of every connection on the endpoint -- and its size is chosen by whoever
+// writes the document, so an unbounded action count is unbounded per-message
+// work. maxActionsPerPolicy bounds it at load time; the number itself and the
+// reasoning behind it are in validate.go.
+//
+// What the test pins is the shape of the bound rather than the number: the cap
+// is inclusive, it sums the three phases, and the refusal names the total, the
+// cap, and the per-phase breakdown, because an operator with a 1200-action
+// document needs to know which section to cut.
+func TestActionCountIsCappedAtLoad(t *testing.T) {
+	// The cheapest legal action in each phase: one with no conditions and the
+	// smallest config it will accept.
+	conn := func(n int) []*Action {
+		out := make([]*Action, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, rule("log", nil, map[string]interface{}{"metadata": map[string]interface{}{"a": "1"}}))
+		}
+		return out
+	}
+	req := func(n int) []*Action {
+		out := make([]*Action, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, rule("deny", nil, nil))
+		}
+		return out
+	}
+	resp := func(n int) []*Action {
+		out := make([]*Action, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, rule("remove-headers", nil, map[string]interface{}{"headers": []interface{}{"x-a"}}))
+		}
+		return out
+	}
+
+	// Exactly at the cap, spread over all three phases: accepted, and it
+	// compiles. A cap that refuses the last legal action is a cap that breaks
+	// documents that worked.
+	at := &TrafficPolicy{
+		OnTCPConnect:   conn(1),
+		OnHTTPRequest:  req(maxActionsPerPolicy - 2),
+		OnHTTPResponse: resp(1),
+	}
+	if err := at.Validate(); err != nil {
+		t.Fatalf("a policy at the cap (%d actions) was refused: %v", maxActionsPerPolicy, err)
+	}
+	if _, err := at.Compile(); err != nil {
+		t.Fatalf("a policy at the cap validates and does not compile: %v", err)
+	}
+
+	// One over: refused, by both entry points, with an error that names the
+	// total, the cap, and the phase that pushed it over.
+	over := &TrafficPolicy{
+		OnTCPConnect:   conn(1),
+		OnHTTPRequest:  req(maxActionsPerPolicy - 1),
+		OnHTTPResponse: resp(1),
+	}
+	werr := over.Validate()
+	if werr == nil {
+		t.Fatalf("a policy with %d actions validated (the cap is %d)", maxActionsPerPolicy+1, maxActionsPerPolicy)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("has %d actions", maxActionsPerPolicy+1),
+		fmt.Sprintf("maximum is %d", maxActionsPerPolicy),
+		fmt.Sprintf("on_tcp_connect %d", 1),
+		fmt.Sprintf("on_http_request %d", maxActionsPerPolicy-1),
+		fmt.Sprintf("on_http_response %d", 1),
+	} {
+		if !strings.Contains(werr.Error(), want) {
+			t.Errorf("the refusal does not cite %q, so the operator cannot tell which phase to cut: %v", want, werr)
+		}
+	}
+	if _, cerr := over.Compile(); cerr == nil {
+		t.Fatal("Validate refused an over-cap policy and Compile accepted it")
+	}
+
+	// The cap counts the whole document, not each phase: three phases that are
+	// each under the cap and together are not.
+	spread := &TrafficPolicy{
+		OnTCPConnect:   conn(maxActionsPerPolicy/3 + 1),
+		OnHTTPRequest:  req(maxActionsPerPolicy/3 + 1),
+		OnHTTPResponse: resp(maxActionsPerPolicy/3 + 1),
+	}
+	if n := len(spread.OnTCPConnect) + len(spread.OnHTTPRequest) + len(spread.OnHTTPResponse); n <= maxActionsPerPolicy {
+		t.Fatalf("the test's own arithmetic is wrong: %d is not over the cap", n)
+	}
+	if err := spread.Validate(); err == nil {
+		t.Fatalf("three phases of %d actions each validated; the cap must sum the phases", maxActionsPerPolicy/3+1)
+	}
+}
+
+// TestHeaderValuesWithACRLFAreRefusedAtLoad is the CRLF-in-a-header-value
+// finding, on the load path this time. A configured value carrying CR or LF is a
+// header-injection payload aimed at whatever reads the request next, and the
+// rewriter already refuses to write one (that is asserted from the rewriter's
+// side, where the bytes are actually emitted). What was missing is the load-time
+// half: the value was accepted, and then silently dropped at write time, so the
+// operator's header was missing from production traffic with nothing anywhere
+// saying why.
+//
+// The two halves of the check that make it safe to be strict are asserted here
+// too: the *literal* bytes are what is refused (a YAML double-quoted scalar is
+// the way a document actually carries them), and ${...} is untouched -- an
+// author who means a line break can say it as interpolation, which is their own
+// expression rather than their document's bytes.
+func TestHeaderValuesWithACRLFAreRefusedAtLoad(t *testing.T) {
+	// A YAML double-quoted scalar is how a CRLF reaches a policy document from a
+	// file: the escapes are real bytes by the time validate.go sees them.
+	cases := []struct {
+		what string
+		doc  string
+	}{
+		{
+			what: "an injected second header (CRLF)",
+			doc:  "on_http_request:\n  - name: add-headers\n    config:\n      headers:\n        X-A: \"ok\\r\\nX-Admin: true\"\n",
+		},
+		{
+			what: "a bare LF",
+			doc:  "on_http_request:\n  - name: add-headers\n    config:\n      headers:\n        X-A: \"ok\\nX-Admin: true\"\n",
+		},
+		{
+			what: "a trailing CR",
+			doc:  "on_http_request:\n  - name: add-headers\n    config:\n      headers:\n        X-A: \"ok\\r\"\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.what, func(t *testing.T) {
+			tp, err := fzYAML(t, []byte(tc.doc))
+			if err != nil {
+				t.Fatalf("the document does not decode: %v", err)
+			}
+			verr := tp.Validate()
+			if verr == nil {
+				t.Fatal("a header value carrying CR or LF validated; it would be dropped at write time with no explanation")
+			}
+			for _, want := range []string{"on_http_request[0] (add-headers)", `config field "headers" entry "X-A"`, "CR or LF"} {
+				if !strings.Contains(verr.Error(), want) {
+					t.Errorf("the refusal does not cite %q, so the operator cannot find the value: %v", want, verr)
+				}
+			}
+			if _, cerr := tp.Compile(); cerr == nil {
+				t.Fatal("Validate refused the document and Compile accepted it")
+			}
+		})
+	}
+
+	// custom-response builds its headers with the same code and refuses them the
+	// same way: this is one check on the header path, not one per action.
+	cr := &TrafficPolicy{OnHTTPRequest: []*Action{rule("custom-response", nil, map[string]interface{}{
+		"status_code": 200,
+		"headers":     map[string]interface{}{"X-A": "ok\r\nX-Admin: true"},
+	})}}
+	if err := cr.Validate(); err == nil {
+		t.Fatal("custom-response accepted a header value carrying CRLF")
+	}
+
+	// The escape hatch, asserted so the check does not read as a blanket ban on
+	// newlines: an interpolated value is an expression, and the check is on the
+	// document's literal bytes.
+	iv := &TrafficPolicy{OnHTTPRequest: []*Action{rule("add-headers", nil, map[string]interface{}{
+		"headers": map[string]interface{}{"X-A": "${req.headers['x-a']}"},
+	})}}
+	if err := iv.Validate(); err != nil {
+		t.Fatalf("an interpolated header value was refused; the check must only see the document's literal bytes: %v", err)
 	}
 }

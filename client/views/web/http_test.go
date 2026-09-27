@@ -33,4 +33,3 @@ func TestFilterTxnsConcurrentAccess(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/http/in", nil)
 	_ = req
 }
-

@@ -24,7 +24,16 @@ func newLogSampler(window time.Duration) *logSampler {
 }
 
 // allow first 3 messages per window and then every 50th.
+//
+// A nil sampler allows everything, the same way a nil ipRateLimiter or
+// ipConnLimiter does (ratelimit.go): warnSampler is only built in Main(), and
+// the rejection paths that consult it must keep working -- and keep saying what
+// they refused -- in a test binary that never ran Main().
 func (s *logSampler) allow(key string) bool {
+	if s == nil {
+		return true
+	}
+
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -3,11 +3,13 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"gopkg.in/yaml.v1"
+	"gopkg.in/yaml.v3"
 	"net"
 	"net/url"
 	"ngrok/log"
+	"ngrok/msg"
 	"ngrok/policy"
+	"ngrok/rewriter"
 	"os"
 	"os/user"
 	"path"
@@ -73,8 +75,12 @@ type TunnelConfiguration struct {
 	//
 	// The rule shape is this build's flat one -- one action per rule, each with
 	// name, expressions and config -- not ngrok's list of actions inside a named
-	// rule, because the config file is parsed by yaml.v1, which cannot decode
-	// that shape into a typed struct.
+	// rule. The parser swap did not move this: the struct above has no field for
+	// a nested actions list, and neither yaml.v1 nor yaml.v3 turns an unknown key
+	// into anything (both drop it by default, having no strict mode in use here),
+	// so the nested spelling is refused by validation -- "action has no name" --
+	// and is not a shape this struct can carry. docs/CHANGELOG.md has the
+	// deviation and the one nested spelling it does not catch.
 	TrafficPolicy *policy.TrafficPolicy `yaml:"traffic_policy,omitempty"`
 }
 
@@ -91,17 +97,19 @@ func (t *TunnelConfiguration) Compress() bool {
 }
 
 const (
-	// bindingPublic and bindingInternal are the accepted values of the binding
-	// configuration key, and of msg.ReqTunnel.Binding. The empty string is what
-	// the wire protocol uses for a public endpoint, so "public" is normalized
-	// to "" when the configuration is loaded.
-	bindingPublic   = "public"
-	bindingInternal = "internal"
+	// bindingPublicAlias is the one user-facing spelling this package keeps for
+	// itself: users write binding: public in a config file and -binding=public
+	// on the command line, so the word has to be recognized here. It is not a
+	// wire value -- msg.BindingPublic (the empty string) is what the protocol
+	// carries, and validateEndpointPolicy normalizes the alias to it, so the
+	// server sees exactly one spelling per binding and never sees this one.
+	bindingPublicAlias = "public"
 
-	// internalSuffix is the reserved namespace for internal endpoints. It
-	// mirrors server/tunnel.go's internalSuffix, which is what actually
-	// enforces it: nothing outside it can be registered as internal.
-	internalSuffix = ".internal"
+	// msg.BindingInternal and the .internal namespace are the server's values: both
+	// live in package msg with the rest of the wire vocabulary
+	// (msg.BindingInternal, msg.InternalSuffix). The client checks them so that
+	// a config that could never be reachable fails at load instead of at
+	// registration; the server is what enforces them.
 )
 
 func LoadConfiguration(opts *Options) (config *Configuration, err error) {
@@ -145,10 +153,25 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	if config.InspectAddr == "" {
 		config.InspectAddr = defaultInspectAddr
 	}
-	if config.InspectMaxBodySize <= 0 {
+
+	// Zero means "the key is absent", which is what a missing YAML key decodes
+	// to, and keeps the default. A negative value is a mistake in the file: it
+	// used to be clamped to the default in silence, so a typo (or a number past
+	// MaxInt64 that the decoder produced a negative for) configured something
+	// the operator never asked for and nothing ever said so. Both of these are
+	// limits -- one on how much body the inspector captures, one on how many
+	// proxied connections run at once -- and a limit that is not what the file
+	// says is exactly the kind of thing that is only noticed under load.
+	if config.InspectMaxBodySize < 0 {
+		return nil, fmt.Errorf("inspect_max_body_bytes must not be negative, got %d (omit the key to keep the default)", config.InspectMaxBodySize)
+	}
+	if config.InspectMaxBodySize == 0 {
 		config.InspectMaxBodySize = 1 * 1024 * 1024
 	}
-	if config.ProxyMaxConcurrent <= 0 {
+	if config.ProxyMaxConcurrent < 0 {
+		return nil, fmt.Errorf("proxy_max_concurrency must not be negative, got %d (omit the key to keep the default)", config.ProxyMaxConcurrent)
+	}
+	if config.ProxyMaxConcurrent == 0 {
 		config.ProxyMaxConcurrent = 64
 	}
 
@@ -172,7 +195,7 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		if proxyUrl, err = url.Parse(config.HttpProxy); err != nil {
 			return
 		} else {
-			if proxyUrl.Scheme != "http" && proxyUrl.Scheme != "https" {
+			if proxyUrl.Scheme != msg.ProtoHTTP && proxyUrl.Scheme != msg.ProtoHTTPS {
 				err = fmt.Errorf("Proxy url scheme must be 'http' or 'https', got %v", proxyUrl.Scheme)
 				return
 			}
@@ -213,11 +236,11 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 				return
 			}
 
-			if t.RemotePort != 0 && k != "tcp" {
+			if t.RemotePort != 0 && k != msg.ProtoTCP {
 				err = fmt.Errorf("Tunnel %s remote_port is only valid for tcp protocol", name)
 				return
 			}
-			if (t.Hostname != "" || t.Subdomain != "") && k == "tcp" {
+			if (t.Hostname != "" || t.Subdomain != "") && k == msg.ProtoTCP {
 				err = fmt.Errorf("Tunnel %s hostname/subdomain are only valid for http/https protocols", name)
 				return
 			}
@@ -394,7 +417,7 @@ func normalizeAddress(addr string, propName string) (string, error) {
 
 func validateProtocol(proto, propName string) (err error) {
 	switch proto {
-	case "http", "https", "http+https", "tcp":
+	case msg.ProtoHTTP, msg.ProtoHTTPS, msg.ProtoHTTPPlusHTTPS, msg.ProtoTCP:
 	default:
 		err = fmt.Errorf("Invalid protocol for %s: %s", propName, proto)
 	}
@@ -406,11 +429,6 @@ const (
 	hostHeaderRewrite  = "rewrite"
 	hostHeaderPreserve = "preserve"
 )
-
-// headerTokenRegexp is the RFC 7230 token grammar for header field names. Any
-// value that fails it (CR/LF, spaces, ':', control bytes, ...) is rejected here,
-// before it can ever reach a header writer.
-var headerTokenRegexp = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
 
 // newHeaderConfig turns the repeatable flag values into a HeaderConfig. It
 // returns nil when both lists are empty so that users who set no header flags
@@ -424,106 +442,36 @@ func newHeaderConfig(add, remove []string) *HeaderConfig {
 	return &HeaderConfig{Add: add, Remove: remove}
 }
 
-// validateHeaderPolicy validates the header policy of one tunnel. It is called
-// both for tunnels read from the config file and for the CLI-synthesized
+// validateHeaderPolicy validates the header settings of one tunnel. It is
+// called both for tunnels read from the config file and for the CLI-synthesized
 // "default" tunnel. Everything it rejects is a startup error naming the tunnel
 // and the offending entry: there is deliberately no silent fallback.
+//
+// The rules themselves are package rewriter's, and they are applied by building
+// the *rewriter.Policy this tunnel would run and calling its Validate: the
+// grammar of a header name, the user-agent ban, the CR/LF guards and the
+// host_header shapes are one function each, in the package that will put the
+// bytes on the wire, rather than a second copy here. That copy is what let a
+// tunnel whose host_header could not be written load cleanly (rewriter's
+// fuzzing report, R1): the loader accepted values the writer refuses, and the
+// only sign of it was traffic that came out wrong.
+//
+// The form of the policy is the same one client/headers.go builds per
+// connection (policyFromTunnel), so what loads is what runs.
 func validateHeaderPolicy(tunnelName string, t *TunnelConfiguration) error {
-	if err := validateHostHeader(tunnelName, t.HostHeader); err != nil {
-		return err
+	requestAdd, requestRemove := flattenHeaderConfig(t.RequestHeader)
+	responseAdd, responseRemove := flattenHeaderConfig(t.ResponseHeader)
+
+	policy := &rewriter.Policy{
+		HostHeader:           t.HostHeader,
+		RequestHeaderAdd:     requestAdd,
+		RequestHeaderRemove:  requestRemove,
+		ResponseHeaderAdd:    responseAdd,
+		ResponseHeaderRemove: responseRemove,
 	}
 
-	if t.RequestHeader != nil {
-		if err := validateHeaderConfig(tunnelName, "request_header", t.RequestHeader); err != nil {
-			return err
-		}
-	}
-
-	if t.ResponseHeader != nil {
-		if err := validateHeaderConfig(tunnelName, "response_header", t.ResponseHeader); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// validateHostHeader accepts the empty value (which means "preserve", the
-// historical behavior), the two keywords, or a plain hostname.
-func validateHostHeader(tunnelName, hostHeader string) error {
-	switch hostHeader {
-	case "", hostHeaderRewrite, hostHeaderPreserve:
-		return nil
-	}
-
-	if strings.ContainsAny(hostHeader, " \t\r\n/") {
-		return fmt.Errorf("Tunnel %s: invalid host_header %q: must be 'rewrite', 'preserve' or a hostname with no spaces, no '/' and no CR/LF",
-			tunnelName, hostHeader)
-	}
-
-	return nil
-}
-
-func validateHeaderConfig(tunnelName, section string, hc *HeaderConfig) error {
-	for _, entry := range hc.Add {
-		if err := validateNoCRLF(tunnelName, section, entry); err != nil {
-			return err
-		}
-
-		// Split on the first colon only, so that values may contain colons
-		// (e.g. "X-Origin: http://example.com").
-		colon := strings.Index(entry, ":")
-		if colon < 0 {
-			return fmt.Errorf("Tunnel %s: %s add entry %q must be formatted as 'key:value'",
-				tunnelName, section, entry)
-		}
-
-		if err := validateHeaderEntry(tunnelName, section, entry, entry[:colon]); err != nil {
-			return err
-		}
-	}
-
-	for _, key := range hc.Remove {
-		if err := validateHeaderEntry(tunnelName, section, key, key); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// validateHeaderEntry checks a single configured header name. entry is the
-// whole configured string, and key the name parsed out of it (equal to entry for
-// removals), so that errors can quote what the user actually wrote.
-func validateHeaderEntry(tunnelName, section, entry, key string) error {
-	if err := validateNoCRLF(tunnelName, section, entry); err != nil {
-		return err
-	}
-
-	if key == "" {
-		return fmt.Errorf("Tunnel %s: %s entry %q has an empty header name", tunnelName, section, entry)
-	}
-
-	if !headerTokenRegexp.MatchString(key) {
-		return fmt.Errorf("Tunnel %s: %s entry %q: %q is not a valid HTTP header name",
-			tunnelName, section, entry, key)
-	}
-
-	// ngrok parity: user-agent is not user-settable in either direction.
-	if strings.EqualFold(key, "user-agent") {
-		return fmt.Errorf("Tunnel %s: %s entry %q: user-agent may not be added or removed",
-			tunnelName, section, entry)
-	}
-
-	return nil
-}
-
-// validateNoCRLF is the header-injection guard: nothing configured here may
-// contain CR or LF, wherever it appears in the string.
-func validateNoCRLF(tunnelName, section, entry string) error {
-	if strings.ContainsAny(entry, "\r\n") {
-		return fmt.Errorf("Tunnel %s: %s entry %q contains a CR or LF (header injection)",
-			tunnelName, section, entry)
+	if err := policy.Validate(); err != nil {
+		return fmt.Errorf("Tunnel %s: %v", tunnelName, err)
 	}
 
 	return nil
@@ -543,7 +491,7 @@ func validateNoCRLF(tunnelName, section, entry string) error {
 // are all invisible until traffic arrives, so they are refused up front.
 func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 	binding := strings.ToLower(strings.TrimSpace(t.Binding))
-	if binding == bindingPublic {
+	if binding == bindingPublicAlias {
 		binding = ""
 	}
 	t.Binding = binding
@@ -554,10 +502,10 @@ func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 		// the public listener will never route to (server/http.go treats
 		// .internal hosts as misses): refuse it here rather than letting it
 		// come online and 404 by construction.
-		if strings.HasSuffix(strings.ToLower(t.Hostname), internalSuffix) {
-			return fmt.Errorf("Tunnel %s: hostname %q ends in %s, which requires binding internal (the public listener never routes %s hosts)", tunnelName, t.Hostname, internalSuffix, internalSuffix)
+		if strings.HasSuffix(strings.ToLower(t.Hostname), msg.InternalSuffix) {
+			return fmt.Errorf("Tunnel %s: hostname %q ends in %s, which requires binding internal (the public listener never routes %s hosts)", tunnelName, t.Hostname, msg.InternalSuffix, msg.InternalSuffix)
 		}
-	case bindingInternal:
+	case msg.BindingInternal:
 		if err := validateInternalEndpoint(tunnelName, t); err != nil {
 			return err
 		}
@@ -570,7 +518,7 @@ func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 	// refuses internal TCP as well (it would have no way to reach it); this
 	// mirror of that rule turns a remote registration error into a local one
 	// that names the tunnel.
-	if binding == bindingInternal {
+	if binding == msg.BindingInternal {
 		for proto := range t.Protocols {
 			if !isHttpProtocol(proto) {
 				return fmt.Errorf("Tunnel %s: binding internal is only supported for http and https tunnels, not %s", tunnelName, proto)
@@ -587,7 +535,7 @@ func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 func validateInternalEndpoint(tunnelName string, t *TunnelConfiguration) error {
 	if t.Subdomain != "" {
 		return fmt.Errorf("Tunnel %s: binding internal does not support subdomain: internal endpoints are addressed by hostname in the %s namespace",
-			tunnelName, internalSuffix)
+			tunnelName, msg.InternalSuffix)
 	}
 	if t.RemotePort != 0 {
 		return fmt.Errorf("Tunnel %s: binding internal does not support remote_port: internal endpoints are http/https only", tunnelName)
@@ -596,7 +544,7 @@ func validateInternalEndpoint(tunnelName string, t *TunnelConfiguration) error {
 	hostname := t.Hostname
 	if hostname == "" {
 		return fmt.Errorf("Tunnel %s: binding internal requires a hostname ending in %s (pass -hostname=myapp%s, or set hostname: myapp%s in the config file)",
-			tunnelName, internalSuffix, internalSuffix, internalSuffix)
+			tunnelName, msg.InternalSuffix, msg.InternalSuffix, msg.InternalSuffix)
 	}
 
 	// The hostname is the name other tunnels forward to, so it is checked in
@@ -606,11 +554,11 @@ func validateInternalEndpoint(tunnelName string, t *TunnelConfiguration) error {
 	if hostname != strings.ToLower(hostname) {
 		return fmt.Errorf("Tunnel %s: internal hostname %q must be lowercase (use %q)", tunnelName, hostname, strings.ToLower(hostname))
 	}
-	if !strings.HasSuffix(hostname, internalSuffix) {
-		return fmt.Errorf("Tunnel %s: internal hostname %q must end in %s (for example \"myapp%s\")", tunnelName, hostname, internalSuffix, internalSuffix)
+	if !strings.HasSuffix(hostname, msg.InternalSuffix) {
+		return fmt.Errorf("Tunnel %s: internal hostname %q must end in %s (for example \"myapp%s\")", tunnelName, hostname, msg.InternalSuffix, msg.InternalSuffix)
 	}
-	if len(hostname) == len(internalSuffix) {
-		return fmt.Errorf("Tunnel %s: internal hostname %q needs a name in front of %s (for example \"myapp%s\")", tunnelName, hostname, internalSuffix, internalSuffix)
+	if len(hostname) == len(msg.InternalSuffix) {
+		return fmt.Errorf("Tunnel %s: internal hostname %q needs a name in front of %s (for example \"myapp%s\")", tunnelName, hostname, msg.InternalSuffix, msg.InternalSuffix)
 	}
 	if strings.ContainsAny(hostname, " \t\r\n/") {
 		return fmt.Errorf("Tunnel %s: internal hostname %q must not contain spaces or '/'", tunnelName, hostname)
@@ -640,23 +588,23 @@ func validateForwardTo(tunnelName string, t *TunnelConfiguration) error {
 		return fmt.Errorf("Tunnel %s: invalid forward_to %q: %v", tunnelName, forwardTo, err)
 	}
 
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if u.Scheme != msg.ProtoHTTP && u.Scheme != msg.ProtoHTTPS {
 		return fmt.Errorf("Tunnel %s: forward_to %q must be an http:// or https:// url pointing at an internal endpoint (for example \"https://myapp%s\")",
-			tunnelName, forwardTo, internalSuffix)
+			tunnelName, forwardTo, msg.InternalSuffix)
 	}
 	if u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return fmt.Errorf("Tunnel %s: forward_to %q must be only the internal endpoint url, with no path, query or fragment (for example \"https://myapp%s\")",
-			tunnelName, forwardTo, internalSuffix)
+			tunnelName, forwardTo, msg.InternalSuffix)
 	}
 	if u.Port() != "" {
 		return fmt.Errorf("Tunnel %s: forward_to %q must not carry a port: internal endpoints are addressed by name (for example \"https://myapp%s\")",
-			tunnelName, forwardTo, internalSuffix)
+			tunnelName, forwardTo, msg.InternalSuffix)
 	}
 
 	hostname := u.Hostname()
-	if !strings.HasSuffix(hostname, internalSuffix) || len(hostname) == len(internalSuffix) {
+	if !strings.HasSuffix(hostname, msg.InternalSuffix) || len(hostname) == len(msg.InternalSuffix) {
 		return fmt.Errorf("Tunnel %s: forward_to %q must point at an internal endpoint whose hostname ends in %s (for example \"https://myapp%s\")",
-			tunnelName, forwardTo, internalSuffix, internalSuffix)
+			tunnelName, forwardTo, msg.InternalSuffix, msg.InternalSuffix)
 	}
 
 	// A forward chain out of a TCP tunnel could never resolve: internal
@@ -672,15 +620,10 @@ func validateForwardTo(tunnelName string, t *TunnelConfiguration) error {
 
 // isHttpProtocol reports whether a protocol key (as written in the config's
 // proto section, so possibly a "+"-joined combination) is one this client
-// serves over HTTP.
+// serves over HTTP. The rule is the wire vocabulary's, in package msg, because
+// the server asks the same question of the same field (SPEC 3.2/3.4).
 func isHttpProtocol(proto string) bool {
-	for _, p := range strings.Split(proto, "+") {
-		if p != "http" && p != "https" {
-			return false
-		}
-	}
-
-	return true
+	return msg.IsHTTPOnly(proto)
 }
 
 // hasHTTPProtocol reports whether a tunnel serves at least one http or https
@@ -746,18 +689,31 @@ func validateTrafficPolicy(tunnelName string, t *TunnelConfiguration) error {
 }
 
 // normalizeTrafficPolicy rewrites a policy's config values into the map shapes
-// the control channel can carry. yaml.v1 decodes a nested map into
-// map[interface{}]interface{}, which has no key type and which encoding/json
-// therefore refuses to marshal at all -- and the tunnel registration is a JSON
-// envelope. A policy straight out of a YAML file would otherwise fail at the
-// first ReqTunnel and take the whole control connection down with it, retrying
-// forever: the e2e found this, and the unit tests could not, because they built
-// their policies in Go, where the maps are already map[string]interface{}.
+// the control channel can carry. The YAML decoder can produce
+// map[interface{}]interface{} at any depth, which has no key type and which
+// encoding/json therefore refuses to marshal at all -- and the tunnel
+// registration is a JSON envelope. A policy straight out of a YAML file would
+// otherwise fail at the first ReqTunnel and take the whole control connection
+// down with it, retrying forever: the e2e found this, and the unit tests could
+// not, because they built their policies in Go, where the maps are already
+// map[string]interface{}.
 //
-// A key that is not a string is rendered with %v and left to validation to
-// judge (it will not match any config field an action documents). It is
-// unreachable for a policy that validates, since the policy package's asMap
-// refuses a nested map with a non-string key wherever it reads one.
+// What the yaml.v3 migration changed here, and why the pass stayed anyway: v1
+// gave *every* nested map the interface-keyed shape, so this rewrote every
+// config value of every policy loaded from a file; v3 uses
+// map[string]interface{} when all the keys are strings and falls back to the
+// interface-keyed shape only when one is not (an int, a bool, a null). So for a
+// policy that validates this is now usually a no-op -- asMap refuses a non-string
+// key wherever it reads one, so no valid policy has one -- and it is kept because
+// the loader cannot know that before validation has run, and the cost of being
+// wrong is a client that never registers.
+//
+// The one thing it still does to such a document is rewrite the key itself: a
+// non-string key becomes its %v rendering *before* Validate sees it, so it is
+// judged as a config field name (which will not match any field an action
+// documents) rather than refused as a key. That is what v1 did with every map,
+// and it is left exactly as it was found: changing it would change which
+// documents are refused, which is not what a parser swap is for.
 func normalizeTrafficPolicy(tp *policy.TrafficPolicy) {
 	if tp == nil {
 		return
@@ -816,7 +772,7 @@ func normalizePolicyValue(v interface{}) interface{} {
 // loadTrafficPolicyFile reads the file named by -traffic-policy-file. YAML is
 // the documented format and is what the config file's traffic_policy key is
 // written in; a JSON policy document is tolerated, because JSON is a subset of
-// YAML and yaml.v1 parses it as one (there is a test for the spelling).
+// YAML and the decoder parses it as one (there is a test for the spelling).
 //
 // The policy is validated here, not later: the point of validating at load time
 // is that a control which does not mean what its author thinks never reaches a

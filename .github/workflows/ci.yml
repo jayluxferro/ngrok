@@ -20,12 +20,20 @@ jobs:
       - name: Generate assets
         run: make assets
 
+      # ./... rather than a hand-written package list: the previous list was
+      # written before ./rewriter and ./policy existed and was never updated, so
+      # the two packages that implement the traffic-policy and header-rewriting
+      # security fixes were the only ones CI never ran. A list of package paths
+      # can go stale again silently; the wildcard cannot.
       - name: Unit Tests
-        run: go test -tags debug ./main/ngrok ./main/ngrokd ./client ./server ./conn ./msg ./proto ./util ./cache ./log ./version ./client/views/web
+        run: go test -tags debug ./...
 
       - name: Vet
-        run: go vet -tags debug ./main/ngrok ./main/ngrokd ./client ./server ./conn ./msg ./proto ./util ./cache ./log ./version ./client/views/web
+        run: go vet -tags debug ./...
 
+      # Every package, not just the three that were historically the racy ones.
+      # -race is the only thing that reads the event-stream and registry code
+      # concurrently; leaving a package out means its data races are invisible.
       - name: Race Tests
-        run: go test -race -tags debug ./server ./util ./client/views/web
+        run: go test -race -tags debug ./...
 

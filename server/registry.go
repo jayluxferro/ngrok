@@ -16,11 +16,9 @@ import (
 const (
 	cacheSaveInterval time.Duration = 10 * time.Minute
 
-	// BindingPublic / BindingInternal are the accepted values of
-	// msg.ReqTunnel.Binding (SPEC 3.5). The zero value is public so that
-	// clients which predate the field keep behaving exactly as before.
-	BindingPublic   = ""
-	BindingInternal = "internal"
+	// The binding values ReqTunnel.Binding may carry live in package msg with
+	// the rest of the wire vocabulary: msg.BindingPublic is the zero value, so
+	// a client which predates the field keeps behaving exactly as before.
 
 	// defaultOwner is the single namespace every client shares when the server
 	// runs without -authToken (SPEC 3.1, documented limitation).
@@ -52,7 +50,15 @@ func (url cacheUrl) Size() int {
 type bucket struct {
 	tunnels []*Tunnel
 	next    uint32
-	owner   string
+
+	// owner is the account of the bucket's first member, and the account every
+	// later member must share to join it. It is a security boundary, not
+	// bookkeeping: the members of a bucket serve each other's public traffic --
+	// Get() round-robins over all of them without consulting the owner of the
+	// connection's Host -- so a bucket that accepted a member from another
+	// account would hand that account's agent, and the requests that carry its
+	// customers' credentials, another account's traffic.
+	owner string
 }
 
 // pooling reports whether this bucket accepts more members: only a bucket
@@ -163,8 +169,11 @@ func (r *TunnelRegistry) SaveCacheThread(path string, interval time.Duration) {
 // surface: there is exactly one way to say who owns a tunnel and whether it
 // pools.
 //
-// Conflict rules: a registration conflicts with an existing bucket unless
-// both the existing members and the newcomer are pooling.
+// Conflict rules: a registration conflicts with an existing bucket unless both
+// the existing members and the newcomer are pooling, and unless the newcomer
+// belongs to the same account as the bucket. Every pooling path -- the vhost
+// one and the TCP one -- arrives here, so this is the single place where a
+// cross-account join can be refused.
 func (r *TunnelRegistry) Register(url string, t *Tunnel) error {
 	r.Lock()
 	defer r.Unlock()
@@ -174,6 +183,14 @@ func (r *TunnelRegistry) Register(url string, t *Tunnel) error {
 	if b := r.tunnels[key]; b != nil {
 		if !b.pooling() {
 			return fmt.Errorf("The tunnel %s is already registered.", url)
+		}
+		// Pooling shares the url, and with it every connection the bucket is
+		// handed: whoever joins serves traffic that was addressed to somebody
+		// else's endpoint. Only the account that owns the bucket may join it,
+		// and a refusal says so without saying anything about the other
+		// account beyond the fact that this url is taken.
+		if b.owner != t.owner {
+			return fmt.Errorf("The tunnel %s is already registered by a different account; pooling only joins a pool owned by the same account.", url)
 		}
 		if !t.req.Pooling {
 			return fmt.Errorf("The tunnel %s is already shared by pooling tunnels; enable pooling to join it.", url)
@@ -255,6 +272,27 @@ func (r *TunnelRegistry) Del(url string) {
 	r.Lock()
 	defer r.Unlock()
 	delete(r.tunnels, url)
+}
+
+// DelBucket removes the whole bucket at url and returns the tunnels it held,
+// in registration order. It is what a listener-owning tunnel's shutdown needs:
+// the members of a TCP pool share a listener they did not bind, so when the
+// creator goes the shared endpoint is gone for all of them, and a bucket key
+// left behind would keep pointing at a url nothing listens on -- and would even
+// report itself as pooling, inviting new members into a pool with no listener.
+func (r *TunnelRegistry) DelBucket(url string) []*Tunnel {
+	r.Lock()
+	defer r.Unlock()
+
+	b := r.tunnels[url]
+	if b == nil {
+		return nil
+	}
+	delete(r.tunnels, url)
+
+	// the caller shuts the members down, so it gets its own slice: it must not
+	// be holding a view into the bucket while doing so.
+	return append([]*Tunnel(nil), b.tunnels...)
 }
 
 // Remove drops a single tunnel from the bucket it was registered in and
@@ -394,14 +432,33 @@ func (r *ControlRegistry) Add(clientId string, ctl *Control) (oldCtl *Control) {
 	return
 }
 
-func (r *ControlRegistry) Del(clientId string) error {
+// Del removes the control registered under clientId, but only if it is still
+// ctl. A control that was replaced (the client reconnected before the old
+// connection noticed) must not evict its replacement on its way out, and
+// comparing pointers is how that is decided now: the check is under the same
+// lock as the delete, so no window exists in which the replacement can slip in
+// between the two.
+//
+// This replaces the old "clear c.id in Replaced so that Del(”) finds
+// nothing" trick, which worked by mutating a field that the registry, the
+// metrics and the logs all read concurrently (see Control.Replaced).
+func (r *ControlRegistry) Del(clientId string, ctl *Control) error {
 	r.Lock()
 	defer r.Unlock()
-	if r.controls[clientId] == nil {
+
+	current := r.controls[clientId]
+	if current == nil {
 		return fmt.Errorf("No control found for client id: %s", clientId)
-	} else {
-		r.Info("Removed control registry id %s", clientId)
-		delete(r.controls, clientId)
+	}
+	if current != ctl {
+		// Not an error worth shouting about: the normal outcome of a reconnect
+		// race, where the old control's stopper runs after the new control was
+		// registered.
+		r.Debug("Control %s was replaced; not removing the replacement", clientId)
 		return nil
 	}
+
+	r.Info("Removed control registry id %s", clientId)
+	delete(r.controls, clientId)
+	return nil
 }

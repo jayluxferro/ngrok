@@ -5,10 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v1"
+	"gopkg.in/yaml.v3"
+
+	"ngrok/rewriter"
 )
 
 // Tests for the config-file and command-line surface of the header-manipulation
@@ -326,6 +329,85 @@ func TestLoadConfigurationHeaderValidation(t *testing.T) {
 	}
 }
 
+// TestHeaderValidationIsTheWriters is the differential test for the one-gate
+// property this package gained when its header rules were deleted in favour of
+// package rewriter's: what the loader accepts and what rewriter.Policy.Validate
+// accepts have to be the same set, value for value.
+//
+// It is written as a comparison against rewriter's own validators rather than
+// as a table of messages on purpose. A table only pins the cases someone
+// thought of, and the old failure mode was not a wrong message: it was two
+// copies of the rules that agreed on every case anyone had written down and
+// were free to disagree on the rest -- so a tunnel could load and then be
+// written to the wire by a code path whose own rules would have refused it
+// (the fuzzing report's R1). Comparing the two gates directly is what makes a
+// freshly reintroduced second copy fail this test.
+func TestHeaderValidationIsTheWriters(t *testing.T) {
+	hostHeaders := []string{
+		"",
+		"rewrite",
+		"preserve",
+		"REWRITE", // the keywords are case-insensitive at write time
+		"host.example",
+		"host.example:8080",
+		"bad host",
+		"evil.example/path",
+		"evil.example\r\nX-Injected: 1",
+		"\t",
+	}
+
+	for _, hostHeader := range hostHeaders {
+		t.Run("host_header "+strconv.Quote(hostHeader), func(t *testing.T) {
+			configPath := writeConfig(t, tunnelYAML("    host_header: "+strconv.Quote(hostHeader)))
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+
+			wantErr := rewriter.ValidateHostHeader(hostHeader) != nil
+			if wantErr != (err != nil) {
+				t.Fatalf("load of host_header %q returned %v; rewriter.ValidateHostHeader says it %s valid",
+					hostHeader, err, map[bool]string{true: "is not", false: "is"}[wantErr])
+			}
+		})
+	}
+
+	entries := []string{
+		"X-A: b",
+		"X-Url: http://localhost:8080/x",
+		"X-Colon: a:b:c",
+		"X-A",
+		": value",
+		"   : value",
+		"X Bad: v",
+		"X-A: b\r\nX-Injected: 1",
+		"User-Agent: not-a-real-client",
+		"user-agent",
+		"",
+	}
+
+	for _, entry := range entries {
+		t.Run("add "+strconv.Quote(entry), func(t *testing.T) {
+			configPath := writeConfig(t, tunnelYAML("    request_header:", "      add:", "        - "+strconv.Quote(entry)))
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+
+			wantErr := rewriter.ValidateAddEntry("request_header", entry) != nil
+			if wantErr != (err != nil) {
+				t.Fatalf("load of add entry %q returned %v; rewriter.ValidateAddEntry says it %s usable",
+					entry, err, map[bool]string{true: "is not", false: "is"}[wantErr])
+			}
+		})
+
+		t.Run("remove "+strconv.Quote(entry), func(t *testing.T) {
+			configPath := writeConfig(t, tunnelYAML("    response_header:", "      remove:", "        - "+strconv.Quote(entry)))
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+
+			wantErr := rewriter.ValidateRemoveName("response_header", entry) != nil
+			if wantErr != (err != nil) {
+				t.Fatalf("load of remove entry %q returned %v; rewriter.ValidateRemoveName says it %s usable",
+					entry, err, map[bool]string{true: "is not", false: "is"}[wantErr])
+			}
+		})
+	}
+}
+
 func TestHeaderValidationNamesOffendingTunnel(t *testing.T) {
 	configPath := writeConfig(t, `
 tunnels:
@@ -614,6 +696,89 @@ tunnels:
     pooling: true
     compression: false
 `
+
+// TestNegativeLimitKeysAreLoadErrors covers the two numeric keys that carry a
+// default: a negative value used to be clamped to the default in silence, so a
+// file that asked for a negative limit loaded as if it had asked for the
+// default and nothing was said. Both keys are limits -- how much body the
+// inspector keeps, how many proxied connections run at once -- and a limit the
+// operator did not choose is exactly the kind of thing that is noticed only
+// under load.
+func TestNegativeLimitKeysAreLoadErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		wantErr string
+	}{
+		{"negative inspect_max_body_bytes", "inspect_max_body_bytes", "-1", "inspect_max_body_bytes must not be negative"},
+		{"negative proxy_max_concurrency", "proxy_max_concurrency", "-1", "proxy_max_concurrency must not be negative"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n"+tt.key+": "+tt.value+"\n")
+
+			_, err := LoadConfiguration(&Options{
+				config:   configPath,
+				command:  "default",
+				args:     []string{"8080"},
+				protocol: "http",
+			})
+			if err == nil {
+				t.Fatalf("expected %s: %s to be a load error", tt.key, tt.value)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected the error to mention %q, got: %v", tt.wantErr, err)
+			}
+			// The message has to tell the operator the way out, since the
+			// value they wrote is what they get told about.
+			if !strings.Contains(err.Error(), tt.value) || !strings.Contains(err.Error(), "omit the key") {
+				t.Fatalf("expected the error to quote the value and say what to do instead, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestLimitKeysDefaultAndExplicitValues is the other half: absent, explicitly
+// zero and explicitly set all have to behave, because 0 is not a
+// distinguishable "unset" for either key -- it means "the default" here, and
+// the load errors above are what keeps a real 0 from being confused with a
+// mistake.
+func TestLimitKeysDefaultAndExplicitValues(t *testing.T) {
+	tests := []struct {
+		name         string
+		lines        string
+		wantBodySize int64
+		wantWorkers  int
+	}{
+		{"absent", "", 1024 * 1024, 64},
+		{"explicit zero", "inspect_max_body_bytes: 0\nproxy_max_concurrency: 0\n", 1024 * 1024, 64},
+		{"explicit values", "inspect_max_body_bytes: 4096\nproxy_max_concurrency: 8\n", 4096, 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n"+tt.lines)
+
+			config, err := LoadConfiguration(&Options{
+				config:   configPath,
+				command:  "default",
+				args:     []string{"8080"},
+				protocol: "http",
+			})
+			if err != nil {
+				t.Fatalf("expected the config to load, got: %v", err)
+			}
+			if config.InspectMaxBodySize != tt.wantBodySize {
+				t.Errorf("InspectMaxBodySize: expected %d, got %d", tt.wantBodySize, config.InspectMaxBodySize)
+			}
+			if config.ProxyMaxConcurrent != tt.wantWorkers {
+				t.Errorf("ProxyMaxConcurrent: expected %d, got %d", tt.wantWorkers, config.ProxyMaxConcurrent)
+			}
+		})
+	}
+}
 
 func TestEndpointConfigYAMLRoundTrip(t *testing.T) {
 	config := new(Configuration)

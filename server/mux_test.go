@@ -37,13 +37,26 @@ func setupTestControlRegistry(t *testing.T) *ControlRegistry {
 	return controlRegistry
 }
 
+// testSessionSecret is the session secret the fixtures in this package present.
+//
+// It is derived from the client id so that each fixture has its own, and it is
+// set on the control by hand rather than minted by the server: a fixture that
+// forgets to install it fails closed (secretMatches refuses an empty stored
+// secret) instead of accidentally authenticating against an empty one.
+func testSessionSecret(clientId string) string {
+	return "test-secret-" + clientId
+}
+
 // muxTestControl returns a control registered under id, backed by testControl's
-// fixture (a real loopback connection, so registration and logging work).
+// fixture (a real loopback connection, so registration and logging work). The
+// control carries the secret its client would have been given at Auth time, so
+// the mux handshake that names it can be accepted.
 func muxTestControl(t *testing.T, reg *ControlRegistry, id string) *Control {
 	t.Helper()
 
 	ctl := testControl(t, "")
 	ctl.id = id
+	ctl.secret = testSessionSecret(id)
 	reg.Add(id, ctl)
 
 	return ctl
@@ -57,17 +70,63 @@ func muxTestPair(t *testing.T, clientId string) *smux.Session {
 	t.Helper()
 
 	serverEnd, clientEnd := net.Pipe()
-	t.Cleanup(func() { clientEnd.Close() })
 
-	go NewMux(conn.Wrap(serverEnd, "tun"), &msg.RegMux{ClientId: clientId})
+	go NewMux(conn.Wrap(serverEnd, "tun"), &msg.RegMux{ClientId: clientId, Secret: testSessionSecret(clientId)})
 
 	sess, err := smux.Client(clientEnd, muxConfig())
 	if err != nil {
 		t.Fatalf("failed to start the client side of the mux session: %v", err)
 	}
-	t.Cleanup(func() { sess.Close() })
+
+	t.Cleanup(func() {
+		clientEnd.Close()
+		sess.Close()
+		waitForMuxDetach(t, clientId)
+	})
 
 	return sess
+}
+
+// waitForMuxDetach waits until the control no longer holds the mux session of
+// the pair that just closed.
+//
+// The server side ends the session on its own goroutine -- it closes the conn,
+// logging on the way out, and only then clears the control's reference to it --
+// so a test that ends first leaves that goroutine running into the next test:
+// logging into the logger the next test installed, and reading the control
+// registry the next test's fixture replaces. Clearing the reference is the
+// session's last act, so waiting for the slot to be empty is waiting for it.
+func waitForMuxDetach(t *testing.T, clientId string) {
+	t.Helper()
+
+	if controlRegistry == nil {
+		return // a test that never installed one has no control to wait for
+	}
+	ctl := controlRegistry.Get(clientId)
+	if ctl == nil {
+		return
+	}
+
+	const grace = 5 * time.Second
+	deadline := time.Now().Add(grace)
+	for {
+		if ctl.MuxSession() == nil {
+			// The session is attached by the listener goroutine, so it may not
+			// have appeared yet: give the handshake a moment before believing
+			// the slot is empty because nothing was ever put in it.
+			time.Sleep(20 * time.Millisecond)
+			if ctl.MuxSession() == nil {
+				return
+			}
+			continue
+		}
+
+		if time.Now().After(deadline) {
+			t.Errorf("the mux session did not detach from the control within %s", grace)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // waitForProxy pops the next proxy connection the control's pool received, and
@@ -152,7 +211,7 @@ func newMuxStreamFixture(t *testing.T, clientId string) *muxStreamFixture {
 	streamConn := conn.Wrap(stream, "pxy")
 	t.Cleanup(func() { streamConn.Close() })
 
-	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: clientId}); err != nil {
+	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: clientId, Secret: testSessionSecret(clientId)}); err != nil {
 		t.Fatalf("failed to register the proxy stream: %v", err)
 	}
 
@@ -280,7 +339,11 @@ func TestMuxStreamRejectsAnotherClientId(t *testing.T) {
 	streamConn := conn.Wrap(stream, "pxy")
 	t.Cleanup(func() { streamConn.Close() })
 
-	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: "client-b"}); err != nil {
+	// The stream names another client and presents that client's id without its
+	// secret: the server rejects it on the id, so whether it would also have
+	// rejected the secret never comes up (the wrong-secret case has its own
+	// test, TestMuxStreamRejectsWrongSecret).
+	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: "client-b", Secret: testSessionSecret("client-b")}); err != nil {
 		t.Fatalf("failed to write RegProxy: %v", err)
 	}
 
@@ -358,7 +421,7 @@ func TestProxyPoolServesDialedAndStreamConns(t *testing.T) {
 
 	// the pre-mux path: a dialed conn registering over the real entry point
 	dialedClient, dialedServer := tcpPair(t)
-	go NewProxy(conn.Wrap(dialedServer, "pxy"), &msg.RegProxy{ClientId: ctl.id})
+	go NewProxy(conn.Wrap(dialedServer, "pxy"), &msg.RegProxy{ClientId: ctl.id, Secret: testSessionSecret(ctl.id)})
 	dialedConn := waitForProxy(t, ctl)
 
 	// the mux path: a stream on a session the same control owns
@@ -371,7 +434,7 @@ func TestProxyPoolServesDialedAndStreamConns(t *testing.T) {
 	streamConn := conn.Wrap(stream, "pxy")
 	t.Cleanup(func() { streamConn.Close() })
 
-	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: ctl.id}); err != nil {
+	if err := msg.WriteMsg(streamConn, &msg.RegProxy{ClientId: ctl.id, Secret: testSessionSecret(ctl.id)}); err != nil {
 		t.Fatalf("failed to register the proxy stream: %v", err)
 	}
 	muxConn := waitForProxy(t, ctl)

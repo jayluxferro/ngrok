@@ -3,6 +3,7 @@ package client
 import (
 	"flag"
 	"fmt"
+	"ngrok/msg"
 	"ngrok/version"
 	"os"
 	"strings"
@@ -144,10 +145,15 @@ func ParseArgs() (opts *Options, err error) {
 		"",
 		"Request a custom hostname from the ngrok server. (HTTP only) (requires CNAME of your DNS)")
 
+	// The help text used to list {'http', 'https', 'tcp'} while the default was
+	// 'http+https' -- a value the list did not contain, so the one spelling a
+	// user was most likely to type was the one the help said was invalid. It is
+	// not: the field is '+'-joined, and a tunnel may carry several protocols at
+	// once (each is registered and served separately).
 	protocol := flag.String(
 		"proto",
-		"http+https",
-		"The protocol of the traffic over the tunnel {'http', 'https', 'tcp'} (default: 'http+https')")
+		msg.ProtoHTTPPlusHTTPS,
+		"The protocol of the traffic over the tunnel: 'http', 'https' or 'tcp', or several of them joined with '+' to serve the same tunnel over each (default: 'http+https', which is an http and an https endpoint)")
 
 	hostHeader := flag.String(
 		"host-header",

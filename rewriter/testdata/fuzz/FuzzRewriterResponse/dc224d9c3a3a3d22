@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("HTTP/1.1 200\nContent-TYpe:teXt/\n\n\x9e\xbc\xbe\xeezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzxzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"ngrok/conn"
 	"ngrok/msg"
+	"ngrok/util"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,11 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 // testControl returns a Control whose connection is a real loopback TCP
 // connection: registration reads the remote address for the affinity cache,
 // and conn.Wrap refuses anything that is not a *net.TCPConn.
+//
+// The four shutdowns are the ones NewControl installs. They are part of what a
+// control is, not decoration: registerTunnel begins the control's shutdown when
+// a registration fails on a control with no tunnels left, so a fixture that
+// leaves them nil panics the moment a registration is refused.
 func testControl(t *testing.T, user string) *Control {
 	t.Helper()
 
@@ -103,12 +109,16 @@ func testControl(t *testing.T, user string) *Control {
 	t.Cleanup(func() { ctlConn.Close() })
 
 	return &Control{
-		auth:     &msg.Auth{User: user, OS: "linux"}, // metrics reads auth.OS
-		conn:     ctlConn,
-		out:      make(chan msg.Message, 16),
-		in:       make(chan msg.Message, 16),
-		proxies:  make(chan conn.Conn, 16),
-		lastPing: time.Now(),
+		auth:            &msg.Auth{User: user, OS: "linux"}, // metrics reads auth.OS
+		conn:            ctlConn,
+		out:             make(chan msg.Message, 16),
+		in:              make(chan msg.Message, 16),
+		proxies:         make(chan conn.Conn, 16),
+		lastPing:        time.Now(),
+		writerShutdown:  util.NewShutdown(),
+		readerShutdown:  util.NewShutdown(),
+		managerShutdown: util.NewShutdown(),
+		shutdown:        util.NewShutdown(),
 	}
 }
 
@@ -140,7 +150,7 @@ func internalTunnel(t *testing.T, reg *TunnelRegistry, url, owner, forwardTo str
 		req: &msg.ReqTunnel{
 			Protocol:  protocol,
 			Hostname:  hostname,
-			Binding:   BindingInternal,
+			Binding:   msg.BindingInternal,
 			ForwardTo: forwardTo,
 		},
 	}
@@ -300,17 +310,44 @@ func TestInternalEndpointRules(t *testing.T) {
 	}{
 		{
 			name:    "a hostname is required",
-			req:     msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Subdomain: "svc"},
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Subdomain: "svc"},
 			wantErr: "require a hostname",
 		},
 		{
 			name:    "the hostname must be under .internal",
-			req:     msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Hostname: "svc.example.com"},
-			wantErr: internalSuffix,
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.example.com"},
+			wantErr: msg.InternalSuffix,
+		},
+		{
+			// Registration used to canonicalize this to svc.internal. It no
+			// longer does: two endpoints whose hostnames differ only in case
+			// are the same hostname to every resolver, so accepting one of
+			// them as a second name for the other is how a client ends up
+			// holding an endpoint it did not ask for. The rule now matches the
+			// client's own validator (client/config.go), so a client that got
+			// here sent a hostname its own rules would have refused.
+			name:    "a mixed case hostname is refused rather than canonicalized",
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "SVC.Internal"},
+			wantErr: "must be lowercase",
+		},
+		{
+			name:    "the bare suffix is not a hostname",
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: msg.InternalSuffix},
+			wantErr: "needs a name in front of",
+		},
+		{
+			name:    "an internal hostname cannot contain a path",
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc/evil.internal"},
+			wantErr: "must not contain spaces or '/'",
+		},
+		{
+			name:    "an internal hostname cannot contain a space",
+			req:     msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "sv c.internal"},
+			wantErr: "must not contain spaces or '/'",
 		},
 		{
 			name:    "tcp internals are not supported yet",
-			req:     msg.ReqTunnel{Protocol: "tcp", Binding: BindingInternal, Hostname: "svc.internal"},
+			req:     msg.ReqTunnel{Protocol: "tcp", Binding: msg.BindingInternal, Hostname: "svc.internal"},
 			wantErr: "not supported yet",
 		},
 		{
@@ -347,9 +384,9 @@ func TestInternalEndpointRules(t *testing.T) {
 		t.Fatal("a public http endpoint should require a public listener")
 	}
 
-	tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Hostname: "SVC.Internal"})
+	tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.internal"})
 	if tun.url != "http://svc.internal" {
-		t.Fatalf("internal endpoint url = %q, want the canonicalized http://svc.internal", tun.url)
+		t.Fatalf("internal endpoint url = %q, want http://svc.internal", tun.url)
 	}
 	if tun.owner != defaultOwner {
 		t.Fatalf("owner = %q, want %q without auth tokens", tun.owner, defaultOwner)
@@ -605,7 +642,7 @@ func TestOwnerFallbackWithoutAuthTokens(t *testing.T) {
 
 	// The owner is what namespaces internal endpoints: the account that
 	// registered one can reach it, a different account cannot.
-	tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Hostname: "shared.internal"})
+	tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "shared.internal"})
 	if tun.owner != "token-1" {
 		t.Fatalf("the tunnel owner is %q, want token-1", tun.owner)
 	}
@@ -660,7 +697,7 @@ func TestPublicHttpPath(t *testing.T) {
 	t.Run("internal endpoints are not routable", func(t *testing.T) {
 		setupTestRegistry(t)
 		ctl := testControl(t, "")
-		registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Hostname: "svc.internal"})
+		registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.internal"})
 
 		status, body := publicRequest(t, "svc.internal")
 		if status != http.StatusNotFound {
@@ -725,7 +762,7 @@ func TestPublicHttpPath(t *testing.T) {
 		setupTestRegistry(t)
 		ctl := testControl(t, "")
 
-		internal := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: BindingInternal, Hostname: "svc.internal"})
+		internal := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.internal"})
 		registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: "http", Hostname: host, ForwardTo: internal.url})
 
 		// the proxy connection the internal endpoint's agent opened

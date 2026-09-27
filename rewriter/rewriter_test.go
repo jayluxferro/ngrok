@@ -825,17 +825,39 @@ func TestLeadingBlankLineIsTolerated(t *testing.T) {
 // TestChunkedWinsOverContentLength: when both framings are present the chunked
 // one is authoritative (RFC 7230 3.3.3). Reading the Content-Length instead
 // would desync the connection, so it is worth pinning down.
+//
+// The Content-Length is dropped on the way out as well as ignored on the way
+// in. Forwarding it would hand the upstream a head that says two things at
+// once, and which of the two it believes is a property of the upstream's
+// implementation rather than of this message: that disagreement -- the reader
+// this end, the writer that end -- is the CL.TE half of request smuggling. So
+// what leaves here says exactly one thing about the body.
 func TestChunkedWinsOverContentLength(t *testing.T) {
 	in := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" +
 		"5\r\nhello\r\n0\r\n\r\n" +
 		"GET /after HTTP/1.1\r\nHost: a.example\r\n\r\n"
-	want := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n" +
+	want := "POST / HTTP/1.1\r\nHost: a.example\r\nTransfer-Encoding: chunked\r\n" +
 		"X-Forwarded-For: 203.0.113.7\r\nX-Forwarded-Proto: http\r\n\r\n" +
 		"5\r\nhello\r\n0\r\n\r\n" +
 		"GET /after HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 203.0.113.7\r\nX-Forwarded-Proto: http\r\n\r\n"
 
 	gotReq, _ := pair(t, tunnelPolicy(), in, "")
 	check(t, "request", gotReq, want)
+
+	// The output has to stay a message net/http is willing to read, and a
+	// reader has to see the chunked body: dropping the field is a framing
+	// change, so it is checked with the arbiter rather than by eye.
+	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(gotReq)))
+	if err != nil {
+		t.Fatalf("the normalized request is not readable by net/http: %v\n%s", err, gotReq)
+	}
+	defer req.Body.Close()
+	if req.ContentLength != -1 {
+		t.Fatalf("net/http read a Content-Length off the normalized head: %d\n%s", req.ContentLength, gotReq)
+	}
+	if body, err := io.ReadAll(req.Body); err != nil || string(body) != "hello" {
+		t.Fatalf("the chunked body did not survive the normalization: %q (err %v)\n%s", body, err, gotReq)
+	}
 }
 
 // TestHostRewriteAddsMissingHost: an HTTP/1.0 request may carry no Host at all,
@@ -1838,15 +1860,11 @@ func TestHookWakeUnblocksParkedResponseSide(t *testing.T) {
 
 	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
 
-	type result struct {
-		out string
-		err error
-	}
-	respOut := make(chan result, 1)
+	respOut := make(chan copyResult, 1)
 	go func() {
 		var b strings.Builder
 		_, err := io.Copy(&b, fromUpstream)
-		respOut <- result{b.String(), err}
+		respOut <- copyResult{b.String(), err}
 	}()
 
 	// Wait until the response side really is parked in the blocking read, so
@@ -1952,15 +1970,11 @@ func TestHookTerminateOverMuxStream(t *testing.T) {
 
 	toUpstream, fromUpstream := NewConnPair(public, respSrc, p)
 
-	type result struct {
-		out string
-		err error
-	}
-	respOut := make(chan result, 1)
+	respOut := make(chan copyResult, 1)
 	go func() {
 		var b strings.Builder
 		_, err := io.Copy(&b, fromUpstream)
-		respOut <- result{b.String(), err}
+		respOut <- copyResult{b.String(), err}
 	}()
 
 	// Wait for the response side to reach the stream, then let that read settle
@@ -2003,5 +2017,521 @@ func TestHookTerminateOverMuxStream(t *testing.T) {
 		t.Fatalf("the terminated request reached the upstream: %d bytes", n)
 	case err == nil:
 		t.Fatalf("the upstream read returned (0, nil), which is not an ending")
+	}
+}
+
+// --- the audit's findings, one test each ------------------------------------
+
+// copyResult is one direction's drained output, or why it stopped. The tests
+// below drive a direction on a goroutine and need the error to travel with the
+// bytes: an io.Copy that ends in an error is a different finding from one that
+// ends at EOF with the wrong bytes, and a bare channel of strings cannot say
+// which happened.
+type copyResult struct {
+	out string
+	err error
+}
+
+// TestOversizedHeadWithARequestHookIsRefused (PT-C1).
+//
+// A head this proxy cannot parse is a head it cannot ask the request hook
+// about: the hook is handed a *http.Request built from the parsed head, and
+// there is no parsed head. Fail-open was the old answer -- pass the bytes
+// through unread -- and it is right for a policy of static rewrites, whose
+// worst case is a rewrite that did not happen. It is not right for a hook: a
+// hook is a question with a yes/no answer, and forwarding the request anyway
+// answers it yes. Anyone who can pad a head past the parser's 64 KiB limit
+// could then walk past every hook rule, which is a bypass of exactly the thing
+// the hook exists for, and the padding is under the attacker's control.
+//
+// So: with a request hook armed, an oversized head is refused on the
+// synthetic-response path with 431, the origin never sees a byte of it, and the
+// refusal is sticky -- the request side stops parsing, so a well-formed request
+// behind the oversized one is not forwarded either. Without a hook the old
+// contract stands, byte for byte, and the other direction is untouched: a
+// response hook has no verdict that says "do not forward this" (see
+// ResponseVerdict), so refusing an oversized response head would only mean
+// dropping an answer.
+func TestOversizedHeadWithARequestHookIsRefused(t *testing.T) {
+	bigLine := "GET / HTTP/1.1\r\nX-Big: " + strings.Repeat("a", 70*1024) + "\r\n\r\n" + "tail bytes"
+
+	var manyLines strings.Builder
+	manyLines.WriteString("GET / HTTP/1.1\r\n")
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&manyLines, "X-Filler-%d: %s\r\n", i, strings.Repeat("b", 400))
+	}
+	manyLines.WriteString("\r\n")
+	// A perfectly good request behind the oversized head: nothing later on the
+	// connection is parsed after a refusal, so the origin must not see this one
+	// either.
+	manyLines.WriteString("GET /after HTTP/1.1\r\nHost: a.example\r\n\r\n")
+
+	cases := []struct {
+		name string
+		in   string
+	}{
+		// readLine's errLineTooLong: one line that does not fit the read buffer.
+		{"line over the read buffer", bigLine},
+		// The head-size cap: many lines that do fit, but not together.
+		{"head over the cap", manyLines.String()},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+": no hook, fail-open", func(t *testing.T) {
+			gotReq, gotResp := pair(t, tunnelPolicy(), tc.in, "")
+			check(t, "request", gotReq, tc.in)
+			if gotResp != "" {
+				t.Fatalf("the response side answered a request that was only passed through: %q", gotResp)
+			}
+		})
+
+		t.Run(tc.name+": request hook armed, refused", func(t *testing.T) {
+			calls := 0
+			p := &Policy{RequestHook: func(*http.Request) *RequestVerdict {
+				calls++
+				return &RequestVerdict{Terminate: syntheticTermination()}
+			}}
+
+			gotReq, gotResp := pair(t, p, tc.in, "")
+
+			if gotReq != "" {
+				t.Fatalf("the origin saw %d byte(s) of a head that could not be parsed: %q", len(gotReq), gotReq)
+			}
+			if calls != 0 {
+				t.Fatalf("the hook was called %d time(s) on a request with no parsed head", calls)
+			}
+
+			// The client gets the refusal, as one complete message that
+			// net/http can read -- 431 is what a client (and net/http's own
+			// MaxHeaderBytes path) understands as "the head was too big".
+			stream := newHTTPStream(t, strings.NewReader(gotResp))
+			resp, body := stream.next()
+			if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+				t.Fatalf("the refusal was answered with %d, want %d:\n%q", resp.StatusCode, http.StatusRequestHeaderFieldsTooLarge, gotResp)
+			}
+			if !strings.Contains(strings.ToLower(string(body)), "too large") {
+				t.Fatalf("the refusal body does not say what happened: %q", body)
+			}
+			stream.done()
+		})
+	}
+
+	t.Run("response side: oversized head still fails open", func(t *testing.T) {
+		// The scope of the refusal, pinned: it is a request-side decision about
+		// a request-side hook. The response hook has no terminate, so there is
+		// no verdict to carry out here and fail-open is what is left.
+		in := "HTTP/1.1 200 OK\r\nX-Big: " + strings.Repeat("c", 70*1024) + "\r\n\r\n"
+		p := &Policy{
+			RequestHook:  func(*http.Request) *RequestVerdict { return nil },
+			ResponseHook: func(*http.Response) *ResponseVerdict { return nil },
+		}
+		gotReq, gotResp := pair(t, p, "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n", in)
+		if gotReq == "" {
+			t.Fatal("the request was not forwarded")
+		}
+		check(t, "response", gotResp, in)
+	})
+}
+
+// TestMalformedHeadWithARequestHookIsRefused (PT-C1, the cheap route).
+//
+// The test above refuses a head past 64 KiB. That is the expensive version of
+// the same bypass: a head this package cannot parse is a head no request-phase
+// action runs on, so failing open forwards a request the policy would have
+// refused. A head that fails to *parse* costs the attacker one malformed line --
+// an obs-fold continuation, a header line with no colon, a space in a field name
+// -- and it is stickier than the oversized one, because failOpen leaves the whole
+// connection in stRaw: every later request on it, well-formed or not, is
+// forwarded unpoliced until the connection ends.
+//
+// The three cases below are the reviewer's, one per shape. Each is run twice:
+// with a static-only policy (tunnelPolicy, no hooks) the old fail-open contract
+// stands byte for byte, and with a request hook armed the connection is refused
+// with 431 before any of it reaches the origin. A well-formed request is
+// pipelined behind the malformed one in every case, which is what makes the
+// stickiness assertion: after the refusal the origin must see none of it either,
+// and the hook must never have run.
+//
+// The response side is pinned at the end for the reason the oversized test gives:
+// the refusal is a request-side decision about a request-side hook.
+func TestMalformedHeadWithARequestHookIsRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		head string
+	}{
+		// RFC 7230 3.2.4: obs-fold is deprecated and this parser refuses it, so a
+		// continuation line is enough to skip every rule on the connection.
+		{"obs-fold continuation line", "GET /admin HTTP/1.1\r\nHost: a.example\r\nX-Folded: one\r\n two\r\n\r\n"},
+		// parseHeaderField's colon check.
+		{"header line without a colon", "GET /admin HTTP/1.1\r\nHost: a.example\r\nnot a header line\r\n\r\n"},
+		// parseHeaderField's token check on the name.
+		{"space in the field name", "GET /admin HTTP/1.1\r\nHost: a.example\r\nX Bad: v\r\n\r\n"},
+	}
+	// A well-formed request behind the malformed one. Nothing later on the
+	// connection is parsed after a refusal, so with a hook armed the origin must
+	// not see this one either -- that is the difference between refusing the
+	// request and refusing the whole connection, and it is the behavior the
+	// change is for.
+	const after = "GET /after HTTP/1.1\r\nHost: a.example\r\n\r\n"
+
+	for _, tc := range cases {
+		in := tc.head + after
+
+		t.Run(tc.name+": no hook, fail-open", func(t *testing.T) {
+			gotReq, gotResp := pair(t, tunnelPolicy(), in, "")
+			check(t, "request", gotReq, in)
+			if gotResp != "" {
+				t.Fatalf("the response side answered a request that was only passed through: %q", gotResp)
+			}
+		})
+
+		t.Run(tc.name+": request hook armed, refused", func(t *testing.T) {
+			calls := 0
+			p := &Policy{RequestHook: func(*http.Request) *RequestVerdict {
+				calls++
+				return &RequestVerdict{Terminate: syntheticTermination()}
+			}}
+
+			gotReq, gotResp := pair(t, p, in, "")
+
+			if gotReq != "" {
+				t.Fatalf("the origin saw %d byte(s) of a connection whose first head was malformed: %q", len(gotReq), gotReq)
+			}
+			if calls != 0 {
+				t.Fatalf("the hook was called %d time(s) on a connection whose first head was malformed", calls)
+			}
+
+			// The client gets the refusal, as one complete message that net/http
+			// can read. 431 rather than 400: it is the status this proxy already
+			// answers the unprocessable-head class with (see refuseHead), and a
+			// client that pads its headers and a client that folds them should
+			// not have to tell two statuses apart to know the policy engine
+			// refused to look at the request.
+			stream := newHTTPStream(t, strings.NewReader(gotResp))
+			resp, body := stream.next()
+			if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+				t.Fatalf("the refusal was answered with %d, want %d:\n%q", resp.StatusCode, http.StatusRequestHeaderFieldsTooLarge, gotResp)
+			}
+			if !strings.Contains(strings.ToLower(string(body)), "malformed") {
+				t.Fatalf("the refusal body does not say what happened: %q", body)
+			}
+			stream.done()
+		})
+	}
+
+	t.Run("response side: malformed head still fails open", func(t *testing.T) {
+		// The response hook has no terminate verdict, so there is nothing to
+		// carry out; dropping an answer would be the only other option, and the
+		// edge has already forwarded the request.
+		in := "HTTP/1.1 200 OK\r\nnot a header line\r\n\r\n"
+		p := &Policy{
+			RequestHook:  func(*http.Request) *RequestVerdict { return nil },
+			ResponseHook: func(*http.Response) *ResponseVerdict { return nil },
+		}
+		gotReq, gotResp := pair(t, p, "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n", in)
+		if gotReq == "" {
+			t.Fatal("the request was not forwarded")
+		}
+		check(t, "response", gotResp, in)
+	})
+}
+
+// TestContentLengthIsDroppedWhenTheBodyIsChunkFramed (M2, RFC 7230 3.3.3).
+//
+// A message that carries both framings is the CL.TE request-smuggling shape,
+// and this package is an intermediary on it: the reader (this side) framed the
+// body by Transfer-Encoding, so a Content-Length in the same head is a second,
+// disagreeing statement of where the body ends. Sending both leaves the choice
+// to the next hop, and the whole point of smuggling is that two hops can choose
+// differently. The field is dropped on the way out in both directions, and the
+// output has to stay a message net/http reads the same way -- this side's reader
+// and a client are the two hops whose disagreement is the attack.
+func TestContentLengthIsDroppedWhenTheBodyIsChunkFramed(t *testing.T) {
+	body := "5\r\nhello\r\n0\r\n\r\n"
+
+	t.Run("request", func(t *testing.T) {
+		in := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+		gotReq, _ := pair(t, tunnelPolicy(), in, "")
+
+		if strings.Contains(gotReq, "Content-Length") {
+			t.Fatalf("a chunk-framed request went out with a Content-Length too:\n%q", gotReq)
+		}
+		if !strings.Contains(gotReq, "Transfer-Encoding: chunked") {
+			t.Fatalf("the framing header was lost as well:\n%q", gotReq)
+		}
+		req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(gotReq)))
+		if err != nil {
+			t.Fatalf("net/http cannot read the normalized request: %v\n%q", err, gotReq)
+		}
+		defer req.Body.Close()
+		if req.ContentLength != -1 {
+			t.Fatalf("net/http read a Content-Length off the normalized head: %d\n%q", req.ContentLength, gotReq)
+		}
+		if got, err := io.ReadAll(req.Body); err != nil || string(got) != "hello" {
+			t.Fatalf("the chunked body did not survive: %q (err %v)\n%q", got, err, gotReq)
+		}
+	})
+
+	t.Run("response", func(t *testing.T) {
+		in := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+		_, gotResp := pair(t, tunnelPolicy(), "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n", in)
+
+		if strings.Contains(gotResp, "Content-Length") {
+			t.Fatalf("a chunk-framed response went out with a Content-Length too:\n%q", gotResp)
+		}
+		stream := newHTTPStream(t, strings.NewReader(gotResp))
+		resp, got := stream.next()
+		if string(got) != "hello" {
+			t.Fatalf("the chunked body did not survive: %q\n%q", got, gotResp)
+		}
+		if resp.ContentLength != -1 {
+			t.Fatalf("net/http read a Content-Length off the normalized head: %d\n%q", resp.ContentLength, gotResp)
+		}
+		stream.done()
+	})
+
+	t.Run("a policy that removes Transfer-Encoding does not resurrect the length", func(t *testing.T) {
+		// The removes shape the head; the framing was already decided by the
+		// input. A policy that strips the field still gets a chunk-framed body,
+		// so a Content-Length kept here would be a length the bytes behind the
+		// head do not have -- the removal is the author's footgun to fire, and
+		// this package does not fire a second one for them.
+		p := &Policy{RequestHeaderRemove: []string{"transfer-encoding"}}
+		in := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+		gotReq, _ := pair(t, p, in, "")
+
+		if strings.Contains(gotReq, "Content-Length") {
+			t.Fatalf("the Content-Length survived a chunk-framed body:\n%q", gotReq)
+		}
+		if strings.Contains(gotReq, "Transfer-Encoding") {
+			t.Fatalf("the policy's removal did not happen:\n%q", gotReq)
+		}
+	})
+
+	t.Run("a Content-Length message is untouched", func(t *testing.T) {
+		in := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\n\r\nhello"
+		gotReq, _ := pair(t, tunnelPolicy(), in, "")
+		want := "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\n" +
+			"X-Forwarded-For: 203.0.113.7\r\nX-Forwarded-Proto: http\r\n\r\nhello"
+		check(t, "request", gotReq, want)
+	})
+}
+
+// TestTerminateInTheParkWindowIsNotLost (M3).
+//
+// The response side's park is a check followed by a wait: "is a terminate
+// already published?" and, if not, "wake me when one is". The wait has to be
+// registered before the answer is looked for, or a terminate published between
+// the two is a terminate whose wake nobody sends -- the request side sees a
+// response side that is not parked yet and stays quiet, the response side
+// registers as parked and hears nothing, and the connection is stuck until
+// something else ends it. That was the R1-R3 report. The fix is one atomic
+// check-and-park (connState.parkResponse) rather than a tighter pair of locks:
+// the window has to stop existing, not get smaller.
+//
+// The window is opened here on purpose, through the package's test-only gap
+// hook, so the interleaving is the reported one rather than one the scheduler
+// may or may not produce. The request side publishes its terminate while the
+// response side is held in the gap. With the old check-then-park this test does
+// not fail, it stalls: the 2s bound below is what turns the stall into a
+// failure, and the response source is the fake whose read parks until it is
+// closed (blockingConn), so "nothing woke it" is a five-second read error
+// rather than a hang that takes the suite with it.
+func TestTerminateInTheParkWindowIsNotLost(t *testing.T) {
+	term := syntheticTermination()
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+
+	oldHook := testParkGapHook
+	testParkGapHook = func(*connState) {
+		once.Do(func() { close(reached) })
+		<-release
+	}
+	defer func() { testParkGapHook = oldHook }()
+
+	p := &Policy{RequestHook: func(*http.Request) *RequestVerdict {
+		return &RequestVerdict{Terminate: term}
+	}}
+
+	public := &fakeConn{src: strings.NewReader("GET /a HTTP/1.1\r\nHost: a.example\r\n\r\n"), id: "http:public"}
+	upstream := newBlockingConn()
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	respOut := make(chan copyResult, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- copyResult{b.String(), err}
+	}()
+
+	// The response side is now in the gap: the generation is claimed and
+	// nothing is parked yet.
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never reached the park window")
+	}
+
+	// The request side decides to terminate, right here, in the window.
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("the terminated request was forwarded: %q", got)
+	}
+	close(release)
+
+	select {
+	case got := <-respOut:
+		if got.err != nil {
+			t.Fatalf("the response side did not end cleanly: %v", got.err)
+		}
+		check(t, "response", got.out, string(term.Render()))
+	case <-time.After(2 * time.Second):
+		t.Fatal("a terminate published between the response side's check and its park was lost: " +
+			"the response side is parked waiting for a wake that was already sent")
+	}
+}
+
+// stagedRespConn is the upstream for the pipelining test below: it hands over
+// the one response it has, but only once the test says so, and it reports its
+// own close. Close is what the wake does to this connection, and a close while
+// the response is in flight is exactly how a wake aimed at the wrong request
+// truncates the answer that is on the wire -- so "the wake did not fire" is
+// observable here rather than asserted: a closed connection never hands the
+// response over at all.
+type stagedRespConn struct {
+	conn.Conn
+	entered chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+	payload string
+
+	enterOne sync.Once
+	closeOne sync.Once
+	sent     bool
+}
+
+func newStagedRespConn(payload string) *stagedRespConn {
+	return &stagedRespConn{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		closed:  make(chan struct{}),
+		payload: payload,
+	}
+}
+
+func (c *stagedRespConn) Read(p []byte) (int, error) {
+	c.enterOne.Do(func() { close(c.entered) })
+	select {
+	case <-c.release:
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+	if c.sent {
+		return 0, io.EOF
+	}
+	c.sent = true
+	return copy(p, c.payload), nil
+}
+
+func (c *stagedRespConn) Close() error {
+	c.closeOne.Do(func() { close(c.closed) })
+	return nil
+}
+
+// TestPipelinedTerminateAnswersItsOwnRequest (M4).
+//
+// Two requests on one connection, the second terminated by the hook. The
+// terminate has to reach the response side as the answer to the second request:
+// R1's answer is the origin's and is in flight, and R2's is the edge's and
+// belongs after it. The old shape -- one terminate slot and a "the response
+// side is parked" bit -- could not tell the two requests apart, so it delivered
+// the synthetic answer in R1's slot and, worse, woke the response side by
+// closing its source while R1's answer was still being read: the client got a
+// refusal for a request that was allowed, and lost the body of a response that
+// had already started.
+//
+// The generation keying is what makes this test possible: the response side
+// parks for generation 1, the terminate carries generation 2, so the wake is
+// not sent (the source is not closed, nothing in flight is truncated) and the
+// terminate waits in the slot until the response side's turn 2 arrives. Both
+// halves are asserted below -- the close that must not have happened while R1's
+// answer is in flight, and the order of the two messages at the end.
+func TestPipelinedTerminateAnswersItsOwnRequest(t *testing.T) {
+	term := syntheticTermination()
+	p := &Policy{RequestHook: func(r *http.Request) *RequestVerdict {
+		if r.URL.Path == "/two" {
+			return &RequestVerdict{Terminate: term}
+		}
+		return nil
+	}}
+
+	// R1's answer, chunk-framed so that there are body bytes after the head for
+	// a truncating wake to cut off.
+	r1 := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"7\r\nfirst: \r\n7\r\nsecond:\r\n5\r\nhello\r\n0\r\n\r\n"
+	upstream := newStagedRespConn(r1)
+
+	public := &fakeConn{
+		src: strings.NewReader("GET /one HTTP/1.1\r\nHost: a.example\r\n\r\n" +
+			"GET /two HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+		id: "http:public",
+	}
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	respOut := make(chan copyResult, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- copyResult{b.String(), err}
+	}()
+
+	// The response side parks in the read of R1's answer: the generation it is
+	// parked on is 1.
+	select {
+	case <-upstream.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never read its upstream")
+	}
+
+	// R1 goes to the origin, R2 is terminated. The terminate is published while
+	// the response side is parked on R1.
+	reqOut := drain(t, toUpstream)
+	if reqOut != "GET /one HTTP/1.1\r\nHost: a.example\r\n\r\n" {
+		t.Fatalf("R1 was not forwarded untouched: %q", reqOut)
+	}
+
+	// The wake must not have fired: a terminate for a later request is not this
+	// request's answer, and closing this source would truncate R1's answer.
+	select {
+	case <-upstream.closed:
+		t.Fatal("the wake closed the upstream for a terminate that answers a later request:" +
+			" R1's response was in flight and its body is now truncated")
+	default:
+	}
+
+	// Let R1's answer through. It has to come out first and whole, followed by
+	// R2's synthetic.
+	close(upstream.release)
+
+	select {
+	case got := <-respOut:
+		if got.err != nil {
+			t.Fatalf("the response side did not end cleanly: %v", got.err)
+		}
+		check(t, "response", got.out, r1+string(term.Render()))
+
+		stream := newHTTPStream(t, strings.NewReader(got.out))
+		first, firstBody := stream.next()
+		if first.StatusCode != http.StatusOK || string(firstBody) != "first: second:hello" {
+			t.Fatalf("R1's own response was not delivered for R1: %d %q", first.StatusCode, firstBody)
+		}
+		second, secondBody := stream.next()
+		if second.StatusCode != term.StatusCode || string(secondBody) != term.Body {
+			t.Fatalf("R2's synthetic response was not delivered for R2: %d %q", second.StatusCode, secondBody)
+		}
+		stream.done()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never produced R1's response and R2's synthetic response")
 	}
 }

@@ -31,12 +31,11 @@ const (
 	maxPongLatency      = 15 * time.Second
 	updateCheckInterval = 6 * time.Hour
 
-	// muxCapability is the server capability that switches this client to the
-	// multiplexed transport (SPEC cluster 3, 3.1): every proxy connection is a
-	// stream on one long-lived conn instead of a TCP+TLS dial of its own.
-	// Without it -- a pre-mux server -- the client dials per connection, which
-	// is what it has always done.
-	muxCapability = "proxy-mux"
+	// The capability that switches this client to the multiplexed transport
+	// (SPEC cluster 3, 3.1) is msg.MuxCapability: it is the server's string, so
+	// it lives with the wire vocabulary rather than being spelled again here.
+	// Without it -- a pre-mux server -- the client dials one conn per proxy
+	// connection, which is what it has always done.
 
 	// muxMaxAttempts bounds the mux watchdog's consecutive failures: a session
 	// that could not be dialed, or that died before it carried anything. Once
@@ -85,6 +84,25 @@ type ClientModel struct {
 	configPath    string
 	proxyWorkers  chan struct{}
 
+	// sessionSecret is the secret that goes with c.id: handed out by the server
+	// in AuthResp, presented in Auth when this client reconnects with that id,
+	// and in every RegProxy and RegMux. It is the proof that a connection
+	// naming this client is this client, which is what the server checks before
+	// it hands over a session's traffic.
+	//
+	// In memory only, for the life of the session: it is not written to the
+	// config file or anywhere else, so a client restart simply starts a new
+	// session with a new id and a new secret. That costs one round trip and
+	// saves the alternative -- a credential at rest, in a file whose
+	// permissions the client would then own -- and it is why the server can
+	// treat an unknown id as "make a new one" instead of having to support
+	// recovery.
+	//
+	// Guarded by its own lock, unlike c.id: the control loop writes it once per
+	// control session while proxy goroutines and the mux watchdog read it.
+	sessionSecretMu sync.RWMutex
+	sessionSecret   string
+
 	// mux session (SPEC 3.1): the single conn every proxy stream travels on,
 	// when the server advertised muxCapability. muxMu guards the slot because
 	// the watchdog replaces it while ReqProxy handlers read it.
@@ -92,12 +110,48 @@ type ClientModel struct {
 	mux   *muxSession
 }
 
+// sessionSecretValue returns the session secret the server handed out, or ""
+// when there is none (no control session yet, or a server that predates it).
+func (c *ClientModel) sessionSecretValue() string {
+	c.sessionSecretMu.RLock()
+	defer c.sessionSecretMu.RUnlock()
+	return c.sessionSecret
+}
+
+// setSessionSecret records the secret that goes with the current client id.
+func (c *ClientModel) setSessionSecret(secret string) {
+	c.sessionSecretMu.Lock()
+	c.sessionSecret = secret
+	c.sessionSecretMu.Unlock()
+}
+
+// resumeCredentials returns what to put in Auth's ClientId and Secret fields.
+//
+// Resuming an id is only possible with the secret that proves it, so a client
+// that holds an id but no secret sends neither and asks for a fresh session
+// instead: it cannot prove the id, the server would refuse the claim, and the
+// session it needs is a new one anyway. The only way to be in that state is to
+// have spoken to a server that predates the field (or to have lost the secret
+// with the process), which is exactly the case this keeps working.
+func (c *ClientModel) resumeCredentials() (clientId, secret string) {
+	secret = c.sessionSecretValue()
+	if c.id == "" || secret == "" {
+		return "", ""
+	}
+	return c.id, secret
+}
+
 func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
+	// The protocol names are package msg's (they are what the wire carries and
+	// what the server matches on), and the http/https aliasing is deliberate:
+	// one *proto.Http serves both, because the difference between them is which
+	// public listener the server accepted the connection on, not anything this
+	// client does -- the private leg it dials is plain HTTP either way.
 	protoMap := make(map[string]proto.Protocol)
-	protoMap["http"] = proto.NewHttp()
-	protoMap["https"] = protoMap["http"]
-	protoMap["tcp"] = proto.NewTcp()
-	protocols := []proto.Protocol{protoMap["http"], protoMap["tcp"]}
+	protoMap[msg.ProtoHTTP] = proto.NewHttp()
+	protoMap[msg.ProtoHTTPS] = protoMap[msg.ProtoHTTP]
+	protoMap[msg.ProtoTCP] = proto.NewTcp()
+	protocols := []proto.Protocol{protoMap[msg.ProtoHTTP], protoMap[msg.ProtoTCP]}
 
 	m := &ClientModel{
 		Logger: log.NewPrefixLogger("client"),
@@ -288,9 +342,15 @@ func (c *ClientModel) control() {
 	}
 	defer ctlConn.Close()
 
-	// authenticate with the server
+	// authenticate with the server. A reconnect resumes this client's previous
+	// session -- the same ClientId, which is what keeps its tunnel urls and its
+	// affinity -- by presenting the secret that came with that id. Without a
+	// secret there is nothing to resume: an empty ClientId asks for a new
+	// session (see resumeCredentials).
+	resumeId, resumeSecret := c.resumeCredentials()
 	auth := &msg.Auth{
-		ClientId:  c.id,
+		ClientId:  resumeId,
+		Secret:    resumeSecret,
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
 		Version:   version.Proto,
@@ -316,6 +376,11 @@ func (c *ClientModel) control() {
 	}
 
 	c.id = authResp.ClientId
+	// The server mints a secret with every id it assigns, and the client stores
+	// it for the life of the session: it is the proof that a later connection
+	// naming this id is this client, so the client presents it when it
+	// reconnects and on every proxy connection (SPEC cluster 3 hardening).
+	c.setSessionSecret(authResp.Secret)
 	c.serverVersion = authResp.MmVersion
 	c.serverCaps = make(map[string]struct{}, len(authResp.Caps))
 	for _, capName := range authResp.Caps {
@@ -337,8 +402,8 @@ func (c *ClientModel) control() {
 	// and small -- the ReqProxy the server sends right after AuthResp is
 	// answered with a dialed proxy conn when it beats the session, and every
 	// later one with a stream.
-	if _, ok := c.serverCaps[muxCapability]; ok {
-		c.Info("Server offers %s; using one multiplexed proxy connection", muxCapability)
+	if _, ok := c.serverCaps[msg.MuxCapability]; ok {
+		c.Info("Server offers %s; using one multiplexed proxy connection", msg.MuxCapability)
 		muxStop := make(chan struct{})
 		defer close(muxStop)
 		go c.muxWatchdog(muxStop, nil)
@@ -523,7 +588,7 @@ func (c *ClientModel) proxyDial() {
 	}
 	defer remoteConn.Close()
 
-	err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id})
+	err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue()})
 	if err != nil {
 		remoteConn.Error("Failed to write RegProxy: %v", err)
 		return
@@ -565,7 +630,7 @@ func (c *ClientModel) proxyStream(sess *muxSession) error {
 	}
 	defer remoteConn.Close()
 
-	if err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id}); err != nil {
+	if err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue()}); err != nil {
 		return fmt.Errorf("failed to write RegProxy: %v", err)
 	}
 
@@ -602,7 +667,7 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 	if err != nil {
 		remoteConn.Warn("Failed to open private leg %s: %v", tunnel.LocalAddr, err)
 
-		if tunnel.Protocol.GetName() == "http" {
+		if msg.IsHTTP(tunnel.Protocol.GetName()) {
 			// try to be helpful when you're in HTTP mode and a human might see the output
 			badGatewayBody := fmt.Sprintf(BadGateway, tunnel.PublicUrl, tunnel.LocalAddr, tunnel.LocalAddr)
 			remoteConn.Write([]byte(fmt.Sprintf(`HTTP/1.0 502 Bad Gateway
@@ -656,7 +721,7 @@ Content-Length: %d
 // the connections underneath (rewriter/conn.go), so each leg is closed exactly
 // as the raw join closed it.
 func (c *ClientModel) relay(localConn, remoteConn conn.Conn, tunnel mvc.Tunnel, clientAddr string) (bytesIn, bytesOut int64) {
-	if tunnel.Protocol.GetName() != "http" {
+	if !msg.IsHTTP(tunnel.Protocol.GetName()) {
 		// Nothing with a header syntax: TCP tunnels, and any protocol this
 		// client version does not know, keep the byte pipe they always had.
 		return conn.Join(localConn, remoteConn)
@@ -791,7 +856,11 @@ func (c *ClientModel) dialMuxSession() (*muxSession, error) {
 		return nil, err
 	}
 
-	if err = msg.WriteMsg(muxConn, &msg.RegMux{ClientId: c.id}); err != nil {
+	// RegMux carries the session's credentials like RegProxy does: attaching a
+	// mux session to a client id means every stream on it is a proxy
+	// connection for that client's tunnels, so it is authenticated with the
+	// same secret the id was handed out with.
+	if err = msg.WriteMsg(muxConn, &msg.RegMux{ClientId: c.id, Secret: c.sessionSecretValue()}); err != nil {
 		muxConn.Close()
 		return nil, err
 	}

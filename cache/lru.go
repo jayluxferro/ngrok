@@ -171,11 +171,28 @@ func (lru *LRUCache) SaveItems(w io.Writer) error {
 	return encoder.Encode(items)
 }
 
+// SaveItemsToFile writes the cache to path, owner-only.
+//
+// 0600 rather than 0644 because of what the file holds: the affinity cache maps
+// a client id -- and a client ip -- to the tunnel url it was last given, so the
+// file is a list of every client the server has served and where they lived.
+// Reading the client ids out of it is a step towards presenting them on a proxy
+// connection. The file is a cache and not a credential store, which is why the
+// server no longer treats a client id as one (see msg.RegProxy.Secret), but
+// there is still no reason for it to be world-readable.
 func (lru *LRUCache) SaveItemsToFile(path string) error {
-	if wr, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
+	if wr, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err != nil {
 		return err
 	} else {
 		defer wr.Close()
+
+		// The mode above only takes effect when the file is created, so a cache
+		// file written by an older version keeps its old permissions forever.
+		// Reasserting it here fixes those up on their first save; a filesystem
+		// that cannot chmod is not a reason to fail the save (the file has been
+		// written), so the error is dropped rather than returned.
+		_ = wr.Chmod(0600)
+
 		return lru.SaveItems(wr)
 	}
 }

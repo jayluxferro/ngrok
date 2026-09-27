@@ -40,16 +40,27 @@
 // Everything else ngrok exposes -- geo, TLS, endpoint, time, ip-intel, request
 // bodies, the action result variables -- is deliberately absent, so that a
 // policy written against it fails to load instead of quietly never matching.
+// Each field in the table is declared in the CEL environment by its own dotted
+// name (see cel.go for why), which is what makes that sentence true of *nested*
+// names too: `conn.geo.country` and the typo `req.headerss` are compile errors
+// at load time, not rules that never match. The cost is real and is stated in
+// cel.go: the objects are not values, so `req.headers` is still a map
+// (size(req.headers) and ${req.headers} work) while `conn` and `req.url` are
+// not variables at all -- only their fields are.
+//
 // Config strings support ngrok's ${...} interpolation over the same variables.
 //
 // The package is built to fail open at runtime and loud at load time. Load
 // time (Validate/Compile) is where an unknown action, a bad expression, a
-// malformed CIDR or a config field with the wrong shape is an error naming the
-// action: an operator must never believe a control is running when it is not.
-// Runtime is where nothing may break a connection the old code would have
-// carried: an expression that fails to evaluate, a hook that panics, an
-// interpolation with no value are all absorbed, logged once, and treated as
-// "this action does not apply".
+// malformed CIDR, a config field with the wrong shape, a header value carrying
+// a CR or an LF, or a document with more than maxActionsPerPolicy actions in
+// total is an error naming the action: an operator must never believe a control
+// is running when it is not, and the action cap is about the cost every
+// message of every connection pays for the document (validate.go has the
+// reasoning and the measured per-action number). Runtime is where nothing may
+// break a connection the old code would have carried: an expression that fails
+// to evaluate, a hook that panics, an interpolation with no value are all
+// absorbed, logged once, and treated as "this action does not apply".
 package policy
 
 import (
@@ -145,7 +156,6 @@ type Compiled struct {
 // before this is ever built.
 type compiledAction struct {
 	action string // one of the Action* constants
-	rule   string // the rule's own name, for log lines and error messages
 	where  string // "on_http_request[1] (deny)", the rule's identity in a phase
 
 	when []*program // conditions; all must hold (they are ANDed)
@@ -174,15 +184,6 @@ type headerPair struct {
 type assignment struct {
 	name  string
 	value *interpolated
-}
-
-// label renders the action for a log line or an error: the action type, its
-// rule name if it has one, and the phase.
-func (a *compiledAction) label() string {
-	if a.rule != "" && a.rule != a.action {
-		return fmt.Sprintf("%s (rule %q)", a.action, a.rule)
-	}
-	return a.action
 }
 
 // Validate checks a policy without building the compiled form: every action
@@ -257,10 +258,17 @@ func (c *Compiled) EvaluateConnect(connAddr string) ConnectVerdict {
 			st.logLine(a, act)
 
 		case ActionDeny:
-			st.info("deny: refusing the connection")
+			// The status comes off the compiled action, which is where the
+			// config's status_code (or the default, when it names none) was
+			// resolved at load time. Hardcoding the default here instead would
+			// make "deny with status_code: 404" answer 403 -- a config the
+			// operator wrote, validated, and never got -- and it is exactly the
+			// drift the one-traversal rule exists to prevent: the HTTP phases
+			// answer with a.statusCode, and this phase has to agree with them.
+			st.info("deny: refusing the connection with status %d", a.statusCode)
 			return ConnectVerdict{
 				Deny:     true,
-				Response: &rewriter.SyntheticResponse{StatusCode: defaultDenyStatus},
+				Response: &rewriter.SyntheticResponse{StatusCode: a.statusCode},
 				Reason:   "deny",
 			}
 
@@ -545,7 +553,7 @@ func (st *evalState) next() {
 // connectActivation is the variable set of the on_tcp_connect phase: a
 // connection and nothing else.
 func (st *evalState) connectActivation() map[string]interface{} {
-	return map[string]interface{}{"conn": st.connVars()}
+	return st.connActivation()
 }
 
 // requestActivation is the variable set of the on_http_request phase.
@@ -561,33 +569,41 @@ func (st *evalState) requestActivation(req *http.Request) map[string]interface{}
 		raw = req.RequestURI
 	}
 
-	return map[string]interface{}{
-		"conn": st.connVars(),
-		"req": map[string]interface{}{
-			"method": req.Method,
-			"url": map[string]string{
-				"path":  path,
-				"query": query,
-				"raw":   raw,
-			},
-			"headers": headerMap(req.Header),
-			"cookies": cookieMap(req),
-		},
-		"vars": st.vars,
-	}
+	act := st.connActivation()
+	act["req.method"] = req.Method
+	act["req.url.path"] = path
+	act["req.url.query"] = query
+	act["req.url.raw"] = raw
+	act["req.headers"] = headerMap(req.Header)
+	act["req.cookies"] = cookieMap(req)
+	act["vars"] = st.vars
+	return act
 }
 
 // responseActivation is the variable set of the on_http_response phase.
 func (st *evalState) responseActivation(resp *http.Response) map[string]interface{} {
-	return map[string]interface{}{
-		"conn": st.connVars(),
-		"res":  map[string]int{"status_code": resp.StatusCode},
-		"vars": st.vars,
-	}
+	act := st.connActivation()
+	act["res.status_code"] = resp.StatusCode
+	act["vars"] = st.vars
+	return act
 }
 
-func (st *evalState) connVars() map[string]string {
-	return map[string]string{"client_ip": st.ip, "remote_addr": st.addr}
+// connActivation is what every phase has in common: the connection's own
+// variables. They are *flat dotted keys*, not a nested conn object, because
+// that is what the environment declares (cel.go): "conn.client_ip" is one
+// variable name to CEL, so it is one key here. A nested map under "conn" is
+// what this used to provide, and against the dotted declarations it would
+// activate nothing -- every conn.* expression would fail to resolve at
+// evaluation time and every conn.* rule would silently not apply, which is the
+// failure mode the dotted declarations exist to make impossible. The two have
+// to move together, so they live next to each other: the names here and the
+// cel.Variable calls there are one list written twice, and a test in this
+// package compares them.
+func (st *evalState) connActivation() map[string]interface{} {
+	return map[string]interface{}{
+		"conn.client_ip":   st.ip,
+		"conn.remote_addr": st.addr,
+	}
 }
 
 // headerMap lower-cases the names, which is the shape the documented req.headers

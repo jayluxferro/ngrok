@@ -17,16 +17,17 @@ import (
 	"time"
 )
 
+// defaultPortMap is the port a tunnel whose url does not carry one is answered
+// on. It has exactly the keys registerVhost can see: a protocol outside it is
+// refused by validateRequest before the lookup, so an entry here that no
+// protocol can reach (the "smtp": 25 this map used to carry, inherited from
+// upstream ngrok, which served smtp) would only be dead weight. The reserved
+// .internal namespace lives in package msg with the rest of the wire
+// vocabulary: msg.InternalSuffix.
 var defaultPortMap = map[string]int{
-	"http":  80,
-	"https": 443,
-	"smtp":  25,
+	msg.ProtoHTTP:  80,
+	msg.ProtoHTTPS: 443,
 }
-
-// internalSuffix is the reserved namespace for internal endpoints. Nothing
-// outside it can be registered as internal, and nothing inside it is ever
-// reachable through the public listeners (SPEC 3.2).
-const internalSuffix = ".internal"
 
 /**
  * Tunnel: A control connection, metadata and proxy connections which
@@ -68,7 +69,7 @@ type Tunnel struct {
 
 // internal reports whether this tunnel is an internal (.internal) endpoint.
 func (t *Tunnel) internal() bool {
-	return t.req != nil && t.req.Binding == BindingInternal
+	return t.req != nil && t.req.Binding == msg.BindingInternal
 }
 
 // forwardTo returns the raw forward_to target this tunnel was registered
@@ -104,14 +105,16 @@ func (t *Tunnel) policyFor(target *Tunnel) *policy.Compiled {
 }
 
 // connectVerdict runs the endpoint's on_tcp_connect phase against a public
-// connection and returns what it decided. It is nil-safe in both the policy and
-// the receiver -- no policy is the common case and costs one nil check -- and
-// it does not log: the caller decides how a refusal looks in its protocol.
-func (t *Tunnel) connectVerdict(c conn.Conn) policy.ConnectVerdict {
-	if t == nil {
-		return policy.ConnectVerdict{}
-	}
-	pol := t.policyFor(t)
+// connection and returns what it decided. It is nil-safe in the policy -- no
+// policy is the common case and costs one nil check -- and it does not log: the
+// caller decides how a refusal looks in its protocol.
+//
+// The policy is passed in rather than read off a receiver because the verdict
+// and the hooks that follow it have to be decided by the same policy: on the
+// HTTP path both come from entry.policyFor(target), and evaluating the connect
+// phase against the entry tunnel's own policy while the hooks run the target's
+// meant an internal endpoint's restrict-ips never ran at all (see httpHandler).
+func connectVerdict(pol *policy.Compiled, c conn.Conn) policy.ConnectVerdict {
 	if pol == nil {
 		return policy.ConnectVerdict{}
 	}
@@ -139,18 +142,34 @@ func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
 	// Canonicalize by always using lower-case
 	vhost = strings.ToLower(vhost)
 
+	// A public binding derives its hostname from vhost (the domain or the
+	// VHOST override): if the derivation ends in .internal, every derived url
+	// would squat the reserved namespace through the public path.
+	// validateRequest covers the explicit-hostname branch; this covers the
+	// derived ones.
+	if strings.HasSuffix(vhost, msg.InternalSuffix) {
+		return fmt.Errorf("%s: the public vhost %q ends in %s, which would derive publicly bound %s hostnames; refusing to register",
+			endpointName(t.req), vhost, msg.InternalSuffix, msg.InternalSuffix)
+	}
+
 	// Register for specific hostname
 	hostname := strings.ToLower(strings.TrimSpace(t.req.Hostname))
 	if hostname != "" {
 		t.url = fmt.Sprintf("%s://%s", protocol, hostname)
-		return tunnelRegistry.Register(t.url, t)
+		if err = tunnelRegistry.Register(t.url, t); err != nil {
+			return fmt.Errorf("%s: %w", endpointName(t.req), err)
+		}
+		return nil
 	}
 
 	// Register for specific subdomain
 	subdomain := strings.ToLower(strings.TrimSpace(t.req.Subdomain))
 	if subdomain != "" {
 		t.url = fmt.Sprintf("%s://%s.%s", protocol, subdomain, vhost)
-		return tunnelRegistry.Register(t.url, t)
+		if err = tunnelRegistry.Register(t.url, t); err != nil {
+			return fmt.Errorf("%s: %w", endpointName(t.req), err)
+		}
+		return nil
 	}
 
 	// Register for random URL
@@ -164,23 +183,50 @@ func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
 // registerInternal registers an internal endpoint (SPEC 3.2).
 //
 // The rules are deliberately narrower than the public ones: a hostname is
-// required, it must live under .internal, and there is no subdomain
-// assignment and no random URL generation to fall back on. The endpoint never
-// touches the public listeners -- it is reachable only through forward_to --
-// so it is registered even when the server is not listening for that protocol
-// publicly.
+// required, it must live under .internal with a name in front of the suffix,
+// and there is no subdomain assignment and no random URL generation to fall
+// back on. The endpoint never touches the public listeners -- it is reachable
+// only through forward_to -- so it is registered even when the server is not
+// listening for that protocol publicly.
+//
+// These are the client's rules (client/config.go, validateInternalEndpoint),
+// enforced here as well. A server cannot assume the client checked anything:
+// the tokens namespace, so the reach of an internal endpoint is bounded by the
+// owner either way, but the spelling is not cosmetic -- what gets registered is
+// what forward_to has to resolve, and an endpoint whose name is not the
+// canonical one (mixed case, a space in the middle, "https:///svc.internal")
+// either cannot be reached by the url the operator wrote or is a different
+// endpoint than the one they think they registered.
 func registerInternal(t *Tunnel, protocol string) error {
-	// Canonicalize the same way public hostnames are canonicalized
-	hostname := strings.ToLower(strings.TrimSpace(t.req.Hostname))
+	raw := t.req.Hostname
+	hostname := strings.ToLower(strings.TrimSpace(raw))
+
 	if hostname == "" {
-		return fmt.Errorf("Internal endpoints require a hostname ending in %s", internalSuffix)
+		return fmt.Errorf("Internal endpoints require a hostname ending in %s (for example \"myapp%s\")", msg.InternalSuffix, msg.InternalSuffix)
 	}
-	if !strings.HasSuffix(hostname, internalSuffix) {
-		return fmt.Errorf("Internal endpoint hostname %s must end in %s", hostname, internalSuffix)
+	// Checked on the raw value: a hostname that is only lowercase because the
+	// server lowercased it is not the name the client wrote, and the mismatch
+	// is exactly what this rejects (the client refuses it too, with the same
+	// reasoning).
+	if raw != hostname {
+		return fmt.Errorf("Internal endpoint hostname %q must be lowercase and unpadded (use %q)", raw, hostname)
+	}
+	if strings.ContainsAny(hostname, " \t\r\n/") {
+		return fmt.Errorf("Internal endpoint hostname %q must not contain spaces or '/'", hostname)
+	}
+	if !strings.HasSuffix(hostname, msg.InternalSuffix) {
+		return fmt.Errorf("Internal endpoint hostname %q must end in %s (for example \"myapp%s\")", hostname, msg.InternalSuffix, msg.InternalSuffix)
+	}
+	if len(hostname) == len(msg.InternalSuffix) {
+		// the suffix alone names nothing: ".internal" is not an endpoint
+		return fmt.Errorf("Internal endpoint hostname %q needs a name in front of %s (for example \"myapp%s\")", hostname, msg.InternalSuffix, msg.InternalSuffix)
 	}
 
 	t.url = fmt.Sprintf("%s://%s", protocol, hostname)
-	return tunnelRegistry.Register(t.url, t)
+	if err := tunnelRegistry.Register(t.url, t); err != nil {
+		return fmt.Errorf("Internal endpoint %s could not be registered: %w", t.url, err)
+	}
+	return nil
 }
 
 // Create a new tunnel from a registration message received
@@ -228,23 +274,46 @@ func NewTunnel(m *msg.ReqTunnel, ctl *Control) (t *Tunnel, err error) {
 
 // validateRequest canonicalizes the endpoint request and rejects the
 // combinations this server cannot serve (SPEC 3.2/3.5).
+//
+// Every error names the endpoint it is about -- the protocol and the hostname
+// or port the client asked for. The client correlates an error with the request
+// it sent by ReqId (see Control.registerTunnel), but a client multiplexing
+// several requests off one message, and a human reading the log, have nothing
+// but the text.
 func (t *Tunnel) validateRequest() error {
 	m := t.req
+	what := endpointName(m)
 
 	// Canonicalize the binding once here, so that every comparison downstream
 	// -- the registry key in particular -- is an exact match.
 	m.Binding = strings.ToLower(strings.TrimSpace(m.Binding))
 	switch m.Binding {
-	case BindingPublic, BindingInternal:
+	case msg.BindingPublic, msg.BindingInternal:
 	default:
-		return fmt.Errorf("Binding %s is not supported", m.Binding)
+		return fmt.Errorf("%s: Binding %s is not supported", what, m.Binding)
+	}
+
+	// The .internal namespace belongs to internal endpoints and to nothing
+	// else. The public registry is keyed by the bare url and internal endpoints
+	// by an owner-namespaced key, so a public endpoint named x.internal is
+	// unreachable rather than dangerous -- but it is also a name the client
+	// refuses to send (client/config.go) and an operator would read as private
+	// while it is public: whoever registers it first wins the name, and the
+	// public listener 404s it. Refuse the oxymoron instead of registering an
+	// endpoint nobody can reach. This is the server-side half of a rule that
+	// until now lived only in the client, and it is enforced before the url is
+	// claimed (see Tunnel.register), so a refused hostname never occupies the
+	// name it asked for.
+	if m.Binding != msg.BindingInternal && strings.HasSuffix(strings.ToLower(strings.TrimSpace(m.Hostname)), msg.InternalSuffix) {
+		return fmt.Errorf("%s: hostname %q ends in %s, which requires binding internal (the public listener never routes %s hosts)",
+			what, strings.TrimSpace(m.Hostname), msg.InternalSuffix, msg.InternalSuffix)
 	}
 
 	switch m.Protocol {
-	case "tcp":
-		if m.Binding == BindingInternal {
+	case msg.ProtoTCP:
+		if m.Binding == msg.BindingInternal {
 			// ngrok also serves tcp://x.internal:port; this cluster does not
-			return fmt.Errorf("Internal TCP endpoints are not supported yet, use http or https")
+			return fmt.Errorf("%s: Internal TCP endpoints are not supported yet, use http or https", what)
 		}
 		if m.ForwardTo != "" {
 			// A TCP connection is dispatched to the bucket that owns the
@@ -252,14 +321,36 @@ func (t *Tunnel) validateRequest() error {
 			// forward chain out of TCP could never resolve. Refuse the
 			// registration instead of silently sending the traffic straight
 			// to this client and ignoring forward_to.
-			return fmt.Errorf("forward_to is only supported for http and https endpoints")
+			return fmt.Errorf("%s: forward_to is only supported for http and https endpoints", what)
 		}
-	case "http", "https":
+	case msg.ProtoHTTP, msg.ProtoHTTPS:
 	default:
-		return fmt.Errorf("Protocol %s is not supported", m.Protocol)
+		return fmt.Errorf("%s: Protocol %s is not supported", what, m.Protocol)
 	}
 
 	return nil
+}
+
+// endpointName describes the endpoint a request is asking for, for use in error
+// messages: the protocol plus whatever names the endpoint (hostname, subdomain
+// or remote port). It is deliberately built from the raw request rather than
+// from a Tunnel, because every caller of it is a registration that failed
+// before a Tunnel existed.
+func endpointName(m *msg.ReqTunnel) string {
+	name := m.Protocol
+	if name == "" {
+		name = "endpoint"
+	}
+
+	switch {
+	case m.Hostname != "":
+		return fmt.Sprintf("%s endpoint %s", name, strings.TrimSpace(m.Hostname))
+	case m.Subdomain != "":
+		return fmt.Sprintf("%s endpoint %s.%s", name, strings.TrimSpace(m.Subdomain), opts.domain)
+	case m.RemotePort != 0:
+		return fmt.Sprintf("%s endpoint %s:%d", name, opts.domain, m.RemotePort)
+	}
+	return name + " endpoint"
 }
 
 // register binds the endpoint and records it in the tunnel registry.
@@ -267,25 +358,25 @@ func (t *Tunnel) register() error {
 	m := t.req
 
 	switch m.Protocol {
-	case "tcp":
+	case msg.ProtoTCP:
 		return t.registerTcp()
 
-	case "http", "https":
+	case msg.ProtoHTTP, msg.ProtoHTTPS:
 		// Internal endpoints are invisible to the public listener, so they do
 		// not need one to be running and never consult the vhost domain.
-		if m.Binding == BindingInternal {
+		if m.Binding == msg.BindingInternal {
 			return registerInternal(t, m.Protocol)
 		}
 
 		l, ok := listeners[m.Protocol]
 		if !ok {
-			return fmt.Errorf("Not listening for %s connections", m.Protocol)
+			return fmt.Errorf("%s: Not listening for %s connections", endpointName(m), m.Protocol)
 		}
 
 		return registerVhost(t, m.Protocol, l.Addr.(*net.TCPAddr).Port)
 	}
 
-	return fmt.Errorf("Protocol %s is not supported", m.Protocol)
+	return fmt.Errorf("%s: Protocol %s is not supported", endpointName(m), m.Protocol)
 }
 
 // registerTcp binds a public TCP listener for this tunnel, or joins the
@@ -369,6 +460,9 @@ func (t *Tunnel) pooledTcpUrl() string {
 	return tunnelRegistry.GetCachedRegistration(t)
 }
 
+// Shutdown takes this endpoint down. A pooling member removes only itself; the
+// tunnel that owns a listener takes the whole pool with it, because the
+// listener every member was sharing dies here (SPEC 3.2).
 func (t *Tunnel) Shutdown() {
 	t.Info("Shutting down")
 
@@ -380,10 +474,27 @@ func (t *Tunnel) Shutdown() {
 	// others; the listener dies with its creator (SPEC 3.2).
 	if t.listener != nil {
 		t.listener.Close()
-	}
 
-	// remove only ourselves: the bucket disappears with its last member
-	tunnelRegistry.Remove(t.url, t)
+		// The bucket is not this tunnel's alone: the members of the pool are
+		// registered under the same url and reach the public world only through
+		// the listener that just closed. Leaving the bucket behind would leave
+		// a pool key pointing at a port nothing listens on -- IsPooling would
+		// keep advertising it and a new pooling tunnel would join a bucket it
+		// can never serve from. Take the bucket down and shut its orphaned
+		// members down with it: their endpoint is gone, and a client that keeps
+		// listing a tunnel that no longer exists is worse than one that is told
+		// its tunnel closed.
+		for _, orphan := range tunnelRegistry.DelBucket(t.url) {
+			if orphan != t {
+				orphan.Info("Shutting down: the pooling listener for %s was closed by its owner", t.url)
+				orphan.Shutdown()
+			}
+		}
+	} else {
+		// remove only ourselves: a bucket of members disappears with its last
+		// member
+		tunnelRegistry.Remove(t.url, t)
+	}
 
 	// let the control connection know we're shutting down
 	// currently, only the control connection shuts down tunnels,
@@ -427,7 +538,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 			ip := remoteIP(publicConn.RemoteAddr())
 			if !publicLimiter.allow(ip) {
 				atomic.AddUint64(&rateDropCount, 1)
-				observe.events.publish(map[string]interface{}{"type": "rate_limit_drop", "scope": "public_tcp", "ip": ip, "at": time.Now().UTC()})
+				observe.events.publishRateLimitDrop(scopePublicTCP, ip)
 				if warnSampler.allow("tcp-rate:" + ip) {
 					publicConn.Warn("Rate-limited TCP public connection from %s", ip)
 				}
@@ -435,7 +546,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 				return
 			}
 			if !connLimiter.acquire(ip) {
-				observe.events.publish(map[string]interface{}{"type": "connection_cap_drop", "scope": "public_tcp", "ip": ip, "at": time.Now().UTC()})
+				observe.events.publishConnectionCapDrop(scopePublicTCP, ip)
 				if warnSampler.allow("tcp-cap:" + ip) {
 					publicConn.Warn("Connection cap reached for %s", ip)
 				}
@@ -465,7 +576,11 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 				// client has no protocol to be answered in, so a refusal is
 				// the connection closing: the response the verdict carries is
 				// for the HTTP path, where it means something.
-				if v := member.connectVerdict(c); v.Deny {
+				//
+				// member is the terminus for TCP -- forward_to is refused for
+				// TCP endpoints -- so policyFor(member) is the same policy the
+				// join below runs.
+				if v := connectVerdict(member.policyFor(member), c); v.Deny {
 					c.Info("Traffic policy refused the connection: %s", v.Reason)
 					c.Close()
 					return
@@ -508,7 +623,6 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 			t.Warn("Failed to get proxy connection: %v", err)
 			return
 		}
-		defer proxyConn.Close()
 		t.Info("Got proxy connection %s", proxyConn.Id())
 		proxyConn.AddLogPrefix(t.Id())
 
@@ -520,11 +634,19 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 
 		if err = msg.WriteMsg(proxyConn, startPxyMsg); err != nil {
 			proxyConn.Warn("Failed to write StartProxyMessage: %v, attempt %d", err, i)
+			// Close the conn that just failed, here, rather than deferring it:
+			// a defer in this loop would pile up one Close per failed attempt
+			// and run them all when this function returns, so every dead proxy
+			// conn would stay open -- and stay registered on the client, which
+			// keeps its end until the socket goes away -- for the whole life of
+			// the public connection being retried. The successful conn is the
+			// one the defer below closes.
 			proxyConn.Close()
-		} else {
-			// success
-			break
+			continue
 		}
+
+		// success
+		break
 	}
 
 	if err != nil {
@@ -532,6 +654,7 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 		publicConn.Error("Too many failures starting proxy connection")
 		return
 	}
+	defer proxyConn.Close()
 
 	// To reduce latency handling tunnel connections, we employ the following curde heuristic:
 	// Whenever we take a proxy connection from the pool, replace it with a new one

@@ -10,65 +10,116 @@ package policy
 // same choice the rest of the policy package makes: a control that does not run
 // is far worse than a control that refuses to load.
 //
-// Everything is declared as a map, which is what makes the subset cheap to
-// declare and cheap to fill: `conn.client_ip` is CEL's field selection on a
-// map, so it costs one string key rather than a protobuf message. The cost is
-// that a *misspelled* key compiles (any string key does) and errors at
-// evaluation time; evaluation errors are treated as "this action does not
-// apply" and logged once, which is the fail-open rule this package lives by.
+// Every field of that subset is declared by its own dotted name
+// (cel.Variable("conn.client_ip", ...)) rather than by declaring conn as a map.
+// The map form is cheaper to write and was what this file did first, but it
+// gives up the property the paragraph above claims: on a map, every key is a
+// string key, so `conn.client_ip` and the typo `conn.client_IP` are the same
+// expression to the compiler, and the typo becomes a rule that never matches --
+// evaluated, failing on a missing key, "this action does not apply", logged
+// once. A rule that silently does nothing is the exact failure this package
+// exists to avoid, so the declarations name the fields.
+//
+// The cost of the dotted form is real and is worth stating: the *objects* are
+// not values. `req.headers` is still declared as a whole map, so ${req.headers}
+// and size(req.headers) work, but `conn` and `req.url` are not variables at all
+// (only their fields are), so an expression that wants the whole conn or the
+// whole url has nothing to name. Nothing in the documented subset does -- the
+// table in the package doc lists fields, not objects -- and a policy that wants
+// one is better off failing to load than being handed a map of whatever this
+// build felt like putting in it.
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/google/cel-go/cel"
 )
 
+// celVar is one declared name in a phase's environment: the variable's dotted
+// name and its type. The list of them per phase is both what the environment is
+// built from and what a compile error is annotated with, so that the two cannot
+// disagree about what a policy may say.
+type celVar struct {
+	name string
+	typ  *cel.Type
+}
+
+func (v celVar) String() string { return fmt.Sprintf("%s (%s)", v.name, v.typ) }
+
+// celSubset is the documented subset, phase by phase: the table in the package
+// doc, in the order it is written there.
+var celSubset = map[phase][]celVar{
+	// on_tcp_connect sees a connection, not a message: conn.* is all there is
+	// to match on.
+	phaseConnect: {
+		{"conn.client_ip", cel.StringType},
+		{"conn.remote_addr", cel.StringType},
+	},
+	// on_http_request sees the request (and conn.*), and the vars that earlier
+	// set-vars actions in the same phase defined.
+	phaseRequest: {
+		{"conn.client_ip", cel.StringType},
+		{"conn.remote_addr", cel.StringType},
+		{"req.method", cel.StringType},
+		{"req.url.path", cel.StringType},
+		{"req.url.query", cel.StringType},
+		{"req.url.raw", cel.StringType},
+		{"req.headers", cel.MapType(cel.StringType, cel.StringType)},
+		{"req.cookies", cel.MapType(cel.StringType, cel.StringType)},
+		{"vars", cel.MapType(cel.StringType, cel.StringType)},
+	},
+	// on_http_response sees the response and conn.*. req.* is not declared here:
+	// the response hook is handed a head-only *http.Response and has no request
+	// to read, so a policy that refers to req.* in this phase is rejected at
+	// load time rather than evaluating against a zero value that would quietly
+	// be wrong.
+	phaseResponse: {
+		{"conn.client_ip", cel.StringType},
+		{"conn.remote_addr", cel.StringType},
+		{"res.status_code", cel.IntType},
+		{"vars", cel.MapType(cel.StringType, cel.StringType)},
+	},
+}
+
 // celEnvs holds the three phase environments. They are built once per process
 // (not per policy): compiling an environment walks a standard library, and
 // nothing in these declarations depends on the policy being compiled.
 var celEnvs = func() map[phase]*cel.Env {
-	vars := cel.MapType(cel.StringType, cel.StringType)
-	req := cel.MapType(cel.StringType, cel.DynType)
-	res := cel.MapType(cel.StringType, cel.IntType)
-
-	must := func(opts ...cel.EnvOption) *cel.Env {
+	envs := map[phase]*cel.Env{}
+	for ph, vars := range celSubset {
+		opts := make([]cel.EnvOption, 0, len(vars))
+		for _, v := range vars {
+			opts = append(opts, cel.Variable(v.name, v.typ))
+		}
 		env, err := cel.NewEnv(opts...)
 		if err != nil {
 			// A fixed set of declarations: if one of them is invalid the
 			// process cannot enforce any policy, and failing at startup beats
 			// serving traffic that is silently unprotected.
-			panic(fmt.Sprintf("policy: cel environment: %v", err))
+			panic(fmt.Sprintf("policy: cel environment for %s: %v", ph, err))
 		}
-		return env
+		envs[ph] = env
 	}
-
-	return map[phase]*cel.Env{
-		// on_tcp_connect sees a connection, not a message: conn.* is all
-		// there is to match on.
-		phaseConnect: must(
-			cel.Variable("conn", vars),
-		),
-		// on_http_request sees the request (and conn.*), and the vars that
-		// earlier set-vars actions in the same phase defined.
-		phaseRequest: must(
-			cel.Variable("conn", vars),
-			cel.Variable("req", req),
-			cel.Variable("vars", vars),
-		),
-		// on_http_response sees the response and conn.*. req.* is not declared
-		// here: the response hook is handed a head-only *http.Response and has
-		// no request to read, so a policy that refers to req.* in this phase is
-		// rejected at load time rather than evaluating against a zero value
-		// that would quietly be wrong.
-		phaseResponse: must(
-			cel.Variable("conn", vars),
-			cel.Variable("res", res),
-			cel.Variable("vars", vars),
-		),
-	}
+	return envs
 }()
+
+// celSubsetHint names the phase's variables for a load-time error, because the
+// interesting typo is almost always a field of a variable that does exist and
+// the compiler's own message names the object, not the field ("undeclared
+// reference to 'conn'" for conn.geo -- the author is left wondering whether the
+// build has no conn or no geo).
+func celSubsetHint(ph phase) string {
+	vars := celSubset[ph]
+	names := make([]string, 0, len(vars))
+	for _, v := range vars {
+		names = append(names, v.String())
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("%s has: %s", ph, strings.Join(names, ", "))
+}
 
 // program is one compiled CEL expression, however it is used: a rule
 // condition, or one ${...} placeholder inside a config string.
@@ -77,14 +128,19 @@ type program struct {
 	prg cel.Program
 }
 
-// compileExpr compiles one expression for a phase. The result type is checked
-// here rather than at evaluation time: an expression that cannot be a condition
-// is a load-time error, and an expression that cannot be a string is not
-// something ${...} can splice into a header value.
-func compileExpr(env *cel.Env, src string, mustBeBool bool) (*program, error) {
+// compileExpr compiles one expression in a phase's environment, which it looks
+// up itself: the phase is what a caller knows (it is a policy document's
+// section) and the environment is a function of it, so the phase is also what a
+// failure has to be explained in terms of.
+//
+// The result type is checked here rather than at evaluation time: an expression
+// that cannot be a condition is a load-time error, and an expression that
+// cannot be a string is not something ${...} can splice into a header value.
+func compileExpr(ph phase, src string, mustBeBool bool) (*program, error) {
+	env := celEnvs[ph]
 	ast, iss := env.Compile(src)
 	if err := iss.Err(); err != nil {
-		return nil, fmt.Errorf("expression %q does not compile: %v", src, err)
+		return nil, fmt.Errorf("expression %q does not compile: %v%s", src, err, undeclaredHint(ph, err))
 	}
 	if mustBeBool && ast.OutputType() != cel.BoolType && ast.OutputType() != cel.DynType {
 		// A dyn result is allowed through: it is what a map lookup whose
@@ -99,6 +155,19 @@ func compileExpr(env *cel.Env, src string, mustBeBool bool) (*program, error) {
 		return nil, fmt.Errorf("expression %q cannot be built into a program: %v", src, err)
 	}
 	return &program{src: src, prg: prg}, nil
+}
+
+// undeclaredHint is the extra line a compile error carries when what went wrong
+// was a name: the compiler reports the reference it could not resolve, and for
+// a dotted name that is the object, not the field ("undeclared reference to
+// 'conn'" for conn.geo -- which reads as if this build had no conn at all). The
+// list is the documented subset for the phase, so the author can see both the
+// fields that do exist and which section of the document they were writing in.
+func undeclaredHint(ph phase, err error) string {
+	if !strings.Contains(err.Error(), "undeclared reference") {
+		return ""
+	}
+	return "\n" + celSubsetHint(ph)
 }
 
 // eval runs the program against an activation and returns its value, or an
@@ -151,7 +220,7 @@ func hasInterpolation(s string) bool {
 // deliberate difference: this build always splices the *string* form of the
 // result, so an interpolation of a list or a map is not supported (ngrok
 // resolves a whole-string "${vars.x}" to the value's own type).
-func compileInterpolation(env *cel.Env, s string) (*interpolated, error) {
+func compileInterpolation(ph phase, s string) (*interpolated, error) {
 	if !hasInterpolation(s) {
 		return &interpolated{raw: s, parts: []interpPart{{text: s}}}, nil
 	}
@@ -178,7 +247,7 @@ func compileInterpolation(env *cel.Env, s string) (*interpolated, error) {
 		if expr == "" {
 			return nil, fmt.Errorf("interpolation %q has an empty expression", s)
 		}
-		prg, err := compileExpr(env, expr, false)
+		prg, err := compileExpr(ph, expr, false)
 		if err != nil {
 			return nil, err
 		}

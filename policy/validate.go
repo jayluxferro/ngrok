@@ -27,7 +27,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/cel-go/cel"
+	"ngrok/rewriter"
 )
 
 // actionPhases is the phase matrix this build implements. ngrok documents a
@@ -47,12 +47,22 @@ var actionPhases = map[string][]phase{
 
 // phaseActions lists, in a stable order, the actions a phase implements, for
 // error messages that tell an operator what they could have written instead.
+//
+// The names come out of actionPhases rather than a second, hand-maintained
+// list, because a second list can disagree with the first: the error message
+// says "this build implements X, Y, Z", and an action added to the matrix but
+// forgotten here would make that message a lie -- the one thing an error
+// message must not be. Sorted, so the message is deterministic for a given
+// matrix whatever order the map is walked in.
 func phaseActions(p phase) []string {
+	names := make([]string, 0, len(actionPhases))
+	for name := range actionPhases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	var out []string
-	for _, name := range []string{
-		ActionRestrictIPs, ActionDeny, ActionLog,
-		ActionAddHeaders, ActionRemoveHeaders, ActionCustomResponse, ActionSetVars,
-	} {
+	for _, name := range names {
 		for _, ph := range actionPhases[name] {
 			if ph == p {
 				out = append(out, name)
@@ -76,12 +86,36 @@ func (p phase) supports(action string) bool {
 // custom-response action may set (and on the headers remove-headers may name).
 const maxHeaderEntries = 10
 
+// maxActionsPerPolicy bounds the total number of actions one policy may carry,
+// summed over its three phases. ngrok documents no such limit, and this build
+// did not have one: a policy is whatever the document says, and every action in
+// it is evaluated against every message of every connection on the endpoint.
+//
+// The bound is about cost, not correctness. Nothing here is superlinear in the
+// action count -- each action is one boolean per condition and one pass over
+// its config -- so a document with ten thousand actions does not break the
+// engine, it just spends the connection's time before the origin ever sees the
+// request. A policy is also the one part of a config that is enforced on the
+// data path rather than at load, so its size is a size an attacker who can talk
+// an operator into a document (or one who can write to the config) gets to
+// choose. The measured cost is roughly 35-55us per action for conditions of the
+// shape the docs use (most of it the CEL evaluation), so the cap below is on
+// the order of 40ms of a connection's first request at the limit, and a
+// hand-written policy is a few dozen actions at most: the limit is three orders
+// of magnitude past anything a person writes, and it is checked at load time
+// where the answer is an error the operator can read.
+const maxActionsPerPolicy = 1000
+
 // build is the one traversal: it validates the whole policy and returns the
 // compiled form. Validate drops the result, Compile keeps it.
 func (tp *TrafficPolicy) build() (*Compiled, error) {
 	c := &Compiled{}
 	if tp == nil {
 		return c, nil
+	}
+	if n := len(tp.OnTCPConnect) + len(tp.OnHTTPRequest) + len(tp.OnHTTPResponse); n > maxActionsPerPolicy {
+		return nil, fmt.Errorf("the policy has %d actions in total (on_tcp_connect %d, on_http_request %d, on_http_response %d); the maximum is %d",
+			n, len(tp.OnTCPConnect), len(tp.OnHTTPRequest), len(tp.OnHTTPResponse), maxActionsPerPolicy)
 	}
 
 	var err error
@@ -132,11 +166,10 @@ func buildPhase(p phase, rules []*Action) ([]*compiledAction, error) {
 }
 
 func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
-	env := celEnvs[p]
-	a := &compiledAction{action: r.Name, rule: r.Name, where: where}
+	a := &compiledAction{action: r.Name, where: where}
 
 	for i, src := range r.Expressions {
-		prg, err := compileExpr(env, src, true)
+		prg, err := compileExpr(p, src, true)
 		if err != nil {
 			return nil, fmt.Errorf("%s: condition %d: %v", where, i, err)
 		}
@@ -150,7 +183,14 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 
 	switch r.Name {
 	case ActionAddHeaders:
-		pairs, err := buildHeaders(env, where, cfg, true)
+		// "headers" and nothing else. The check is not decoration: a typo in
+		// the field name ("headerss") is a config the author believes is doing
+		// something and an engine that does nothing, and the difference only
+		// shows up when the header is missing from a production request.
+		if err := checkConfigKeys(where, cfg, "headers"); err != nil {
+			return nil, err
+		}
+		pairs, err := buildHeaders(p, where, cfg, true)
 		if err != nil {
 			return nil, err
 		}
@@ -202,11 +242,11 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 			}
 			rawBody = s
 		}
-		if a.body, err = compileInterpolation(env, rawBody); err != nil {
+		if a.body, err = compileInterpolation(p, rawBody); err != nil {
 			return nil, fmt.Errorf("%s: config field \"body\": %v", where, err)
 		}
 
-		if a.addHeaders, err = buildHeaders(env, where, cfg, false); err != nil {
+		if a.addHeaders, err = buildHeaders(p, where, cfg, false); err != nil {
 			return nil, err
 		}
 		// ngrok infers a content-type when the config does not give one, and
@@ -222,7 +262,7 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 		}
 
 	case ActionLog:
-		md, err := buildMetadata(env, where, cfg)
+		md, err := buildMetadata(p, where, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -246,16 +286,19 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 				return nil, fmt.Errorf("%s: config field \"vars\" entry %d: each entry must be a map with exactly one key, got %s",
 					where, i, typeName(item))
 			}
-			for name, val := range m {
+			// One key by the check above, so the order here cannot vary; sorted
+			// anyway, so that a future relaxation of that check does not quietly
+			// make this error non-deterministic.
+			for _, name := range sortedKeys(m) {
 				if !isIdent(name) {
 					return nil, fmt.Errorf("%s: config field \"vars\" entry %d: %q is not a usable variable name (letters, digits and _ only, not starting with a digit; it is referenced as ${vars.%s})",
 						where, i, name, name)
 				}
-				val, err := interpolatedValue(env, fmt.Sprintf("%s: config field \"vars\" entry %d (%s)", where, i, name), val)
+				iv, err := interpolatedValue(p, fmt.Sprintf("%s: config field \"vars\" entry %d (%s)", where, i, name), m[name])
 				if err != nil {
 					return nil, err
 				}
-				a.assignments = append(a.assignments, assignment{name: name, value: val})
+				a.assignments = append(a.assignments, assignment{name: name, value: iv})
 			}
 		}
 
@@ -293,7 +336,13 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 // custom-response (optional) action. Names are lower-cased, as ngrok documents,
 // and sorted so that what is emitted is the same on every run: the config is a
 // map and a map has no order.
-func buildHeaders(env *cel.Env, where string, cfg map[string]interface{}, required bool) ([]headerPair, error) {
+//
+// The entries are walked in sorted order too, not for the output (the sort
+// below fixes the emitted bytes either way) but for the error: a config with
+// two bad entries has to report the same one every time, or the same document
+// fails differently on consecutive runs and an operator chasing a flake is
+// chasing the map's iteration order.
+func buildHeaders(ph phase, where string, cfg map[string]interface{}, required bool) ([]headerPair, error) {
 	v, ok := cfg["headers"]
 	if !ok {
 		if required {
@@ -313,7 +362,8 @@ func buildHeaders(env *cel.Env, where string, cfg map[string]interface{}, requir
 	}
 
 	pairs := make([]headerPair, 0, len(m))
-	for k, v := range m {
+	for _, k := range sortedKeys(m) {
+		v := m[k]
 		if err := checkHeaderName(where, k); err != nil {
 			return nil, err
 		}
@@ -321,7 +371,23 @@ func buildHeaders(env *cel.Env, where string, cfg map[string]interface{}, requir
 		if !ok {
 			return nil, fmt.Errorf("%s: config field \"headers\" entry %q must be a string, got %s", where, k, typeName(v))
 		}
-		iv, err := compileInterpolation(env, val)
+		// A CR or an LF in a configured value is a header-injection payload
+		// aimed at whatever reads the request next, and it is not something an
+		// author ever means to write. The rule is rewriter.ValidHeaderValue, the
+		// same one the rewriter applies before it writes a value. This
+		// package's runtime path drops such a value (the rewriter refuses to
+		// write it, newHookRewrite's rule), so without this check the failure
+		// mode is a header that is simply missing from production traffic --
+		// and a value that is *supposed* to carry a line break can say so as
+		// ${...} interpolation, which is evaluated after the check and is the
+		// author's own expression rather than their document's literal bytes.
+		// Refusing it here is the same choice the rest of this file makes: a
+		// control that cannot run as written is a load error, not a silent
+		// no-op.
+		if !rewriter.ValidHeaderValue(val) {
+			return nil, fmt.Errorf("%s: config field \"headers\" entry %q contains a CR or LF, which would split the header in two on the wire (%q)", where, k, val)
+		}
+		iv, err := compileInterpolation(ph, val)
 		if err != nil {
 			return nil, fmt.Errorf("%s: config field \"headers\" entry %q: %v", where, k, err)
 		}
@@ -368,7 +434,7 @@ func buildRemoveHeaders(where string, cfg map[string]interface{}) ([]string, err
 }
 
 // buildMetadata builds the log action's `metadata`, which ngrok marks required.
-func buildMetadata(env *cel.Env, where string, cfg map[string]interface{}) ([]headerPair, error) {
+func buildMetadata(ph phase, where string, cfg map[string]interface{}) ([]headerPair, error) {
 	if err := checkConfigKeys(where, cfg, "metadata"); err != nil {
 		return nil, err
 	}
@@ -382,7 +448,7 @@ func buildMetadata(env *cel.Env, where string, cfg map[string]interface{}) ([]he
 	}
 	pairs := make([]headerPair, 0, len(m))
 	for _, k := range sortedKeys(m) {
-		val, err := interpolatedValue(env, fmt.Sprintf("%s: config field \"metadata\" entry %q", where, k), m[k])
+		val, err := interpolatedValue(ph, fmt.Sprintf("%s: config field \"metadata\" entry %q", where, k), m[k])
 		if err != nil {
 			return nil, err
 		}
@@ -428,8 +494,9 @@ func buildCIDRs(where, field string, v interface{}) ([]*net.IPNet, error) {
 }
 
 // configStatus reads a status code, which may have arrived as any of the
-// integer types YAML and JSON decode into: yaml.v1 gives int (or uint64 for a
-// large value), encoding/json gives float64.
+// integer types YAML and JSON decode into: the YAML decoder gives int (or uint64
+// for a value past MaxInt64), encoding/json gives float64. The two are not
+// interchangeable and this reads both.
 func configStatus(where string, cfg map[string]interface{}, def int) (int, error) {
 	v, ok := cfg["status_code"]
 	if !ok {
@@ -449,10 +516,10 @@ func configStatus(where string, cfg map[string]interface{}, def int) (int, error
 // at runtime: a string is compiled for ${...} interpolation, a bool or a number
 // is rendered once into a literal (there is nothing in it to interpolate), and
 // a list or a map is refused rather than guessed at.
-func interpolatedValue(env *cel.Env, where string, v interface{}) (*interpolated, error) {
+func interpolatedValue(ph phase, where string, v interface{}) (*interpolated, error) {
 	switch t := v.(type) {
 	case string:
-		iv, err := compileInterpolation(env, t)
+		iv, err := compileInterpolation(ph, t)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %v", where, err)
 		}
@@ -480,11 +547,18 @@ func checkConfigKeys(where string, cfg map[string]interface{}, allowed ...string
 
 // checkHeaderName enforces the header rules ngrok documents for add-headers and
 // remove-headers: a valid header name, and never user-agent.
+//
+// The grammar is rewriter.ValidHeaderToken's -- the same RFC 7230 token rule
+// the rewriter applies to a name before it writes it, and the client applies to
+// a name before it loads it -- so a name that satisfies one of the three
+// satisfies all three. The messages here stay policy's: an operator reading
+// "on_http_request[0] (add-headers): config field "headers"..." needs the rule's
+// path in the document, which the other two callers have no way to produce.
 func checkHeaderName(where, name string) error {
 	if name == "" {
 		return fmt.Errorf("%s: a header name is empty", where)
 	}
-	if !isToken(name) {
+	if !rewriter.ValidHeaderToken(name) {
 		return fmt.Errorf("%s: %q is not a valid header name", where, name)
 	}
 	if strings.EqualFold(name, "user-agent") {
@@ -514,8 +588,10 @@ func hasHeader(pairs []headerPair, name string) bool {
 // --- small helpers over the shapes a config value arrives in ---------------
 
 // asMap accepts both map shapes a config value can arrive in: map[string]interface{}
-// from a programmatic or JSON source, and map[interface{}]interface{} from yaml.v1,
-// which decodes nested maps that way and has no hook to do otherwise.
+// from a programmatic or JSON source, and map[interface{}]interface{} from the
+// YAML decoder, which produces that shape -- with no hook to do otherwise -- for
+// any nested map that has a key which is not a string, and which therefore
+// arrives here only for a document this function is about to refuse.
 func asMap(v interface{}) (map[string]interface{}, bool) {
 	switch t := v.(type) {
 	case map[string]interface{}:
@@ -607,24 +683,10 @@ func typeName(v interface{}) string {
 	return fmt.Sprintf("%T", v)
 }
 
-// isToken reports whether s is an RFC 7230 token, which is what a header name
-// has to be to reach the wire.
-func isToken(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
-		default:
-			return false
-		}
-	}
-	return len(s) > 0
-}
-
 // isIdent reports whether s can be referenced as a CEL field name
-// (${vars.<name>}), which is stricter than isToken: a variable named "a-b"
-// could be stored but never read.
+// (${vars.<name>}), which is stricter than rewriter.ValidHeaderToken (the token
+// grammar this file used to carry a copy of): a variable named "a-b" could be
+// stored but never read.
 func isIdent(s string) bool {
 	if s == "" {
 		return false

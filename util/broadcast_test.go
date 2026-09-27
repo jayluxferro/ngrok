@@ -23,4 +23,3 @@ func TestBroadcastDoesNotBlockOnSlowListener(t *testing.T) {
 		t.Fatalf("expected fast listener to receive updates without blocking")
 	}
 }
-

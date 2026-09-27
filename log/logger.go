@@ -5,13 +5,30 @@ import (
 	"fmt"
 	log "github.com/alecthomas/log4go"
 	"strings"
+	"sync"
 	"time"
 )
 
 var root log.Logger = make(log.Logger)
-var jsonFormat bool
+
+// rootMu guards root and jsonFormat. The logger is a process-wide map of
+// filters that every log call reads and LogTo rewrites, and log4go mutates and
+// iterates that map without a lock of its own ("this function should not be
+// called from multiple goroutines", says AddFilter). LogTo is therefore only
+// safe as long as it cannot run while anything else is logging: it is called
+// once at startup in Main, but a test that points the log at a file of its own
+// -- or any future reconfiguration -- would otherwise be a data race on the
+// filter map at best and a "concurrent map read and map write" crash at worst.
+// Readers take the read lock, LogTo takes the write lock.
+var (
+	rootMu     sync.RWMutex
+	jsonFormat bool
+)
 
 func LogTo(target string, level_name string, format string) {
+	rootMu.Lock()
+	defer rootMu.Unlock()
+
 	var writer log.LogWriter = nil
 	jsonFormat = strings.EqualFold(format, "json")
 
@@ -109,6 +126,9 @@ func (pl *PrefixLogger) ClearLogPrefixes() {
 }
 
 func (pl *PrefixLogger) log(level string, format string, args ...interface{}) error {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
+
 	if jsonFormat {
 		msg := fmt.Sprintf(format, args...)
 		payload, _ := json.Marshal(map[string]string{
@@ -147,17 +167,25 @@ func (pl *PrefixLogger) log(level string, format string, args ...interface{}) er
 
 // we should never really use these . . . always prefer logging through a prefix logger
 func Debug(arg0 string, args ...interface{}) {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
 	root.Debug(arg0, args...)
 }
 
 func Info(arg0 string, args ...interface{}) {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
 	root.Info(arg0, args...)
 }
 
 func Warn(arg0 string, args ...interface{}) error {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
 	return root.Warn(arg0, args...)
 }
 
 func Error(arg0 string, args ...interface{}) error {
+	rootMu.RLock()
+	defer rootMu.RUnlock()
 	return root.Error(arg0, args...)
 }

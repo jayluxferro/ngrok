@@ -22,7 +22,7 @@ Scope: client-side only. Server untouched.
 - Data path is raw byte pipes. Server parses the request head only for vhost lookup (`server/http.go`), then streams the original bytes; `StartProxy` carries only `Url` + `ClientAddr` (`msg/msg.go:108-111`).
 - Client proxy loop: `client/model.go:401-440` reads `StartProxy`, dials the local upstream, wraps it in the inspector tee (`proto/http.go:85-91`), then `conn.Join(localConn, remoteConn)` (`conn/conn.go:202-226`) copies both directions with `io.Copy`.
 - `mvc.Tunnel` (`client/mvc/state.go:25-29`) is `{PublicUrl, Protocol, LocalAddr}` — the natural carrier for per-tunnel header policy.
-- Config plumbing: CLI flags in `client/cli.go` (`Options` struct, Go `flag` pkg — no repeatable flag support, needs a custom `flag.Value`); config file in `client/config.go` (`Configuration` / `TunnelConfiguration`, `gopkg.in/yaml.v1`); the `default` CLI tunnel is synthesized in `LoadConfiguration` (`client/config.go:175-190`).
+- Config plumbing: CLI flags in `client/cli.go` (`Options` struct, Go `flag` pkg — no repeatable flag support, needs a custom `flag.Value`); config file in `client/config.go` (`Configuration` / `TunnelConfiguration`, `gopkg.in/yaml.v3` since the hardening pass — v1 panicked on malformed input); the `default` CLI tunnel is synthesized in `LoadConfiguration` (`client/config.go:175-190`).
 - Go 1.21, module path `ngrok`. Tests use plain stdlib `testing` with `t.Fatalf` (see `server/ratelimit_test.go`).
 
 ## 4. Semantics to implement (ngrok parity)

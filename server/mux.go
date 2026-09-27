@@ -24,13 +24,6 @@ import (
 )
 
 const (
-	// muxCapability is the AuthResp capability that tells a client it may
-	// multiplex (SPEC 3.1). It gates nothing on this side -- a client that opens
-	// a mux conn states what it wants with RegMux and gets it -- but a client
-	// that never sees the cap keeps dialing one conn per proxy connection, which
-	// is exactly what a mixed-version deployment needs.
-	muxCapability = "proxy-mux"
-
 	// muxStreamReadTimeout bounds the wait for the RegProxy that must be the
 	// first message on every stream. A stream that says nothing is broken or a
 	// probe, and it must not hold an accept goroutine forever. The tunnel
@@ -57,6 +50,18 @@ func muxConfig() *smux.Config {
 // RegMux naming an unknown client is logged and dropped with its conn: there is
 // nothing to attach it to, and the client's watchdog (or its next control
 // session) will try again.
+//
+// Naming a session is a claim on that session -- once the mux session is
+// attached, every stream on it is a proxy connection for that control's
+// tunnels -- so the claim has to be proved, with the same session secret a
+// resuming control connection presents (RegMux.Secret, minted in AuthResp).
+// The ClientId alone is public (it is logged, and it is in every admin
+// snapshot), so the secret is what makes this authentication rather than
+// naming. A conn with a missing or wrong secret is closed before smux is even
+// started, and an old client that predates the field is refused by the same
+// check: a server upgraded ahead of its clients stops serving mux sessions to
+// them until they are upgraded (they fall back to dialing proxy conns, which
+// are refused too -- see msg.Auth.Secret).
 func NewMux(muxConn conn.Conn, regMux *msg.RegMux) {
 	// fail gracefully if the mux connection cannot be registered, the same way
 	// NewProxy does
@@ -75,6 +80,14 @@ func NewMux(muxConn conn.Conn, regMux *msg.RegMux) {
 
 	if ctl == nil {
 		muxConn.Warn("No client found for identifier: %s", regMux.ClientId)
+		muxConn.Close()
+		return
+	}
+
+	if !secretMatches(ctl.secret, regMux.Secret) {
+		// The id is logged (it is public); the secret never is, and neither is
+		// the value that was presented.
+		muxConn.Warn("Rejecting mux session for %s: invalid session secret", regMux.ClientId)
 		muxConn.Close()
 		return
 	}
@@ -165,11 +178,18 @@ func (m *MuxSession) acceptLoop() {
 // handleStream registers one mux stream as a proxy connection.
 //
 // The steps mirror NewProxy's -- read RegProxy, find the control it names,
-// register -- with one check that only a stream can make: the client id must be
-// the one this session registered as, because the stream is not authenticated
-// on its own. A stream that names another client, or one whose control has been
-// replaced in the meantime, is closed and never pooled: it is either a bug or
-// an attempt to borrow somebody else's tunnels.
+// register -- with checks that only a stream can make: the client id must be
+// the one this session registered as, the control it names must still be this
+// session's control, and the session secret in the RegProxy must be the
+// control's. The streams of one mux conn are not authenticated individually by
+// the transport, so each one re-states the session's credentials; anything that
+// does not line up is closed and never pooled. That is either a bug or an
+// attempt to borrow somebody else's tunnels.
+//
+// The secret check is not redundant with NewMux's: a mux session outlives the
+// control connection's authentication, its streams are opened at the client's
+// discretion, and m.id/controlRegistry alone say only that the sender knows a
+// public identifier.
 func (m *MuxSession) handleStream(stream *smux.Stream) {
 	// A control that shuts down while a stream is registering closes the pool
 	// channel under it. NewProxy guards its registration the same way: the panic
@@ -198,6 +218,12 @@ func (m *MuxSession) handleStream(stream *smux.Stream) {
 
 	if regPxy.ClientId != m.id || controlRegistry.Get(regPxy.ClientId) != m.ctl {
 		pxyConn.Warn("Rejecting mux stream for %s: session belongs to %s", regPxy.ClientId, m.id)
+		pxyConn.Close()
+		return
+	}
+
+	if !secretMatches(m.ctl.secret, regPxy.Secret) {
+		pxyConn.Warn("Rejecting mux stream for %s: invalid session secret", regPxy.ClientId)
 		pxyConn.Close()
 		return
 	}

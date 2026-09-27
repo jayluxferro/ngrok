@@ -38,6 +38,18 @@ var (
 	warnSampler   *logSampler
 )
 
+// NewProxy attaches a dialed proxy connection to the control session it names.
+//
+// A proxy connection is the transport that carries a public connection's bytes
+// to an agent, so attaching one to a session means handing that session's
+// traffic to whoever opened the conn. The RegProxy names the session with a
+// client id -- a public value -- and proves it with the session secret minted
+// in AuthResp, which is the actual authentication of this path.
+//
+// Deliberately, a conn that fails the check is closed rather than kept: an old
+// client that does not send a secret is refused here exactly like an impostor,
+// because from this side the two are indistinguishable and only one of them is
+// safe to serve. That is the upgrade requirement stated in msg.Auth.Secret.
 func NewProxy(pxyConn conn.Conn, regPxy *msg.RegProxy) {
 	// fail gracefully if the proxy connection fails to register
 	defer func() {
@@ -55,7 +67,15 @@ func NewProxy(pxyConn conn.Conn, regPxy *msg.RegProxy) {
 	ctl := controlRegistry.Get(regPxy.ClientId)
 
 	if ctl == nil {
-		panic("No client found for identifier: " + regPxy.ClientId)
+		pxyConn.Warn("No client found for identifier: %s", regPxy.ClientId)
+		pxyConn.Close()
+		return
+	}
+
+	if !secretMatches(ctl.secret, regPxy.Secret) {
+		pxyConn.Warn("Rejecting proxy connection for %s: invalid session secret", regPxy.ClientId)
+		pxyConn.Close()
+		return
 	}
 
 	ctl.RegisterProxy(pxyConn)
@@ -101,7 +121,7 @@ func tunnelListener(addr string, tlsConfig *tls.Config) *conn.Listener {
 					ip := remoteIP(tunnelConn.RemoteAddr())
 					if !authLimiter.allow(ip) {
 						atomic.AddUint64(&rateDropCount, 1)
-						observe.events.publish(map[string]interface{}{"type": "rate_limit_drop", "scope": "auth", "ip": ip, "at": time.Now().UTC()})
+						observe.events.publishRateLimitDrop(scopeAuth, ip)
 						if warnSampler.allow("auth-rate:" + ip) {
 							tunnelConn.Warn("Rate-limited auth attempt from %s", ip)
 						}
@@ -171,12 +191,12 @@ func Main() {
 
 	// listen for http
 	if opts.httpAddr != "" {
-		listeners["http"] = startHttpListener(opts.httpAddr, nil)
+		listeners[msg.ProtoHTTP] = startHttpListener(opts.httpAddr, nil)
 	}
 
 	// listen for https
 	if opts.httpsAddr != "" {
-		listeners["https"] = startHttpListener(opts.httpsAddr, tlsConfig)
+		listeners[msg.ProtoHTTPS] = startHttpListener(opts.httpsAddr, tlsConfig)
 	}
 
 	// ngrok clients

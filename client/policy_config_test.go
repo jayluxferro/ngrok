@@ -11,9 +11,11 @@ package client
 // The rule shape under test is this build's flat one: one action per rule, with
 // name, expressions and config at the top level of the rule. ngrok nests a list
 // of actions ({"name": "my rule", "actions": [{"type": ..., "config": ...}]})
-// inside each rule, which yaml.v1 cannot decode into a typed policy -- the
+// inside each rule, which this build's typed policy has no field for -- the
 // deviation, its reasoning and the one shape of it that does not fail loudly
-// are in docs/CHANGELOG.md.
+// are in docs/CHANGELOG.md. The parser migration did not move it: both yaml.v1
+// and yaml.v3 drop a key the struct does not have, so a nested rule still
+// decodes to an unnamed action and fails validation rather than loading.
 
 import (
 	"encoding/json"
@@ -25,7 +27,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v1"
+	"gopkg.in/yaml.v3"
 
 	"ngrok/conn"
 	"ngrok/msg"
@@ -37,12 +39,14 @@ import (
 // config file has to use.
 //
 // Two details are worth reading twice, because the YAML that reads best is not
-// the YAML that works:
+// always the YAML that works:
 //
-//   - "proto: {http: 127.0.0.1:8080}" -- the flow spelling -- does not parse at
-//     all under yaml.v1: a plain scalar inside a flow mapping may not contain a
-//     colon ("found unexpected ':'"), so the port has to be written in block
-//     style. Every config in this repo does.
+//   - "proto: {http: 127.0.0.1:8080}" is written in block style, which is the
+//     style every config in this repo uses. The flow spelling parses too now --
+//     TestTrafficPolicyFlowSpellingParses is where that is pinned, because it
+//     did not under yaml.v1 (a plain scalar inside a flow mapping may not
+//     contain a colon: "found unexpected ':'") and the difference between the
+//     two spellings is exactly the kind of thing that gets forgotten.
 //   - a header value is an object entry ("X-Policy: checked"), not a quoted
 //     "X-Policy: checked" string: the quoted spelling is a YAML set entry whose
 //     value is null, and the policy package (rightly) refuses it as a header
@@ -106,6 +110,73 @@ func writeFile(t *testing.T, dir, name, contents string) string {
 	}
 
 	return path
+}
+
+// TestTrafficPolicyFlowSpellingParses is the yaml.v1 -> yaml.v3 difference in
+// the config file's own surface, and it is a test that changed sides: the flow
+// spelling of a protocol below was a *parse error* under yaml.v1, which is why
+// the comment beside guardedTunnelYAML used to tell the reader to write it in
+// block style. Under yaml.v3 it parses, so what is asserted is the result rather
+// than the refusal.
+//
+// Two shapes, because the parser change reached exactly one of them:
+//
+//   - "proto: {http: 127.0.0.1:8080}" loads and means what the block spelling
+//     means. yaml.v1 refused the whole document -- a plain scalar inside a flow
+//     mapping may not contain a colon ("found unexpected ':'") -- so a config
+//     written in the flow style did not start at all. This is the half that
+//     changed.
+//   - "headers: {\"X-Policy: checked\"}" is not a header entry and must not
+//     become one. This one parsed under yaml.v1 as well, and it is here because
+//     a reader looking at a parser that "now parses flow mappings correctly"
+//     would reasonably expect the quoted spelling to have turned into a header
+//     entry too. It has not, and the reason is the trap worth pinning: in flow
+//     style an entry with no colon after the scalar is a *set* entry, so the key
+//     is the string "X-Policy: checked" and its value is null. The policy package
+//     refuses it as a header name, which is the behavior to keep -- the quoted
+//     spelling is a plausible-looking way to write a header and it does nothing.
+//     The assertion is deliberately on the refusal and not on its prose: what
+//     matters is that it is refused *by validation*, with an error naming the
+//     rule, rather than decoded into a header nobody asked for.
+func TestTrafficPolicyFlowSpellingParses(t *testing.T) {
+	t.Run("the flow spelling of a protocol", func(t *testing.T) {
+		path := writeConfig(t, `
+tunnels:
+  flow:
+    hostname: flow
+    proto: {http: 127.0.0.1:8080}
+`)
+		config, err := LoadConfiguration(&Options{config: path, command: "start", args: []string{"flow"}})
+		if err != nil {
+			t.Fatalf("the flow spelling of proto did not load: %v", err)
+		}
+		if got := config.Tunnels["flow"].Protocols["http"]; got != "127.0.0.1:8080" {
+			t.Fatalf("the flow spelling decoded to %q, want %q", got, "127.0.0.1:8080")
+		}
+	})
+
+	t.Run("a quoted scalar in a flow mapping is a set entry, and is refused", func(t *testing.T) {
+		path := writeConfig(t, `
+tunnels:
+  flow:
+    hostname: flow
+    proto:
+      http: 127.0.0.1:8080
+    traffic_policy:
+      on_http_request:
+        - name: add-headers
+          config:
+            headers: {"X-Policy: checked"}
+`)
+		_, err := LoadConfiguration(&Options{config: path, command: "start", args: []string{"flow"}})
+		if err == nil {
+			t.Fatal("a set entry decoded into a header: the quoted spelling must be refused, or every config that uses it silently adds a header nobody asked for")
+		}
+		if !strings.Contains(err.Error(), "headers") {
+			t.Fatalf("the refusal does not name the headers field: %v", err)
+		}
+		t.Logf("refused at validation, not at parse: %v", err)
+	})
 }
 
 // TestTrafficPolicyYAMLRoundTrip pins the config-file spelling: every phase,
@@ -199,12 +270,23 @@ func TestTrafficPolicyYAMLRoundTrip(t *testing.T) {
 }
 
 // policyRule is one rule of a policy in a form that two decodes of the same
-// document can be compared in. The difference it exists to normalize away: a
-// rule with no config key comes back from a marshal/unmarshal cycle with an
-// empty config map rather than a nil one (yaml.v1 emits `config: {}` and reads
-// it back as an empty map). That is a difference in representation, not in
-// meaning -- the policy package reads both as "this action has no config" -- but
-// reflect.DeepEqual sees it, so the round trip is asserted on this view.
+// document can be compared in. The differences it exists to normalize away are
+// both empty-collection spellings that a marshal/unmarshal cycle changes without
+// changing anything the policy package reads:
+//
+//   - a rule with no config key comes back with an empty config map rather than
+//     a nil one (the marshaller emits `config: {}` and reads it back as an empty
+//     map);
+//   - a rule with no conditions comes back with an empty slice rather than a nil
+//     one (the marshaller emits `expressions: []`). This one is the yaml.v3
+//     migration's doing, and it is the whole reason this helper is touched at
+//     all: yaml.v1 left a nil []string nil after decoding `[]`, v3 makes it an
+//     empty non-nil slice. Both are "this rule has no conditions" -- build()
+//     ranges over the field, so nil and empty take the same path -- and both
+//     marshal to `[]`.
+//
+// Neither is a difference in meaning, but reflect.DeepEqual sees both, so the
+// round trip is asserted on this view.
 type policyRule struct {
 	phase       string
 	name        string
@@ -231,10 +313,14 @@ func policyRules(tp *policy.TrafficPolicy) []policyRule {
 			if config == nil {
 				config = map[string]interface{}{}
 			}
+			expressions := r.Expressions
+			if expressions == nil {
+				expressions = []string{}
+			}
 			out = append(out, policyRule{
 				phase:       fmt.Sprintf("%s[%d]", phase.name, i),
 				name:        r.Name,
-				expressions: r.Expressions,
+				expressions: expressions,
 				config:      config,
 			})
 		}
@@ -263,10 +349,13 @@ func TestLoadConfigurationTrafficPolicyTunnel(t *testing.T) {
 	}
 
 	// The policy has to be marshallable as well as valid. The tunnel
-	// registration is a JSON envelope, and a policy read from a config file holds
-	// yaml.v1's map[interface{}]interface{} shape until the loader normalizes it
-	// -- a policy that loads but cannot be sent leaves the client retrying its
-	// control connection forever.
+	// registration is a JSON envelope, and a policy read from a config file can
+	// hold the YAML decoder's map[interface{}]interface{} shape until the loader
+	// normalizes it -- a policy that loads but cannot be sent leaves the client
+	// retrying its control connection forever. (Under yaml.v3 a string-keyed map
+	// arrives already JSON-shaped, so this particular document no longer
+	// exercises that path; the normalization stays and the assertion stays with
+	// it, because a document with a non-string key still produces the shape.)
 	if _, err := json.Marshal(tp); err != nil {
 		t.Fatalf("the loaded policy cannot go over the control channel: %v", err)
 	}
@@ -507,15 +596,16 @@ func TestEmptyTrafficPolicyIsNormalizedToNil(t *testing.T) {
 
 // TestNestedNgrokRuleShapeIsRejected pins what happens to ngrok's own rule
 // shape, which this build does not implement: a rule whose actions are nested
-// has no action name of its own, and yaml.v1 silently drops the key it does not
-// know. The load failure is the point -- the shape must not load as something
-// that enforces less than its author read into it.
+// has no action name of its own, and the decoder silently drops the key the
+// struct does not have. The load failure is the point -- the shape must not load
+// as something that enforces less than its author read into it.
 //
 // It is only a partial guard, and the limitation is worth stating where the test
-// is: yaml.v1 has no strict mode, so a nested rule that happens to *be* named
-// after a real action ("- name: deny" with "actions:" under it) decodes as
-// that action with no conditions. That shape is not caught here; see the
-// changelog's parity notes.
+// is: the loader does not decode strictly (yaml.v3 has a KnownFields mode and
+// this build does not turn it on, as yaml.v1 had no equivalent), so a nested rule
+// that happens to *be* named after a real action ("- name: deny" with "actions:"
+// under it) decodes as that action with no conditions. That shape is not caught
+// here; see the changelog's parity notes.
 func TestNestedNgrokRuleShapeIsRejected(t *testing.T) {
 	configPath := writeConfig(t, tunnelYAML(
 		"    traffic_policy:",
@@ -750,10 +840,10 @@ tunnels:
 // server never sees, which looks exactly like a policy that does nothing.
 //
 // The policy is loaded from a config file rather than built here, and that is
-// the substance of the test, not a convenience: yaml.v1 decodes a nested map
-// into map[interface{}]interface{}, which encoding/json cannot marshal at all,
-// so a struct built in Go would test a path no user takes. The e2e run is what
-// found the difference; this is the unit-level guard for it.
+// the substance of the test, not a convenience: the YAML decoder can hand back a
+// nested map as map[interface{}]interface{}, which encoding/json cannot marshal
+// at all, so a struct built in Go would test a path no user takes. The e2e run is
+// what found the difference; this is the unit-level guard for it.
 func TestReqTunnelCarriesTrafficPolicyOverTheWire(t *testing.T) {
 	configPath := writeConfig(t, wireTunnelYAML)
 

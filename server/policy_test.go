@@ -806,7 +806,7 @@ func TestPolicyAcrossForwardToEndpoint(t *testing.T) {
 		armHTTPAgent(t, ctl)
 
 		internal := registerTestTunnel(t, ctl, msg.ReqTunnel{
-			Protocol: "http", Binding: BindingInternal, Hostname: "svc.internal",
+			Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.internal",
 			TrafficPolicy: &policy.TrafficPolicy{OnHTTPRequest: []*policy.Action{
 				policyActionConfig("add-headers", map[string]interface{}{
 					"headers": map[string]interface{}{"X-Internal": "added"},
@@ -830,7 +830,7 @@ func TestPolicyAcrossForwardToEndpoint(t *testing.T) {
 		agent := armHTTPAgent(t, ctl)
 
 		internal := registerTestTunnel(t, ctl, msg.ReqTunnel{
-			Protocol: "http", Binding: BindingInternal, Hostname: "svc.internal",
+			Protocol: "http", Binding: msg.BindingInternal, Hostname: "svc.internal",
 			TrafficPolicy: &policy.TrafficPolicy{OnHTTPRequest: []*policy.Action{policyAction("deny")}},
 		})
 		registerTestTunnel(t, ctl, msg.ReqTunnel{

@@ -1,4 +1,161 @@
 # Changelog
+## 1.0.6 - 2026-09-27 - Security hardening release
+
+A hardening pass over ngrokd, the agent and the policy engine, from a fuzzing
+and review report against the 1.0.5 tree. Nothing in the feature set changed:
+this release is about what a hostile or merely malformed peer can make the
+server do.
+
+**Upgrade the client and the server together.** The proxy and mux paths now
+require the session secret the server hands out at authentication, so a 1.0.6
+server refuses an older client's proxy connections rather than serving them
+unauthenticated. An old server ignores the new field, so a 1.0.6 client talking
+to one is not refused -- it just does not get the protection. Mixed deployments
+therefore either fail (old client, new server) or are silently unprotected (new
+client, old server), and there is no version of this that is safe to run half
+upgraded on those paths.
+
+### Server
+
+- **Session secret authentication on the proxy and mux paths.** The Auth
+  response now carries a per-session secret, and `RegProxy` / `RegMux` have to
+  present it; the comparison is constant time. A client id alone -- which is
+  public, it is the tunnel's own id -- is no longer enough to register a proxy
+  connection or a mux session. See the upgrade note above.
+- **Pooled endpoints enforce ownership.** A client can only join the pooling
+  bucket for its own endpoints; the bucket key is scoped to the owning
+  registration, so a name collision cannot put a stranger's traffic on your
+  agent.
+- **The `.internal` namespace is enforced server-side.** A public request for an
+  internal hostname is a miss by construction: internal endpoints resolve only
+  through the `forward_to` chain, and the lookup is namespaced by owner.
+- **Public request heads are bounded.** The head on a public HTTP connection is
+  read by a bounded parser (64 KiB cap, per head and per line) that answers
+  `431` past the cap instead of growing with the request, and it refuses while
+  routing -- before an agent is asked for a proxy connection. The cap is the
+  reader's buffer, so neither one enormous header line nor a great many ordinary
+  ones can make the edge hold more than that.
+- **A head goes out declaring one framing, not two.** A message carrying both
+  `Transfer-Encoding: chunked` and a `Content-Length` is a request-smuggling
+  shape -- two disagreeing statements of where the body ends, and the next hop
+  is free to believe the other one -- so the Content-Length is dropped from the
+  emitted head in both directions, per RFC 7230 §3.3.3 ("a sender MUST NOT send
+  a Content-Length header field in any message that contains a
+  Transfer-Encoding header field"). The test is the chunked *token*, not the
+  presence of the field: a Transfer-Encoding this build cannot frame with keeps
+  the Content-Length that describes the bytes actually copied.
+- **Terminate and park are atomic and generation-keyed.** A connection that is
+  terminated while it is parked can no longer be handed a response generated for
+  a previous occupant of the same slot, and a park/terminate race can no longer
+  lose a wake-up. The synthetic responses the edge writes itself (`404`, `431`,
+  `502`, policy answers) carry the generation of the connection they were built
+  for, so a pipelined or recycled connection cannot be served the wrong one.
+- **The `404` for an unknown host escapes the Host value and sets a
+  Content-Type.** The hostname is echoed back, so it is escaped now, and the
+  response is served as text.
+- **Token checks run before version negotiation**, so an unauthenticated peer
+  cannot use the handshake as an oracle for which versions this build speaks.
+- **Affinity cache files are written `0600`.** The cache holds the mapping from
+  a client to its assigned server; it is now created with the permission a file
+  that describes other people's sessions deserves, and an existing file is
+  re-`chmod`ed on the next rewrite rather than left as it was found.
+- **The server's config file is decoded strictly.** A key the server does not
+  know -- `auth_toknes`, a rate limit nested one level too deep -- fails the
+  load instead of being discarded, so a misspelling cannot silently leave the
+  server unprotected.
+
+### Policy
+
+- **The CEL environment is strict.** A policy that references a variable this
+  build does not declare is a load error instead of a rule that evaluates
+  differently than it reads.
+- **Header values with CR or LF are refused at load**, as are unknown
+  `add-headers` config fields. A policy that cannot be enforced as written is a
+  load error, not a rule that quietly skips.
+- **A policy is capped at 1000 actions**, so a document cannot turn the request
+  path into an unbounded compile.
+- **An unparseable request head is refused, not forwarded, when a request hook
+  is armed.** A request-phase action is handed a parsed request, so a head the
+  rewriter cannot parse -- past the 64 KiB read limit, or malformed (a folded
+  continuation line, a field line without a colon, a field name that is not a
+  token) -- is a request whose rules cannot be evaluated at all; the old answer
+  was fail-open (forward the bytes unrewritten), which let anyone who could pad
+  a head past the limit, or add one folded header line, choose to be subject to
+  no policy. With a request hook armed the connection now gets a `431`, the
+  origin sees none of it, and the refusal is sticky for the connection, so a
+  well-formed request pipelined behind the refused one is not forwarded either.
+  Without a hook the old fail-open contract stands byte for byte; the response
+  direction is untouched (see the known limitations).
+- **Validation messages are deterministic.** The list of actions a phase
+  implements is derived from the same table the engine enforces -- sorted, not
+  hand-maintained -- so the message that tells an operator what they could have
+  written cannot go stale or vary between runs.
+- **One header-validation gate.** The rule for a legal header name, the
+  `user-agent` prohibition and the CR/LF rule existed in three copies (the
+  config loader, the rewriter and the policy validator). The loader now builds
+  the same `rewriter.Policy` it would run and validates *that*, so a tunnel
+  which loads is a tunnel the writer can write. This closes the fuzzing report's
+  R1: a value refused by the writer used to be accepted by a loader that carried
+  its own copy of the rules.
+
+### Both
+
+- **yaml.v3 instead of yaml.v1.** Flow-shaped documents now load
+  (`proto: {http: 8080}` was a parse error), and a malformed file is an error
+  message instead of a panic -- the v1 scanner read past the end of its buffer
+  and had no recovery story. The policy rule shape is unchanged and still flat;
+  see "The rule shape, and where it differs from ngrok" below for what nesting
+  does.
+- **Session secrets never appear in the log or the event stream.** Not at DEBUG,
+  not in a refusal message, not in an event payload -- there is a test that runs
+  every path that touches the secret and greps both.
+- **A config file can no longer disable the rate limits by omission.** Loading
+  any `-config` file used to reset `-authRate` and `-adminRate` to 0 (the
+  "disabled" value) even when the file did not mention them, because the
+  "unset" sentinel for an integer key was the same as the value that means
+  "off"; the limits are now only changed by a key that is actually present.
+- **The client's numeric limits reject a negative value.** A negative
+  `inspect_max_body_bytes` or `proxy_max_concurrency` used to be clamped to the
+  default in silence, so a file that asked for a limit it did not get loaded as
+  if it had asked for the default; both are load errors now, and the message
+  says to omit the key to keep the default.
+- **CI runs every package.** The workflow listed package paths explicitly and
+  had never been updated for `./rewriter` and `./policy` -- the two packages
+  these fixes live in -- so neither had a test run in CI. The test, vet and
+  `-race` steps now run `./...` with the same tags.
+
+### Known limitations
+
+- **Policy path matching is against the raw request target.** Dot-segments are
+  not normalized before a `req.url.path` expression is evaluated, so a `deny` on
+  an exact path can be stepped around by a backend (or an intermediary) that
+  normalizes `/a/../b` itself. Match the shape you actually control -- prefix or
+  parameter patterns rather than one exact path -- or normalize at the origin.
+- **An oversized response head fails open.** The 64 KiB bound and the `431` are
+  on the request head; a response head larger than the reader's cap is handed to
+  the agent rather than rejected, because the response is already being proxied
+  and there is no correct way to un-send it. A hostile upstream can therefore
+  still make an agent deal with a large response head, but it cannot make the
+  edge buffer it.
+- **A forward chain uses the entry endpoint's policy when the entry has one.**
+  An internal endpoint protected by its own policy is protected only when the
+  public endpoint that forwards to it carries no policy at all; the entry's
+  rules win rather than being merged. Keep the strict rules on the entry, or
+  leave the entry policy-free so the target's policy applies.
+- **A request target without a Host field answers 404.** The bounded head
+  parser routes on the Host field alone, so a proxy-form target
+  (`GET http://svc.test/ HTTP/1.1` with no Host) no longer routes by the
+  target's authority the way the old parser did.
+- **A 1.0.6 client against an older server loses session resume.** The old
+  server does not return a session secret, so the client re-registers as a new
+  session on every control reconnect and its tunnel URL changes each time.
+  Mixed deployments are unsupported on the proxy paths either way -- upgrade
+  together.
+- **The public-leg head buffer is 64 KiB per connection, and the per-IP rate
+  limits are off by default.** A hostile client can still hold 64 KiB per
+  connection at the edge; `-publicRate` and `-maxConnPerIP` remain 0 (disabled)
+  until an operator sets them. Public deployments should set both.
+
 ## 1.0.5 - 2026-09-27 - Traffic policy engine (server-side): restrict-ips, deny, custom-response, header and log actions
 
 A tunnel can now carry a **traffic policy**: rules that ngrokd evaluates against
@@ -85,26 +242,36 @@ same level:
 
 ngrok nests instead -- a rule is a name plus an `actions:` list of
 `{type, config}`. **This build cannot read that shape, and the way it fails
-matters.** The YAML decoder here is yaml.v1, which has no strict mode: keys it
-does not know about are dropped in silence. An unnamed nested rule therefore
-fails loudly (`on_http_request[0]: action has no name`), but a nested rule that
-*is* named after a real action -- `- name: deny` with an `actions:` list under it
--- decodes as that action with no conditions and no config, i.e. as a rule that
-applies to everything. An ngrok policy pasted into this build can end up
-denying all traffic. Keep the flat form; do not nest.
+matters.** The document is decoded into a struct that has fields for `name`,
+`expressions` and `config` and no field for a nested action list, and the
+decoder is not in strict mode (`yaml.Unmarshal`, not a `Decoder` with
+`KnownFields(true)`), so a key the struct does not have -- `actions:` included --
+is dropped in silence. An unnamed nested rule therefore fails loudly
+(`on_http_request[0]: action has no name`), but a nested rule that *is* named
+after a real action -- `- name: deny` with an `actions:` list under it -- decodes
+as that action with no conditions and no config, i.e. as a rule that applies to
+everything. An ngrok policy pasted into this build can end up denying all
+traffic. Keep the flat form; do not nest.
+
+The yaml.v1-to-yaml.v3 parser swap changed one thing here, and only one: the
+nested spelling is no longer a *parse* problem (it never was), so nothing about
+it changed. What did change is flow syntax, which is now accepted where v1
+rejected it -- `proto: {http: 8080}` used to fail to parse at all
+(`found unexpected ':'`, a colon inside a plain scalar in a flow mapping) and
+now decodes to the same map the block form does. The other two shapes in the
+worked example this cluster was specified with are still refused, each for its
+own reason. `headers: {"X-Policy: checked"}` is read by both parsers as a flow
+mapping with one key and a null value, i.e. a set entry, and then rejected
+(`"X-Policy: checked" is not a valid header name`); `vars: {who: policy}` is
+rejected because `vars` must be a list of one-entry maps
+(`config field "vars" must be a list of one-entry maps, got an object`). The
+example above, and the one in the e2e script, is the shape that works.
 
 Per-action config field names mirror ngrok (`headers` as a name-to-value object
 for `add-headers`, as a list of names for `remove-headers`, `vars` as a list of
 one-entry maps for `set-vars`, `metadata` as an object for `log`, `status_code`,
 `body`, `allow`/`deny`/`enforce` for `restrict-ips`), so a policy migrated from
-ngrok mostly needs its envelope rewritten. Three shapes in the worked example
-this cluster was specified with do not load as written, all for the same reason
--- yaml.v1's flow-mapping rules. `proto: {http: 8080}` fails to parse at all
-(`found unexpected ':'`, a colon inside a plain scalar in a flow mapping);
-`headers: {"X-Policy: checked"}` is read as a set entry with a null value and
-then rejected (`"X-Policy: checked" is not a valid header name`); and
-`vars: {who: policy}` is rejected because `vars` must be a list of one-entry
-maps. The example above, and the one in the e2e script, is the shape that works.
+ngrok mostly needs its envelope rewritten.
 
 ### The actions, by phase
 

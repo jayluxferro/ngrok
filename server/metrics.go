@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"ngrok/conn"
 	"ngrok/log"
+	"ngrok/msg"
 	"os"
 	"time"
 )
@@ -105,10 +106,16 @@ func (m *LocalMetrics) OpenTunnel(t *Tunnel) {
 		m.otherCounter.Inc(1)
 	}
 
-	switch t.req.Protocol {
-	case "tcp":
+	switch {
+	case t.req.Protocol == msg.ProtoTCP:
 		m.tcpTunnelMeter.Mark(1)
-	case "http":
+	case msg.IsHTTP(t.req.Protocol):
+		// https counts as http traffic. It used to have no arm at all, so an
+		// https-only endpoint -- which is what "ngrok https 8080" and a config
+		// tunnel with one https leg both produce -- was counted by no tunnel
+		// meter: the meter exists to answer "how much of this server's traffic
+		// is HTTP", and where the public listener terminated TLS is not part of
+		// that question.
 		m.httpTunnelMeter.Mark(1)
 	}
 }
