@@ -48,7 +48,46 @@ type TunnelConfiguration struct {
 	HostHeader     string        `yaml:"host_header,omitempty"`
 	RequestHeader  *HeaderConfig `yaml:"request_header,omitempty"`
 	ResponseHeader *HeaderConfig `yaml:"response_header,omitempty"`
+
+	// Endpoint settings (SPEC 3.2/3.3/3.4). Binding is normalized at load time
+	// ("public" becomes the empty string the wire protocol uses) and, together
+	// with ForwardTo, validated by validateEndpointPolicy; Pooling is carried
+	// through as written.
+	Binding   string `yaml:"binding,omitempty"`
+	Pooling   bool   `yaml:"pooling,omitempty"`
+	ForwardTo string `yaml:"forward_to,omitempty"`
+
+	// Compression is a pointer because the default is on: "no compression key
+	// at all" and "compression: false" have to be distinguishable, and a plain
+	// bool cannot tell them apart. Compress reports the resolved value.
+	Compression *bool `yaml:"compression,omitempty"`
 }
+
+// Compress reports whether responses on this tunnel may be gzip-compressed
+// (SPEC 3.4). Compression defaults to on -- the ngrok v2 default -- so the key
+// only turns it off when the config says so explicitly; a nil tunnel (a lookup
+// miss) reads as the default too.
+func (t *TunnelConfiguration) Compress() bool {
+	if t == nil || t.Compression == nil {
+		return true
+	}
+
+	return *t.Compression
+}
+
+const (
+	// bindingPublic and bindingInternal are the accepted values of the binding
+	// configuration key, and of msg.ReqTunnel.Binding. The empty string is what
+	// the wire protocol uses for a public endpoint, so "public" is normalized
+	// to "" when the configuration is loaded.
+	bindingPublic   = "public"
+	bindingInternal = "internal"
+
+	// internalSuffix is the reserved namespace for internal endpoints. It
+	// mirrors server/tunnel.go's internalSuffix, which is what actually
+	// enforces it: nothing outside it can be registered as internal.
+	internalSuffix = ".internal"
+)
 
 func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	configPath := opts.config
@@ -142,6 +181,13 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
+		// Before the protocol loop: the endpoint rules are more specific than
+		// "hostname/subdomain are only valid for http/https", so a bad
+		// internal-plus-tcp combination should say that instead.
+		if err = validateEndpointPolicy(name, t); err != nil {
+			return
+		}
+
 		for k, addr := range t.Protocols {
 			tunnelName := fmt.Sprintf("for tunnel %s[%s]", name, k)
 			if t.Protocols[k], err = normalizeAddress(addr, tunnelName); err != nil {
@@ -197,6 +243,12 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			HostHeader:     opts.hostHeader,
 			RequestHeader:  newHeaderConfig(opts.requestHeaderAdd, opts.requestHeaderRemove),
 			ResponseHeader: newHeaderConfig(opts.responseHeaderAdd, opts.responseHeaderRemove),
+			Binding:        opts.binding,
+			Pooling:        opts.pooling,
+			ForwardTo:      opts.forwardTo,
+			// The flag defaults to true, so the pointer always has the value
+			// the user asked for -- there is no "unset" for a flag.
+			Compression: &opts.compression,
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -210,7 +262,11 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		}
 
 		// the synthesized tunnel never went through the config-file validation
-		// loop above, so validate what the header flags produced here
+		// loop above, so validate what the endpoint and header flags produced
+		// here
+		if err = validateEndpointPolicy("default", config.Tunnels["default"]); err != nil {
+			return
+		}
 		if err = validateHeaderPolicy("default", config.Tunnels["default"]); err != nil {
 			return
 		}
@@ -424,6 +480,160 @@ func validateNoCRLF(tunnelName, section, entry string) error {
 	}
 
 	return nil
+}
+
+// validateEndpointPolicy validates the cluster-2 endpoint settings of one
+// tunnel: the binding, the internal-namespace rules, and forward_to. Like
+// validateHeaderPolicy it is called for config-file tunnels and for the
+// CLI-synthesized "default" tunnel, so the rules live in exactly one place.
+//
+// It also normalizes: a binding of "public" (the spelling users will reach for,
+// since that is what the flag documents) becomes the empty string that
+// msg.ReqTunnel.Binding actually carries, so the server sees exactly one
+// spelling per binding. Everything else it rejects is a startup error naming
+// the tunnel and the offending value: the failure modes here (a private
+// endpoint that silently ends up public, a forward_to that could never resolve)
+// are all invisible until traffic arrives, so they are refused up front.
+func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
+	binding := strings.ToLower(strings.TrimSpace(t.Binding))
+	if binding == bindingPublic {
+		binding = ""
+	}
+	t.Binding = binding
+
+	switch binding {
+	case "":
+		// A .internal hostname registered with the public binding is a tunnel
+		// the public listener will never route to (server/http.go treats
+		// .internal hosts as misses): refuse it here rather than letting it
+		// come online and 404 by construction.
+		if strings.HasSuffix(strings.ToLower(t.Hostname), internalSuffix) {
+			return fmt.Errorf("Tunnel %s: hostname %q ends in %s, which requires binding internal (the public listener never routes %s hosts)", tunnelName, t.Hostname, internalSuffix, internalSuffix)
+		}
+	case bindingInternal:
+		if err := validateInternalEndpoint(tunnelName, t); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("Tunnel %s: invalid binding %q: must be 'public' or 'internal'", tunnelName, t.Binding)
+	}
+
+	// An internal endpoint is served by an agent, not by a public listener, so
+	// it can only be the target of an http/https forward chain. The server
+	// refuses internal TCP as well (it would have no way to reach it); this
+	// mirror of that rule turns a remote registration error into a local one
+	// that names the tunnel.
+	if binding == bindingInternal {
+		for proto := range t.Protocols {
+			if !isHttpProtocol(proto) {
+				return fmt.Errorf("Tunnel %s: binding internal is only supported for http and https tunnels, not %s", tunnelName, proto)
+			}
+		}
+	}
+
+	return validateForwardTo(tunnelName, t)
+}
+
+// validateInternalEndpoint checks the .internal namespace rules of SPEC 3.2:
+// internal endpoints are named, never assigned, so a hostname is required and
+// nothing may be derived from a subdomain or a port.
+func validateInternalEndpoint(tunnelName string, t *TunnelConfiguration) error {
+	if t.Subdomain != "" {
+		return fmt.Errorf("Tunnel %s: binding internal does not support subdomain: internal endpoints are addressed by hostname in the %s namespace",
+			tunnelName, internalSuffix)
+	}
+	if t.RemotePort != 0 {
+		return fmt.Errorf("Tunnel %s: binding internal does not support remote_port: internal endpoints are http/https only", tunnelName)
+	}
+
+	hostname := t.Hostname
+	if hostname == "" {
+		return fmt.Errorf("Tunnel %s: binding internal requires a hostname ending in %s (pass -hostname=myapp%s, or set hostname: myapp%s in the config file)",
+			tunnelName, internalSuffix, internalSuffix, internalSuffix)
+	}
+
+	// The hostname is the name other tunnels forward to, so it is checked in
+	// the exact spelling it will be registered under: the server lowercases it,
+	// and a user who wrote "Svc.Internal" would then have a forward_to that
+	// does not look like what they configured.
+	if hostname != strings.ToLower(hostname) {
+		return fmt.Errorf("Tunnel %s: internal hostname %q must be lowercase (use %q)", tunnelName, hostname, strings.ToLower(hostname))
+	}
+	if !strings.HasSuffix(hostname, internalSuffix) {
+		return fmt.Errorf("Tunnel %s: internal hostname %q must end in %s (for example \"myapp%s\")", tunnelName, hostname, internalSuffix, internalSuffix)
+	}
+	if len(hostname) == len(internalSuffix) {
+		return fmt.Errorf("Tunnel %s: internal hostname %q needs a name in front of %s (for example \"myapp%s\")", tunnelName, hostname, internalSuffix, internalSuffix)
+	}
+	if strings.ContainsAny(hostname, " \t\r\n/") {
+		return fmt.Errorf("Tunnel %s: internal hostname %q must not contain spaces or '/'", tunnelName, hostname)
+	}
+
+	return nil
+}
+
+// validateForwardTo checks a forward_to target. It has to parse as an http or
+// https URL whose host is in the .internal namespace: the server resolves
+// forward_to against the internal registry key, which is exactly
+// "<scheme>://<hostname>" (server/tunnel.go registerInternal), so anything more
+// -- a path, a query, a port, credentials -- could never resolve and would only
+// turn into a 502 at request time.
+//
+// The scheme is not a style choice: an internal endpoint registered with
+// -proto=https is keyed "https://svc.internal" and can only be forwarded to
+// with that spelling, so a typo here is a 502, not a redirect.
+func validateForwardTo(tunnelName string, t *TunnelConfiguration) error {
+	forwardTo := t.ForwardTo
+	if forwardTo == "" {
+		return nil
+	}
+
+	u, err := url.Parse(forwardTo)
+	if err != nil {
+		return fmt.Errorf("Tunnel %s: invalid forward_to %q: %v", tunnelName, forwardTo, err)
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("Tunnel %s: forward_to %q must be an http:// or https:// url pointing at an internal endpoint (for example \"https://myapp%s\")",
+			tunnelName, forwardTo, internalSuffix)
+	}
+	if u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return fmt.Errorf("Tunnel %s: forward_to %q must be only the internal endpoint url, with no path, query or fragment (for example \"https://myapp%s\")",
+			tunnelName, forwardTo, internalSuffix)
+	}
+	if u.Port() != "" {
+		return fmt.Errorf("Tunnel %s: forward_to %q must not carry a port: internal endpoints are addressed by name (for example \"https://myapp%s\")",
+			tunnelName, forwardTo, internalSuffix)
+	}
+
+	hostname := u.Hostname()
+	if !strings.HasSuffix(hostname, internalSuffix) || len(hostname) == len(internalSuffix) {
+		return fmt.Errorf("Tunnel %s: forward_to %q must point at an internal endpoint whose hostname ends in %s (for example \"https://myapp%s\")",
+			tunnelName, forwardTo, internalSuffix, internalSuffix)
+	}
+
+	// A forward chain out of a TCP tunnel could never resolve: internal
+	// endpoints are http/https only. The server refuses this too.
+	for proto := range t.Protocols {
+		if !isHttpProtocol(proto) {
+			return fmt.Errorf("Tunnel %s: forward_to is only supported for http and https tunnels, not %s", tunnelName, proto)
+		}
+	}
+
+	return nil
+}
+
+// isHttpProtocol reports whether a protocol key (as written in the config's
+// proto section, so possibly a "+"-joined combination) is one this client
+// serves over HTTP.
+func isHttpProtocol(proto string) bool {
+	for _, p := range strings.Split(proto, "+") {
+		if p != "http" && p != "https" {
+			return false
+		}
+	}
+
+	return true
 }
 
 func SaveAuthToken(configPath, authtoken string) (err error) {

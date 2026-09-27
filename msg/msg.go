@@ -75,6 +75,20 @@ type ReqTunnel struct {
 
 	// tcp only
 	RemotePort uint16
+
+	// Binding selects the kind of endpoint to create. "" (the zero value, so
+	// old clients keep working) is a public endpoint reachable through the
+	// public listeners; "internal" is a private endpoint that only forward_to
+	// from an endpoint of the same account can reach.
+	Binding string
+
+	// Pooling allows several agents to register the same url and share the
+	// traffic between them, round-robin per connection.
+	Pooling bool
+
+	// ForwardTo routes this endpoint's traffic to an internal endpoint
+	// ("https://svc.internal") instead of to this client's own upstream.
+	ForwardTo string
 }
 
 // When the server opens a new tunnel on behalf of

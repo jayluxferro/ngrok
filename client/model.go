@@ -16,6 +16,7 @@ import (
 	"ngrok/util"
 	"ngrok/version"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -297,20 +298,7 @@ func (c *ClientModel) control() {
 	// request tunnels
 	reqIdToTunnelConfig := make(map[string]*TunnelConfiguration)
 	for _, config := range c.tunnelConfig {
-		// create the protocol list to ask for
-		var protocols []string
-		for proto, _ := range config.Protocols {
-			protocols = append(protocols, proto)
-		}
-
-		reqTunnel := &msg.ReqTunnel{
-			ReqId:      util.RandId(8),
-			Protocol:   strings.Join(protocols, "+"),
-			Hostname:   config.Hostname,
-			Subdomain:  config.Subdomain,
-			HttpAuth:   config.HttpAuth,
-			RemotePort: config.RemotePort,
-		}
+		reqTunnel := reqTunnelFromConfig(util.RandId(8), config)
 
 		// send the tunnel request
 		if err = msg.WriteMsg(ctlConn, reqTunnel); err != nil {
@@ -348,26 +336,12 @@ func (c *ClientModel) control() {
 				continue
 			}
 
-			// The tunnel carries its header policy from here on: this is the
-			// last point at which the config that requested the tunnel is
-			// still reachable, and by the time a proxied connection arrives
-			// proxy() has nothing but the tunnel itself (found by public URL).
+			// The tunnel carries its config from here on: this is the last
+			// point at which the config that requested the tunnel is still
+			// reachable, and by the time a proxied connection arrives proxy()
+			// has nothing but the tunnel itself (found by public URL).
 			tunnelCfg := reqIdToTunnelConfig[m.ReqId]
-			requestHeaderAdd, requestHeaderRemove := flattenHeaderConfig(tunnelCfg.RequestHeader)
-			responseHeaderAdd, responseHeaderRemove := flattenHeaderConfig(tunnelCfg.ResponseHeader)
-
-			tunnel := mvc.Tunnel{
-				PublicUrl: m.Url,
-				LocalAddr: tunnelCfg.Protocols[m.Protocol],
-				Protocol:  c.protoMap[m.Protocol],
-
-				HostHeader: tunnelCfg.HostHeader,
-
-				RequestHeaderAdd:     requestHeaderAdd,
-				RequestHeaderRemove:  requestHeaderRemove,
-				ResponseHeaderAdd:    responseHeaderAdd,
-				ResponseHeaderRemove: responseHeaderRemove,
-			}
+			tunnel := tunnelFromConfig(m.Url, m.Protocol, c.protoMap[m.Protocol], tunnelCfg)
 
 			c.tunnelsMu.Lock()
 			c.tunnels[tunnel.PublicUrl] = tunnel
@@ -379,6 +353,73 @@ func (c *ClientModel) control() {
 		default:
 			ctlConn.Warn("Ignoring unknown control message %v ", m)
 		}
+	}
+}
+
+// reqTunnelFromConfig builds the ReqTunnel that asks the server for one
+// configured tunnel (SPEC 3.5), carrying the endpoint settings added by
+// cluster 2 -- binding, pooling and forward_to -- along with the fields the
+// client has always sent. It is split out of control() so that the request,
+// which is otherwise only observable over a live control connection, can be
+// asserted on directly.
+//
+// The protocol list is sorted rather than left in map order: a config tunnel
+// with an http and an https leg used to ask for "http+https" or "https+http"
+// at random, which made the request (and any test of it) unreproducible for no
+// reason. The set of protocols is unchanged, and the set is all the server
+// looks at -- it splits the field on "+" (server/control.go).
+func reqTunnelFromConfig(reqId string, config *TunnelConfiguration) *msg.ReqTunnel {
+	protocols := make([]string, 0, len(config.Protocols))
+	for proto := range config.Protocols {
+		protocols = append(protocols, proto)
+	}
+	sort.Strings(protocols)
+
+	return &msg.ReqTunnel{
+		ReqId:      reqId,
+		Protocol:   strings.Join(protocols, "+"),
+		Hostname:   config.Hostname,
+		Subdomain:  config.Subdomain,
+		HttpAuth:   config.HttpAuth,
+		RemotePort: config.RemotePort,
+
+		Binding:   config.Binding,
+		Pooling:   config.Pooling,
+		ForwardTo: config.ForwardTo,
+	}
+}
+
+// tunnelFromConfig builds the mvc.Tunnel the client works with for a tunnel the
+// server just established. Like reqTunnelFromConfig it is split out of
+// control() so the mapping from configuration to tunnel -- which header
+// settings get flattened, which endpoint settings get carried, and the fact
+// that Compress is the resolved value of a key that defaults to on -- can be
+// tested without a control channel.
+//
+// publicUrl and protocolName are what the server reported (msg.NewTunnel.Url
+// and .Protocol). The proto.Protocol is passed in already resolved, because the
+// map from a protocol name to a proto.Protocol belongs to the ClientModel and
+// not to the tunnel.
+func tunnelFromConfig(publicUrl, protocolName string, protocol proto.Protocol, config *TunnelConfiguration) mvc.Tunnel {
+	requestHeaderAdd, requestHeaderRemove := flattenHeaderConfig(config.RequestHeader)
+	responseHeaderAdd, responseHeaderRemove := flattenHeaderConfig(config.ResponseHeader)
+
+	return mvc.Tunnel{
+		PublicUrl: publicUrl,
+		LocalAddr: config.Protocols[protocolName],
+		Protocol:  protocol,
+
+		HostHeader: config.HostHeader,
+
+		RequestHeaderAdd:     requestHeaderAdd,
+		RequestHeaderRemove:  requestHeaderRemove,
+		ResponseHeaderAdd:    responseHeaderAdd,
+		ResponseHeaderRemove: responseHeaderRemove,
+
+		Binding:   config.Binding,
+		Pooling:   config.Pooling,
+		ForwardTo: config.ForwardTo,
+		Compress:  config.Compress(),
 	}
 }
 

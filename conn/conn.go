@@ -45,7 +45,7 @@ func wrapConn(conn net.Conn, typ string) *loggedConn {
 	case *loggedConn:
 		return c
 	case *net.TCPConn:
-		wrapped := &loggedConn{c, conn, log.NewPrefixLogger(), util.GetGlobalRand().Int31(), typ}
+		wrapped := &loggedConn{c, conn, log.NewPrefixLogger(), util.GlobalInt31(), typ}
 		wrapped.AddLogPrefix(wrapped.Id())
 		return wrapped
 	}

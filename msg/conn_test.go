@@ -21,9 +21,9 @@ func (c *testConn) Warn(string, ...interface{}) error {
 func (c *testConn) Error(string, ...interface{}) error {
 	return nil
 }
-func (c *testConn) Id() string          { return "test" }
-func (c *testConn) SetType(string)      {}
-func (c *testConn) CloseRead() error    { return nil }
+func (c *testConn) Id() string       { return "test" }
+func (c *testConn) SetType(string)   {}
+func (c *testConn) CloseRead() error { return nil }
 
 func TestReadMsgRejectsLargeFrame(t *testing.T) {
 	old := maxMessageSize
@@ -45,4 +45,3 @@ func TestReadMsgRejectsLargeFrame(t *testing.T) {
 		t.Fatalf("expected oversized frame to fail")
 	}
 }
-

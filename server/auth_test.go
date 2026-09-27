@@ -21,4 +21,3 @@ func TestTokenMatchesSHA256(t *testing.T) {
 		t.Fatalf("expected hashed token mismatch")
 	}
 }
-

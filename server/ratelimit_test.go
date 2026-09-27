@@ -36,4 +36,3 @@ func TestIPConnLimiter(t *testing.T) {
 		t.Fatalf("expected acquire to pass after release")
 	}
 }
-

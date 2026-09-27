@@ -567,3 +567,538 @@ func TestStringListFlagValue(t *testing.T) {
 		t.Fatalf("String(): expected %q, got %q", want, l.String())
 	}
 }
+
+// Tests for the cluster-2 endpoint surface (SPEC 4-C): the -binding, -pooling,
+// -forward-to and -compression flags, the equivalent per-tunnel config keys,
+// and the validation that keeps a misconfigured endpoint from failing silently
+// at request time instead of at startup.
+
+// endpointTunnelYAML builds a one-tunnel ("web") config file with the given
+// proto lines spliced in under "proto:" and extraLines spliced in as (already
+// indented) tunnel lines.
+func endpointTunnelYAML(protoLines []string, extraLines ...string) string {
+	lines := []string{
+		"tunnels:",
+		"  web:",
+		"    proto:",
+	}
+	lines = append(lines, protoLines...)
+	lines = append(lines, extraLines...)
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// The two proto sections the endpoint cases use. The http one is what
+// tunnelYAML() bakes in; the tcp one exists because the tcp cases need a tunnel
+// the endpoint settings are not valid for.
+var (
+	httpProtoLines = []string{"      http: 127.0.0.1:8080"}
+	tcpProtoLines  = []string{"      tcp: 127.0.0.1:8080"}
+)
+
+// cluster2TunnelYAML exercises every new key at once, on the two kinds of
+// tunnel that use them: an internal endpoint, and a public endpoint that
+// forwards to it.
+const cluster2TunnelYAML = `
+tunnels:
+  svc:
+    hostname: svc.internal
+    binding: internal
+    proto:
+      https: 127.0.0.1:11434
+  web:
+    hostname: web.example.com
+    proto:
+      http: 127.0.0.1:8080
+    forward_to: https://svc.internal
+    pooling: true
+    compression: false
+`
+
+func TestEndpointConfigYAMLRoundTrip(t *testing.T) {
+	config := new(Configuration)
+	if err := yaml.Unmarshal([]byte(cluster2TunnelYAML), config); err != nil {
+		t.Fatalf("failed to unmarshal endpoint config: %v", err)
+	}
+
+	svc := config.Tunnels["svc"]
+	if svc == nil {
+		t.Fatalf("expected a tunnel named svc, got %d tunnels", len(config.Tunnels))
+	}
+	if svc.Binding != "internal" {
+		t.Fatalf("binding: expected internal, got %q", svc.Binding)
+	}
+	if svc.Pooling {
+		t.Fatalf("pooling should default to off, got %v", svc.Pooling)
+	}
+	if svc.ForwardTo != "" {
+		t.Fatalf("forward_to should default to empty, got %q", svc.ForwardTo)
+	}
+	// The compression key is absent here and the default is on (SPEC 3.4), so
+	// this is the case that has to distinguish "not configured" from "false".
+	if svc.Compression != nil {
+		t.Fatalf("an absent compression key should stay nil, got %v", *svc.Compression)
+	}
+	if !svc.Compress() {
+		t.Fatal("compression should default to on")
+	}
+
+	web := config.Tunnels["web"]
+	if web.Binding != "" {
+		t.Fatalf("an absent binding should stay empty, got %q", web.Binding)
+	}
+	if !web.Pooling {
+		t.Fatal("pooling: true did not survive unmarshaling")
+	}
+	if web.ForwardTo != "https://svc.internal" {
+		t.Fatalf("forward_to: expected https://svc.internal, got %q", web.ForwardTo)
+	}
+	if web.Compression == nil || *web.Compression {
+		t.Fatalf("compression: false did not survive unmarshaling: %v", web.Compression)
+	}
+	if web.Compress() {
+		t.Fatal("an explicit compression: false must resolve to off")
+	}
+
+	// The keys also have to survive a marshal/unmarshal cycle: SaveAuthToken
+	// rewrites the config file through yaml.Marshal.
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	for _, key := range []string{"binding: internal", "forward_to: https://svc.internal", "pooling: true", "compression: false"} {
+		if !strings.Contains(string(marshaled), key) {
+			t.Fatalf("marshaled config is missing %q:\n%s", key, marshaled)
+		}
+	}
+
+	reloaded := new(Configuration)
+	if err := yaml.Unmarshal(marshaled, reloaded); err != nil {
+		t.Fatalf("failed to re-unmarshal marshaled config: %v", err)
+	}
+	if again := reloaded.Tunnels["svc"]; !reflect.DeepEqual(svc, again) {
+		t.Fatalf("round trip changed the internal tunnel:\n before: %+v\nafter: %+v", svc, again)
+	}
+	if again := reloaded.Tunnels["web"]; !reflect.DeepEqual(web, again) {
+		t.Fatalf("round trip changed the forwarding tunnel:\n before: %+v\nafter: %+v", web, again)
+	}
+}
+
+// TestYAMLWithoutEndpointKeysRoundTrip is the other half: a config that says
+// nothing about endpoints must not grow any of the new keys when it is
+// re-marshaled (they are all omitempty), and must still read as
+// compression-on.
+func TestYAMLWithoutEndpointKeysRoundTrip(t *testing.T) {
+	config := new(Configuration)
+	if err := yaml.Unmarshal([]byte(tunnelYAML()), config); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	for _, key := range []string{"binding", "pooling", "forward_to", "compression"} {
+		if strings.Contains(string(marshaled), key) {
+			t.Fatalf("no endpoint keys should be emitted when none were configured (%q appeared):\n%s", key, marshaled)
+		}
+	}
+
+	reloaded := new(Configuration)
+	if err := yaml.Unmarshal(marshaled, reloaded); err != nil {
+		t.Fatalf("failed to re-unmarshal marshaled config: %v", err)
+	}
+	tunnel := reloaded.Tunnels["web"]
+	if tunnel.Binding != "" || tunnel.Pooling || tunnel.ForwardTo != "" {
+		t.Fatalf("expected no endpoint settings, got %+v", tunnel)
+	}
+	if !tunnel.Compress() {
+		t.Fatal("a config with no compression key must load with compression on")
+	}
+}
+
+// TestLoadConfigurationEndpointValidation drives the endpoint rejections
+// through the real entry point, so it also proves the validation is wired into
+// LoadConfiguration for config-file tunnels and not just available as an
+// unused helper.
+func TestLoadConfigurationEndpointValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		proto   []string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name:  "no endpoint configuration at all",
+			proto: httpProtoLines,
+		},
+		{
+			name:  "binding public is the default spelled out",
+			proto: httpProtoLines,
+			lines: []string{"    binding: public"},
+		},
+		{
+			name:  "binding internal with a hostname",
+			proto: httpProtoLines,
+			lines: []string{"    hostname: svc.internal", "    binding: internal"},
+		},
+		{
+			name:  "internal endpoint over https",
+			proto: []string{"      https: 127.0.0.1:8080"},
+			lines: []string{"    hostname: svc.internal", "    binding: internal"},
+		},
+		{
+			name:  "pooling",
+			proto: httpProtoLines,
+			lines: []string{"    pooling: true"},
+		},
+		{
+			name:  "compression off",
+			proto: httpProtoLines,
+			lines: []string{"    compression: false"},
+		},
+		{
+			name:  "forward_to to an internal endpoint",
+			proto: httpProtoLines,
+			lines: []string{"    forward_to: https://svc.internal"},
+		},
+		{
+			name:  "forward_to with a trailing slash is accepted (the server strips it)",
+			proto: httpProtoLines,
+			lines: []string{"    forward_to: https://svc.internal/"},
+		},
+		{
+			name:    "binding that is not public or internal",
+			proto:   httpProtoLines,
+			lines:   []string{"    binding: loopback"},
+			wantErr: "invalid binding",
+		},
+		{
+			name:    "internal without a hostname",
+			proto:   httpProtoLines,
+			lines:   []string{"    binding: internal"},
+			wantErr: "requires a hostname",
+		},
+		{
+			name:    "internal hostname outside the .internal namespace",
+			proto:   httpProtoLines,
+			lines:   []string{"    hostname: svc.example.com", "    binding: internal"},
+			wantErr: "must end in .internal",
+		},
+		{
+			name:    "internal hostname with uppercase letters",
+			proto:   httpProtoLines,
+			lines:   []string{"    hostname: Svc.Internal", "    binding: internal"},
+			wantErr: "must be lowercase",
+		},
+		{
+			name:    "internal with a subdomain",
+			proto:   httpProtoLines,
+			lines:   []string{"    subdomain: svc", "    hostname: svc.internal", "    binding: internal"},
+			wantErr: "does not support subdomain",
+		},
+		{
+			name:    "internal over tcp",
+			proto:   tcpProtoLines,
+			lines:   []string{"    hostname: svc.internal", "    binding: internal"},
+			wantErr: "only supported for http and https",
+		},
+		{
+			name:    "forward_to without a scheme",
+			proto:   httpProtoLines,
+			lines:   []string{"    forward_to: svc.internal"},
+			wantErr: "forward_to",
+		},
+		{
+			name:    "forward_to with a path",
+			proto:   httpProtoLines,
+			lines:   []string{"    forward_to: https://svc.internal/foo"},
+			wantErr: "forward_to",
+		},
+		{
+			name:    "forward_to with a port",
+			proto:   httpProtoLines,
+			lines:   []string{"    forward_to: https://svc.internal:443"},
+			wantErr: "forward_to",
+		},
+		{
+			name:    "forward_to to a host outside the .internal namespace",
+			proto:   httpProtoLines,
+			lines:   []string{"    forward_to: https://example.com"},
+			wantErr: "forward_to",
+		},
+		{
+			name:    "forward_to on a tcp tunnel",
+			proto:   tcpProtoLines,
+			lines:   []string{"    forward_to: https://svc.internal"},
+			wantErr: "forward_to is only supported for http and https",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, endpointTunnelYAML(tt.proto, tt.lines...))
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the config to load, got: %v", err)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("expected an error containing %q, got none", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error should mention %q, got: %v", tt.wantErr, err)
+			}
+			// Failing loudly also means saying which tunnel is at fault.
+			if !strings.Contains(err.Error(), "web") {
+				t.Fatalf("error should name the offending tunnel, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestEndpointBindingNormalization pins the one value the loader rewrites: a
+// tunnel configured with "binding: public" must go on the wire with the empty
+// binding the protocol uses for public endpoints, not with "public" (which the
+// server would refuse as an unknown binding).
+func TestEndpointBindingNormalization(t *testing.T) {
+	configPath := writeConfig(t, endpointTunnelYAML(httpProtoLines, "    binding: public"))
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if got := config.Tunnels["web"].Binding; got != "" {
+		t.Fatalf("binding: public should be normalized to the empty binding, got %q", got)
+	}
+}
+
+func TestLoadConfigurationEndpointTunnel(t *testing.T) {
+	configPath := writeConfig(t, cluster2TunnelYAML)
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"svc", "web"}})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+
+	svc := config.Tunnels["svc"]
+	if svc.Binding != "internal" || svc.Hostname != "svc.internal" {
+		t.Fatalf("internal tunnel did not survive loading: %+v", svc)
+	}
+	if !svc.Compress() {
+		t.Fatal("the internal tunnel's absent compression key should still mean on")
+	}
+
+	web := config.Tunnels["web"]
+	if web.ForwardTo != "https://svc.internal" || !web.Pooling {
+		t.Fatalf("forwarding tunnel did not survive loading: %+v", web)
+	}
+	if web.Compress() {
+		t.Fatal("compression: false did not survive loading")
+	}
+}
+
+// TestDefaultTunnelEndpointSynthesis covers the config.go wiring: the flags are
+// copied onto the tunnel that LoadConfiguration synthesizes for the simple
+// "ngrok <port>" invocation, including the compression default.
+func TestDefaultTunnelEndpointSynthesis(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	t.Run("internal endpoint", func(t *testing.T) {
+		config, err := LoadConfiguration(&Options{
+			config:      configPath,
+			command:     "default",
+			args:        []string{"8080"},
+			protocol:    "http",
+			binding:     "internal",
+			hostname:    "svc.internal",
+			pooling:     true,
+			compression: false,
+		})
+		if err != nil {
+			t.Fatalf("expected the default tunnel to load, got: %v", err)
+		}
+
+		tunnel := config.Tunnels["default"]
+		if tunnel == nil {
+			t.Fatal("expected a synthesized default tunnel")
+		}
+		if tunnel.Binding != "internal" {
+			t.Fatalf("binding: expected internal, got %q", tunnel.Binding)
+		}
+		if tunnel.Hostname != "svc.internal" {
+			t.Fatalf("hostname: expected svc.internal, got %q", tunnel.Hostname)
+		}
+		if !tunnel.Pooling {
+			t.Fatal("-pooling did not reach the synthesized tunnel")
+		}
+		if tunnel.Compress() {
+			t.Fatal("-compression=false did not reach the synthesized tunnel")
+		}
+		if tunnel.Compression == nil {
+			t.Fatal("the flag should always set an explicit compression value")
+		}
+	})
+
+	t.Run("forwarding endpoint", func(t *testing.T) {
+		config, err := LoadConfiguration(&Options{
+			config:    configPath,
+			command:   "default",
+			args:      []string{"8080"},
+			protocol:  "http",
+			forwardTo: "https://svc.internal",
+			// Options has no default of its own for this one: ParseArgs fills
+			// it from the flag, whose default is on (SPEC 3.4), which is what
+			// an invocation that passes no -compression gets.
+			compression: true,
+		})
+		if err != nil {
+			t.Fatalf("expected the default tunnel to load, got: %v", err)
+		}
+
+		tunnel := config.Tunnels["default"]
+		if tunnel.ForwardTo != "https://svc.internal" {
+			t.Fatalf("forward_to: expected https://svc.internal, got %q", tunnel.ForwardTo)
+		}
+		if tunnel.Binding != "" {
+			t.Fatalf("a forwarding tunnel is public by default, got binding %q", tunnel.Binding)
+		}
+		// No -compression=false was passed: on is what a user gets.
+		if !tunnel.Compress() {
+			t.Fatal("compression should be on for a tunnel started without -compression=false")
+		}
+	})
+}
+
+func TestDefaultTunnelEndpointSynthesisRejectsBadValues(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	tests := []struct {
+		name    string
+		opts    Options
+		wantErr string
+	}{
+		{
+			name:    "binding internal without a hostname",
+			opts:    Options{config: configPath, command: "default", args: []string{"8080"}, protocol: "http", binding: "internal"},
+			wantErr: "-hostname=myapp.internal",
+		},
+		{
+			name:    "binding internal with a hostname outside the namespace",
+			opts:    Options{config: configPath, command: "default", args: []string{"8080"}, protocol: "http", binding: "internal", hostname: "svc"},
+			wantErr: "must end in .internal",
+		},
+		{
+			name:    "binding internal over tcp",
+			opts:    Options{config: configPath, command: "default", args: []string{"22"}, protocol: "tcp", binding: "internal", hostname: "svc.internal"},
+			wantErr: "only supported for http and https",
+		},
+		{
+			name:    "unknown binding",
+			opts:    Options{config: configPath, command: "default", args: []string{"8080"}, protocol: "http", binding: "loopback"},
+			wantErr: "invalid binding",
+		},
+		{
+			name:    "malformed forward_to",
+			opts:    Options{config: configPath, command: "default", args: []string{"8080"}, protocol: "http", forwardTo: "svc.internal"},
+			wantErr: "forward_to",
+		},
+		{
+			name:    "forward_to over tcp",
+			opts:    Options{config: configPath, command: "default", args: []string{"22"}, protocol: "tcp", forwardTo: "https://svc.internal"},
+			wantErr: "forward_to is only supported for http and https",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := tt.opts
+			_, err := LoadConfiguration(&opts)
+			if err == nil {
+				t.Fatalf("expected an error containing %q, got none", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error should mention %q, got: %v", tt.wantErr, err)
+			}
+			if !strings.Contains(err.Error(), "default") {
+				t.Fatalf("error should name the default tunnel, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestEndpointFlagParsing is the core flag test: the new flags reach Options,
+// including the compression default and the -flag=value / -flag value
+// spellings.
+func TestEndpointFlagParsing(t *testing.T) {
+	opts, _ := parseArgs(t, []string{
+		"ngrok",
+		"-binding", "internal",
+		"-hostname=svc.internal",
+		"-pooling",
+		"-forward-to=https://other.internal",
+		"-compression=false",
+		"8080",
+	})
+
+	if opts.binding != "internal" {
+		t.Fatalf("binding: expected internal, got %q", opts.binding)
+	}
+	if opts.hostname != "svc.internal" {
+		t.Fatalf("hostname: expected svc.internal, got %q", opts.hostname)
+	}
+	if !opts.pooling {
+		t.Fatal("-pooling did not reach the options")
+	}
+	if opts.forwardTo != "https://other.internal" {
+		t.Fatalf("forward_to: expected https://other.internal, got %q", opts.forwardTo)
+	}
+	if opts.compression {
+		t.Fatal("-compression=false did not reach the options")
+	}
+	if opts.command != "default" || len(opts.args) != 1 || opts.args[0] != "8080" {
+		t.Fatalf("positional argument handling changed: command=%q args=%v", opts.command, opts.args)
+	}
+}
+
+// TestEndpointFlagParsingDefaults guards the other direction: without the
+// flags, pooling is off and compression is on.
+func TestEndpointFlagParsingDefaults(t *testing.T) {
+	opts, _ := parseArgs(t, []string{"ngrok", "8080"})
+
+	if opts.binding != "" {
+		t.Fatalf("binding should default to empty, got %q", opts.binding)
+	}
+	if opts.pooling {
+		t.Fatal("pooling should default to off")
+	}
+	if opts.forwardTo != "" {
+		t.Fatalf("forward_to should default to empty, got %q", opts.forwardTo)
+	}
+	if !opts.compression {
+		t.Fatal("compression should default to on (SPEC 3.4)")
+	}
+}
+
+// TestEndpointFlagsAreRegistered checks the flags exist and carry help text: a
+// flag nobody can discover in the usage output is as good as missing.
+func TestEndpointFlagsAreRegistered(t *testing.T) {
+	_, usage := parseArgs(t, []string{"ngrok", "8080"})
+
+	for _, name := range []string{"binding", "pooling", "forward-to", "compression"} {
+		if !strings.Contains(usage, "-"+name) {
+			t.Fatalf("flag -%s is missing from the usage output:\n%s", name, usage)
+		}
+	}
+
+	if !strings.Contains(usage, "internal") || !strings.Contains(usage, ".internal") {
+		t.Fatalf("usage output should explain internal endpoints:\n%s", usage)
+	}
+	if !strings.Contains(usage, "round-robin") {
+		t.Fatalf("usage output should explain pooling:\n%s", usage)
+	}
+}

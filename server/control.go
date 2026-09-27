@@ -61,6 +61,27 @@ type Control struct {
 	shutdown *util.Shutdown
 }
 
+// ownerOf returns the account identity of a control connection, which is what
+// namespaces internal endpoints and scopes forward_to resolution (SPEC 3.1).
+//
+// This fork has no account objects: when the server is started with
+// -authToken, the validated auth token IS the identity. Without tokens
+// configured every client shares the "default" namespace, which is a
+// documented limitation rather than a security boundary.
+func ownerOf(ctl *Control) string {
+	if ctl == nil || ctl.auth == nil {
+		return defaultOwner
+	}
+	if len(opts.authTokens) == 0 {
+		return defaultOwner
+	}
+	owner := strings.TrimSpace(ctl.auth.User)
+	if owner == "" {
+		return defaultOwner
+	}
+	return owner
+}
+
 func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	var err error
 	atomic.AddInt64(&controlConnCount, 1)

@@ -30,7 +30,10 @@ func InitGlobalRand(seed int64) {
 	})
 }
 
-// GetGlobalRand returns the global random number generator
+// GetGlobalRand returns the global random number generator. Callers that need
+// a random value should use GlobalInt31/GlobalUint32 instead: the generator is
+// shared across connections, and math/rand.Rand is not safe for concurrent
+// use, so reads must happen under the lock.
 func GetGlobalRand() *mrand.Rand {
 	randMutex.Lock()
 	defer randMutex.Unlock()
@@ -43,15 +46,36 @@ func GetGlobalRand() *mrand.Rand {
 	return globalRand
 }
 
+// GlobalInt31 returns a random int31 from the shared generator, locked.
+func GlobalInt31() int32 {
+	randMutex.Lock()
+	defer randMutex.Unlock()
+	if globalRand == nil {
+		seed, _ := RandomSeed()
+		initGlobalRand(seed)
+	}
+	return globalRand.Int31()
+}
+
+// GlobalUint32 returns a random uint32 from the shared generator, locked.
+func GlobalUint32() uint32 {
+	randMutex.Lock()
+	defer randMutex.Unlock()
+	if globalRand == nil {
+		seed, _ := RandomSeed()
+		initGlobalRand(seed)
+	}
+	return globalRand.Uint32()
+}
+
 // creates a random identifier of the specified length
 func RandId(idlen int) string {
 	b := make([]byte, idlen)
 	var randVal uint32
-	gr := GetGlobalRand()
 	for i := 0; i < idlen; i++ {
 		byteIdx := i % 4
 		if byteIdx == 0 {
-			randVal = gr.Uint32()
+			randVal = GlobalUint32()
 		}
 		b[i] = byte((randVal >> (8 * uint(byteIdx))) & 0xFF)
 	}

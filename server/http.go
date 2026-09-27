@@ -31,7 +31,24 @@ Content-Length: 12
 
 Bad Request
 `
+
+	BadGateway = `HTTP/1.0 502 Bad Gateway
+Content-Length: %d
+
+%s`
 )
+
+// respondBadGateway refuses a public connection whose forward_to chain cannot
+// be resolved (SPEC 3.3): the target is offline, the chain loops, or it is
+// longer than we follow. The reason travels to the client verbatim and is
+// logged at the edge, so a broken chain is never a silent 404 or a dropped
+// connection.
+func respondBadGateway(c conn.Conn, err error) {
+	c.Warn("Refusing connection: %v", err)
+
+	body := fmt.Sprintf("Bad Gateway: %v\n", err)
+	c.Write([]byte(fmt.Sprintf(BadGateway, len(body), body)))
+}
 
 // Listens for new http(s) connections from the public internet
 func startHttpListener(addr string, tlsCfg *tls.Config) (listener *conn.Listener) {
@@ -112,7 +129,13 @@ func httpHandler(c conn.Conn, proto string) {
 	c.Debug("Found hostname %s in request", host)
 	tunnel := tunnelRegistry.Get(fmt.Sprintf("%s://%s", proto, host))
 	if tunnel == nil {
-		c.Info("No tunnel found for hostname %s", host)
+		if strings.HasSuffix(host, internalSuffix) {
+			// Internal endpoints live under an owner-namespaced key, so a
+			// public lookup of one is a miss by construction (SPEC 3.2)
+			c.Info("No public tunnel for internal hostname %s; internal endpoints are only reachable through forward_to", host)
+		} else {
+			c.Info("No tunnel found for hostname %s", host)
+		}
 		c.Write([]byte(fmt.Sprintf(NotFound, len(host)+18, host)))
 		return
 	}
@@ -129,6 +152,18 @@ func httpHandler(c conn.Conn, proto string) {
 	// dead connections will now be handled by tunnel heartbeating and the client
 	c.SetDeadline(time.Time{})
 
+	// Follow the forward_to chain, if this endpoint has one, and serve the
+	// connection through whichever tunnel terminates the chain. The public
+	// client's address rides along untouched, so X-Forwarded-For stays
+	// truthful, and the forwarding endpoint's own agent never sees this
+	// connection (SPEC 3.3). Only HTTP is wired: internal TCP endpoints do
+	// not exist in this cluster, so a TCP chain could never resolve.
+	target, err := tunnelRegistry.ResolveForward(tunnel)
+	if err != nil {
+		respondBadGateway(c, err)
+		return
+	}
+
 	// let the tunnel handle the connection now
-	tunnel.HandlePublicConnection(c)
+	target.HandlePublicConnection(c)
 }

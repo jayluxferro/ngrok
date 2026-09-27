@@ -2,16 +2,42 @@ package server
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"net"
 	"ngrok/cache"
 	"ngrok/log"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	cacheSaveInterval time.Duration = 10 * time.Minute
+
+	// BindingPublic / BindingInternal are the accepted values of
+	// msg.ReqTunnel.Binding (SPEC 3.5). The zero value is public so that
+	// clients which predate the field keep behaving exactly as before.
+	BindingPublic   = ""
+	BindingInternal = "internal"
+
+	// defaultOwner is the single namespace every client shares when the server
+	// runs without -authToken (SPEC 3.1, documented limitation).
+	defaultOwner = "default"
+
+	// maxForwardDepth caps how many forward_to hops a single public connection
+	// may take before we refuse it (SPEC 3.3).
+	maxForwardDepth = 8
+)
+
+// Forward chain resolution failures. Each one is turned into an explicit 502
+// at the public edge (SPEC 3.3); the wrapped detail is what the client reads
+// in the response body and what we log.
+var (
+	errForwardTargetMissing = errors.New("forward target offline")
+	errForwardCycle         = errors.New("forward loop detected")
+	errForwardDepth         = errors.New("forward chain too deep")
 )
 
 type cacheUrl string
@@ -20,9 +46,61 @@ func (url cacheUrl) Size() int {
 	return len(url)
 }
 
+// bucket holds every tunnel registered at one url. A non-pooling url has
+// exactly one member; a pooling url has as many as there are agents that
+// registered it, and Get() hands connections out round-robin (SPEC 3.2).
+type bucket struct {
+	tunnels []*Tunnel
+	next    uint32
+	owner   string
+}
+
+// pooling reports whether this bucket accepts more members: only a bucket
+// whose members registered with Pooling may be shared.
+func (b *bucket) pooling() bool {
+	return len(b.tunnels) > 0 && b.tunnels[0].req.Pooling
+}
+
+// get returns the next member of the bucket in round-robin order.
+//
+// The caller must hold at least the registry read lock: atomic.AddUint32
+// keeps the cursor consistent between concurrent readers, but the slice
+// itself is only stable while the lock is held.
+func (b *bucket) get() *Tunnel {
+	n := uint32(len(b.tunnels))
+	if n == 0 {
+		return nil
+	}
+	return b.tunnels[(atomic.AddUint32(&b.next, 1)-1)%n]
+}
+
+// internalKey namespaces an internal endpoint by its owner (SPEC 3.2). Public
+// lookups use the bare url, so they can never see an entry stored under this
+// key: that is what makes .internal hosts unreachable from the public
+// listener, 404 exactly as an unknown host would be.
+func internalKey(url, owner string) string {
+	return url + "\x00" + owner
+}
+
+// registryKey is the key a tunnel is stored under.
+func registryKey(url string, t *Tunnel) string {
+	if t.internal() {
+		return internalKey(url, t.owner)
+	}
+	return url
+}
+
+// canonicalForwardURL normalizes a forward_to target so that chain
+// bookkeeping and internal key lookup agree on spelling differences that
+// would otherwise let a loop escape detection: case, surrounding whitespace,
+// and one trailing slash.
+func canonicalForwardURL(url string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(url)), "/")
+}
+
 // TunnelRegistry maps a tunnel URL to Tunnel structures
 type TunnelRegistry struct {
-	tunnels  map[string]*Tunnel
+	tunnels  map[string]*bucket
 	affinity *cache.LRUCache
 	log.Logger
 	sync.RWMutex
@@ -30,7 +108,7 @@ type TunnelRegistry struct {
 
 func NewTunnelRegistry(cacheSize uint64, cacheFile string) *TunnelRegistry {
 	registry := &TunnelRegistry{
-		tunnels:  make(map[string]*Tunnel),
+		tunnels:  make(map[string]*bucket),
 		affinity: cache.NewLRUCache(cacheSize),
 		Logger:   log.NewPrefixLogger("registry", "tun"),
 	}
@@ -77,15 +155,37 @@ func (r *TunnelRegistry) SaveCacheThread(path string, interval time.Duration) {
 
 // Register a tunnel with a specific url, returns an error
 // if a tunnel is already registered at that url
+//
+// v2 (SPEC 3.2): the owner and the pooling flag are read from the tunnel
+// itself (t.owner, t.req.Pooling) rather than passed as extra parameters, so
+// the signature stays compatible with every existing caller. That is the
+// equivalent of the spec's Register(url, owner, t, pooling) with a smaller
+// surface: there is exactly one way to say who owns a tunnel and whether it
+// pools.
+//
+// Conflict rules: a registration conflicts with an existing bucket unless
+// both the existing members and the newcomer are pooling.
 func (r *TunnelRegistry) Register(url string, t *Tunnel) error {
 	r.Lock()
 	defer r.Unlock()
 
-	if r.tunnels[url] != nil {
-		return fmt.Errorf("The tunnel %s is already registered.", url)
+	key := registryKey(url, t)
+
+	if b := r.tunnels[key]; b != nil {
+		if !b.pooling() {
+			return fmt.Errorf("The tunnel %s is already registered.", url)
+		}
+		if !t.req.Pooling {
+			return fmt.Errorf("The tunnel %s is already shared by pooling tunnels; enable pooling to join it.", url)
+		}
+		b.tunnels = append(b.tunnels, t)
+		return nil
 	}
 
-	r.tunnels[url] = t
+	r.tunnels[key] = &bucket{
+		tunnels: []*Tunnel{t},
+		owner:   t.owner,
+	}
 
 	return nil
 }
@@ -148,16 +248,116 @@ func (r *TunnelRegistry) RegisterRepeat(urlFn func() string, t *Tunnel) (string,
 	return "", fmt.Errorf("Failed to assign a URL after %d attempts!", maxAttempts)
 }
 
+// Del removes every tunnel registered at a public url, pooling members
+// included. Tunnel shutdown removes only itself through Remove; this is the
+// blunt instrument used for teardown and tests.
 func (r *TunnelRegistry) Del(url string) {
 	r.Lock()
 	defer r.Unlock()
 	delete(r.tunnels, url)
 }
 
+// Remove drops a single tunnel from the bucket it was registered in and
+// deletes the bucket once the last member is gone (SPEC 3.2). Removing a
+// tunnel that is no longer registered is a no-op.
+func (r *TunnelRegistry) Remove(url string, t *Tunnel) {
+	r.Lock()
+	defer r.Unlock()
+
+	key := registryKey(url, t)
+	b := r.tunnels[key]
+	if b == nil {
+		return
+	}
+
+	for i, member := range b.tunnels {
+		if member == t {
+			b.tunnels = append(b.tunnels[:i], b.tunnels[i+1:]...)
+			break
+		}
+	}
+
+	if len(b.tunnels) == 0 {
+		delete(r.tunnels, key)
+	}
+}
+
+// Get returns the tunnel registered for a public url, round-robining across
+// the members of a pooling bucket. The lookup is the bare url, exactly as
+// before pooling existed, and the owner is deliberately not part of the
+// public key: that is what keeps internal endpoints unreachable from here
+// (SPEC 3.2).
 func (r *TunnelRegistry) Get(url string) *Tunnel {
 	r.RLock()
 	defer r.RUnlock()
-	return r.tunnels[url]
+
+	b := r.tunnels[url]
+	if b == nil {
+		return nil
+	}
+	return b.get()
+}
+
+// GetInternal returns the internal endpoint registered at url by owner, or
+// nil. Internal endpoints are keyed by owner, so a different account asking
+// for the same url gets the same answer as for a url that was never
+// registered (SPEC 3.1/3.2).
+func (r *TunnelRegistry) GetInternal(url, owner string) *Tunnel {
+	r.RLock()
+	defer r.RUnlock()
+
+	b := r.tunnels[internalKey(canonicalForwardURL(url), owner)]
+	if b == nil {
+		return nil
+	}
+	return b.get()
+}
+
+// IsPooling reports whether url is currently a pooling bucket, i.e. whether
+// another tunnel may join it instead of binding a second listener (SPEC 3.2).
+func (r *TunnelRegistry) IsPooling(url string) bool {
+	r.RLock()
+	defer r.RUnlock()
+
+	b := r.tunnels[url]
+	return b != nil && b.pooling()
+}
+
+// ResolveForward walks the forward_to chain that starts at t and returns the
+// tunnel that should actually serve the connection (SPEC 3.3).
+//
+// Every hop is resolved with t's owner, so same-account forwarding only: an
+// internal endpoint owned by somebody else is indistinguishable from one that
+// does not exist. A chain that loops or runs longer than maxForwardDepth hops
+// is refused rather than followed. t itself comes back when it does not
+// forward, which is the common case and allocates nothing.
+func (r *TunnelRegistry) ResolveForward(t *Tunnel) (*Tunnel, error) {
+	owner := t.owner
+	target := canonicalForwardURL(t.forwardTo())
+	if target == "" {
+		return t, nil
+	}
+
+	visited := make(map[string]bool)
+	for hop := 0; ; hop++ {
+		if hop >= maxForwardDepth {
+			return nil, fmt.Errorf("%w: more than %d hops from %s", errForwardDepth, maxForwardDepth, t.url)
+		}
+		if visited[target] {
+			return nil, fmt.Errorf("%w: %s", errForwardCycle, target)
+		}
+		visited[target] = true
+
+		next := r.GetInternal(target, owner)
+		if next == nil {
+			return nil, fmt.Errorf("%w: %s", errForwardTargetMissing, target)
+		}
+
+		target = canonicalForwardURL(next.forwardTo())
+		if target == "" {
+			return next, nil
+		}
+	}
 }
 
 // ControlRegistry maps a client ID to Control structures

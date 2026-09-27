@@ -35,6 +35,14 @@ type Tunnel struct {
 	RequestHeaderRemove  []string
 	ResponseHeaderAdd    []string
 	ResponseHeaderRemove []string
+
+	// Endpoint settings, carried the same way and for the same reason: they
+	// come from the tunnel's configuration and are consumed by the rewrite
+	// policy (Compress) or reported to the user (the other three).
+	Binding   string // "" public, "internal"
+	Pooling   bool
+	ForwardTo string
+	Compress  bool
 }
 
 type ConnectionContext struct {

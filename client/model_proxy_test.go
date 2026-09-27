@@ -807,6 +807,27 @@ func TestPolicyFromTunnel(t *testing.T) {
 			},
 		},
 		{
+			// SPEC 3.4: the compression setting rides in the policy, and a
+			// policy that asks for it is never skippable -- the rewriter
+			// decides per response whether there is anything to compress, but
+			// it cannot make that decision for a tunnel whose flag it never
+			// saw. The cases above pin the other direction: a tunnel without
+			// Compress produces a policy with Compress false.
+			name: "compression is carried into the policy",
+			tunnel: mvc.Tunnel{
+				PublicUrl: "http://localhost:18080",
+				LocalAddr: "127.0.0.1:11434",
+				Compress:  true,
+			},
+			clientAddr: testClientAddr,
+			want: rewriter.Policy{
+				Compress:        true,
+				UpstreamHost:    "127.0.0.1",
+				ClientAddr:      testClientIP,
+				XForwardedProto: "http",
+			},
+		},
+		{
 			// No flags: still not a no-op, because 4.3's X-Forwarded injection
 			// is unconditional on http tunnels. relay() depends on this.
 			name: "no flags is still a working policy",

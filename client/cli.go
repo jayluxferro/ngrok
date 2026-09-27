@@ -18,6 +18,8 @@ Examples:
 	ngrok -subdomain=example 8080
 	ngrok -proto=tcp 22
 	ngrok -hostname="example.com" -httpauth="user:password" 10.0.0.1
+	ngrok -binding=internal -hostname=svc.internal 8080
+	ngrok -forward-to=https://svc.internal 80
 
 
 Advanced usage: ngrok [OPTIONS] <command> [command args] [...]
@@ -56,6 +58,16 @@ type Options struct {
 	requestHeaderRemove  stringList
 	responseHeaderAdd    stringList
 	responseHeaderRemove stringList
+
+	// Endpoint settings (SPEC 3.2/3.3/3.4). Like the header flags above, these
+	// only feed the "default" tunnel synthesized for the simple
+	// "ngrok <port>" invocation; config-file tunnels set the equivalent keys
+	// per tunnel. compression defaults to true, so the zero value of this
+	// struct is deliberately NOT the default for it.
+	binding     string
+	pooling     bool
+	forwardTo   string
+	compression bool
 }
 
 // stringList is a flag.Value that accumulates each occurrence of a repeatable
@@ -153,6 +165,26 @@ func ParseArgs() (opts *Options, err error) {
 		"response-header-remove",
 		"Header key to remove from responses returned to the public client. May be given multiple times to remove multiple headers. (HTTP only)")
 
+	binding := flag.String(
+		"binding",
+		"",
+		"Whether the tunnel is reachable from the public internet: 'public' (default) or 'internal'. An internal endpoint lives in the .internal namespace of your account and is only reachable from another tunnel of yours via -forward-to. (HTTP only)")
+
+	pooling := flag.Bool(
+		"pooling",
+		false,
+		"Allow several agents to register the same tunnel URL and share the traffic between them, round-robin per connection (default: false)")
+
+	forwardTo := flag.String(
+		"forward-to",
+		"",
+		"Forward this endpoint's traffic to an internal endpoint ('https://svc.internal') instead of to the local address. (HTTP only)")
+
+	compression := flag.Bool(
+		"compression",
+		true,
+		"Gzip-compress compressible responses sent to clients that accept gzip. Set -compression=false to send responses exactly as your local server wrote them. (HTTP only)")
+
 	flag.Parse()
 
 	opts = &Options{
@@ -170,6 +202,10 @@ func ParseArgs() (opts *Options, err error) {
 		requestHeaderRemove:  *requestHeaderRemove,
 		responseHeaderAdd:    *responseHeaderAdd,
 		responseHeaderRemove: *responseHeaderRemove,
+		binding:              *binding,
+		pooling:              *pooling,
+		forwardTo:            *forwardTo,
+		compression:          *compression,
 		command:              flag.Arg(0),
 	}
 

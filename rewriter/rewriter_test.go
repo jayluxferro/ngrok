@@ -1,9 +1,14 @@
 package rewriter
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -71,6 +76,101 @@ func readOnce(t *testing.T, r io.Reader) string {
 // always on (4.3), so this policy is never a no-op.
 func tunnelPolicy() *Policy {
 	return &Policy{ClientAddr: "203.0.113.7", XForwardedProto: "http"}
+}
+
+// compressPolicy is a live tunnel policy with the gzip transform on.
+func compressPolicy() *Policy {
+	return &Policy{ClientAddr: "203.0.113.7", XForwardedProto: "http", Compress: true}
+}
+
+// gzipRequest is what a browser or "curl --compressed" sends: the gzip token
+// among others, which is the case the token match has to pick out of the list.
+func gzipRequest(target string) string {
+	return "GET " + target + " HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: gzip, deflate, br\r\n\r\n"
+}
+
+// gunzipBody decompresses a body the rewriter produced. The transform's whole
+// contract is that this reproduces the upstream body byte for byte.
+func gunzipBody(t *testing.T, b []byte) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("the transformed body is not a gzip stream: %v", err)
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("decompressing the transformed body failed: %v", err)
+	}
+	return out
+}
+
+// chunkBody frames b as chunks the way an upstream would, ending with the
+// terminal chunk's size line so that a caller can add a trailer section.
+func chunkBody(b string) string {
+	return chunkBodyN(b, 200)
+}
+
+// chunkBodyN is chunkBody with an explicit chunk size, because the size decides
+// how much the transform can compress per flush (see feedGzip): the cases that
+// care about the ratio use a realistic one.
+func chunkBodyN(b string, chunk int) string {
+	var out strings.Builder
+	for len(b) > 0 {
+		n := chunk
+		if n > len(b) {
+			n = len(b)
+		}
+		fmt.Fprintf(&out, "%x\r\n%s\r\n", n, b[:n])
+		b = b[n:]
+	}
+	out.WriteString("0\r\n")
+	return out.String()
+}
+
+// httpStream reads the rewriter's output the way a real HTTP client does.
+// net/http is the arbiter of "well-formed": if it cannot read a message we
+// produced, the framing is wrong however the bytes look to a test.
+type httpStream struct {
+	t  *testing.T
+	br *bufio.Reader
+}
+
+func newHTTPStream(t *testing.T, r io.Reader) *httpStream {
+	t.Helper()
+	return &httpStream{t: t, br: bufio.NewReader(r)}
+}
+
+// next reads one response and its decoded body. Fully reading the body is what
+// advances the stream to the end of the message, so two next() calls on one
+// stream prove the messages are framed one after the other.
+func (s *httpStream) next() (*http.Response, []byte) {
+	s.t.Helper()
+	// The request is only there for ReadResponse's framing rules (a HEAD request
+	// would mean "no body"); every response in these tests is an answer to a GET.
+	req, err := http.NewRequest("GET", "http://a.example/", nil)
+	if err != nil {
+		s.t.Fatalf("building the request for ReadResponse failed: %v", err)
+	}
+	resp, err := http.ReadResponse(s.br, req)
+	if err != nil {
+		s.t.Fatalf("http.ReadResponse rejected the rewritten response: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.t.Fatalf("reading the rewritten response body failed: %v", err)
+	}
+	resp.Body.Close()
+	return resp, body
+}
+
+// done asserts the stream ended where the last message ended: a byte left over
+// here is a message that ran past its own framing.
+func (s *httpStream) done() {
+	s.t.Helper()
+	if b, err := s.br.ReadByte(); err != io.EOF {
+		s.t.Fatalf("expected the response stream to end after the last message, got byte %q (err %v)", b, err)
+	}
 }
 
 // Case 1: GET with the default host policy. Everything the client sent must
@@ -526,6 +626,10 @@ func TestCase16IsNoop(t *testing.T) {
 		{"forwarded for only", &Policy{ClientAddr: "203.0.113.7"}, false},
 		{"forwarded proto only", &Policy{XForwardedProto: "http"}, false},
 		{"tunnel policy", tunnelPolicy(), false},
+		// The gzip transform fires per response, but a policy that asks for it can
+		// never be skipped outright.
+		{"compress", &Policy{Compress: true}, false},
+		{"compress with preserve", &Policy{HostHeader: "preserve", Compress: true}, false},
 	}
 
 	for _, tc := range cases {
@@ -558,6 +662,9 @@ func TestValidate(t *testing.T) {
 		{HostHeader: "internal.local:8080"},
 		{RequestHeaderAdd: []string{"X-A: b", "X-Url: http://localhost:8080/x"}, RequestHeaderRemove: []string{"X-Secret"}},
 		{ResponseHeaderAdd: []string{"X-Served-By: ngrok"}, ResponseHeaderRemove: []string{"Server"}},
+		// Compress adds no rule: it is a bool, and the fields the transform writes
+		// are constants this package builds, not caller input.
+		{Compress: true},
 	}
 	for _, p := range valid {
 		if err := p.Validate(); err != nil {
@@ -736,4 +843,445 @@ func TestHostRewriteAddsMissingHost(t *testing.T) {
 
 	gotReq, _ := pair(t, p, in, "")
 	check(t, "request", gotReq, want)
+}
+
+// Case 17: the gzip transform's core promise. Whatever framed the upstream body
+// -- a Content-Length, chunks, chunks with a trailer section, or nothing but the
+// connection close -- the client gets one chunk-framed gzip message, and
+// decompressing it reproduces the upstream body byte for byte. net/http does the
+// parsing, so "the output is well-formed" means here exactly what it means to a
+// real client.
+func TestCase17GzipRoundTrip(t *testing.T) {
+	body := strings.Repeat("{\"token\":\"hello gzip world\"}\n", 64)
+	if len(body) < 1024 {
+		t.Fatalf("the test body is too small to be interesting: %d bytes", len(body))
+	}
+
+	cases := []struct {
+		name   string
+		respIn string
+		// keep are the head fragments that must survive byte for byte: only the
+		// fields the transform has to change may move.
+		keep []string
+	}{
+		{
+			name: "content-length framed",
+			respIn: fmt.Sprintf("HTTP/1.1 200 OK\r\nServer: ollama\r\nContent-Type: application/json\r\n"+
+				"ETag: \"v1\"\r\nContent-Length: %d\r\n\r\n%s", len(body), body),
+			keep: []string{"Server: ollama", "Content-Type: application/json"},
+		},
+		{
+			name: "chunked framed",
+			respIn: "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n" +
+				"Transfer-Encoding: chunked\r\n\r\n" + chunkBody(body) + "\r\n",
+			keep: []string{"Transfer-Encoding: chunked", "Content-Type: application/json; charset=utf-8"},
+		},
+		{
+			name: "chunked framed with a trailer section",
+			respIn: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n" +
+				chunkBody(body) + "Content-MD5: 6f5902ac237024bdd0c176cb93063dc4\r\n\r\n",
+			keep: []string{"Transfer-Encoding: chunked"},
+		},
+		{
+			name:   "close delimited",
+			respIn: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + body,
+			keep:   []string{"Connection: close"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReq, gotResp := pair(t, compressPolicy(), gzipRequest("/v1/chat"), tc.respIn)
+			if !strings.Contains(gotReq, "Accept-Encoding: gzip, deflate, br") {
+				t.Fatalf("the request side changed Accept-Encoding: %q", gotReq)
+			}
+
+			in := newHTTPStream(t, strings.NewReader(gotResp))
+			resp, encoded := in.next()
+			in.done()
+
+			check(t, "Content-Encoding", resp.Header.Get("Content-Encoding"), "gzip")
+			check(t, "Vary", resp.Header.Get("Vary"), "Accept-Encoding")
+			if got := resp.Header.Get("Content-Length"); got != "" {
+				t.Fatalf("Content-Length survived into a compressed response: %q", got)
+			}
+			if got := resp.Header.Get("ETag"); got != "" {
+				t.Fatalf("an ETag for the identity body survived into a compressed response: %q", got)
+			}
+			if got := strings.Join(resp.TransferEncoding, ","); got != "chunked" {
+				t.Fatalf("the compressed response does not declare chunked framing: %q", got)
+			}
+			check(t, "decompressed body", string(gunzipBody(t, encoded)), body)
+
+			for _, fragment := range tc.keep {
+				if !strings.Contains(gotResp, fragment) {
+					t.Fatalf("a field the transform should not touch was rewritten: %q is missing from %q", fragment, gotResp)
+				}
+			}
+			if strings.Contains(gotResp, "Content-MD5") {
+				t.Fatalf("a trailer describing the identity body was forwarded: %q", gotResp)
+			}
+			if len(encoded) >= len(body) {
+				t.Fatalf("the compressed body did not get smaller: %d >= %d bytes", len(encoded), len(body))
+			}
+		})
+	}
+
+	// Correctness does not depend on the chunk size, only the ratio does: a stream
+	// of very small chunks pays a sync flush each (see feedGzip), so this case
+	// asserts the round trip and nothing about size. An upstream that frames its
+	// body in 7-byte chunks gets a valid gzip stream that happens not to be
+	// smaller -- not a broken one.
+	t.Run("tiny chunks still round-trip", func(t *testing.T) {
+		respIn := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n" +
+			chunkBodyN(body, 7) + "\r\n"
+		_, gotResp := pair(t, compressPolicy(), gzipRequest("/x"), respIn)
+		in := newHTTPStream(t, strings.NewReader(gotResp))
+		resp, encoded := in.next()
+		in.done()
+		check(t, "Content-Encoding", resp.Header.Get("Content-Encoding"), "gzip")
+		check(t, "decompressed body", string(gunzipBody(t, encoded)), body)
+	})
+}
+
+// Case 18: the skip matrix. Each row is one reason not to compress, and the
+// response has to come out byte for byte as the upstream sent it: a compression
+// feature that perturbs a response it decided not to touch is worse than no
+// feature at all.
+func TestCase18GzipSkipMatrix(t *testing.T) {
+	big := strings.Repeat("compressible text, ", 64) // well over the 128-byte floor
+
+	jsonResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(big), big)
+
+	cases := []struct {
+		name string
+		p    *Policy
+		req  string
+		resp string
+	}{
+		{
+			name: "compress off in the policy",
+			p:    tunnelPolicy(),
+			req:  gzipRequest("/x"),
+			resp: jsonResp,
+		},
+		{
+			name: "client sent no Accept-Encoding",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.1\r\nHost: a.example\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			name: "Accept-Encoding without gzip",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: identity\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			name: "Accept-Encoding refuses gzip with q=0",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: gzip;q=0\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			name: "Accept-Encoding wildcard",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: *\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			name: "Range request",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: gzip\r\nRange: bytes=0-99\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			name: "HEAD request",
+			p:    compressPolicy(),
+			req:  "HEAD /x HTTP/1.1\r\nHost: a.example\r\nAccept-Encoding: gzip\r\n\r\n",
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4096\r\n\r\n",
+		},
+		{
+			name: "204",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.1 204 No Content\r\n\r\n",
+		},
+		{
+			name: "304",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Type: text/html\r\n\r\n",
+		},
+		{
+			name: "101",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+		},
+		{
+			name: "already encoded",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: br\r\nContent-Length: 12\r\n\r\nbr-encoded!!",
+		},
+		{
+			name: "type that does not compress",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n%s", len(big), big),
+		},
+		{
+			name: "no type at all",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(big), big),
+		},
+		{
+			name: "declared body under the floor",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"a\": \"tiny\"}",
+		},
+		{
+			name: "HTTP/1.0 client",
+			p:    compressPolicy(),
+			req:  "GET /x HTTP/1.0\r\nHost: a.example\r\nAccept-Encoding: gzip\r\n\r\n",
+			resp: jsonResp,
+		},
+		{
+			// A 1.0 head is read as close-delimited whatever its framing fields say
+			// (net/http ignores a transfer coding on a 1.0 response), so chunked
+			// output under it would be read as body bytes.
+			name: "upstream answered in HTTP/1.0",
+			p:    compressPolicy(),
+			req:  gzipRequest("/x"),
+			resp: "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(big)) + "\r\n\r\n" + big,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, gotResp := pair(t, tc.p, tc.req, tc.resp)
+			check(t, "response", gotResp, tc.resp)
+			if strings.Contains(strings.ToLower(gotResp), "content-encoding: gzip") {
+				t.Fatalf("a skipped response was gzip-encoded: %q", gotResp)
+			}
+		})
+	}
+
+	// The matrix is a skip list, not a blanket refusal: a 404 with a compressible
+	// body is a perfectly good thing to compress.
+	for _, tc := range []struct{ name, resp string }{
+		{"404 text/html", fmt.Sprintf("HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(big), big)},
+		{"200 TEXT/PLAIN", fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: TEXT/PLAIN\r\nContent-Length: %d\r\n\r\n%s", len(big), big)},
+	} {
+		t.Run("positive control: "+tc.name, func(t *testing.T) {
+			_, gotResp := pair(t, compressPolicy(), gzipRequest("/x"), tc.resp)
+			in := newHTTPStream(t, strings.NewReader(gotResp))
+			resp, encoded := in.next()
+			in.done()
+			check(t, "Content-Encoding", resp.Header.Get("Content-Encoding"), "gzip")
+			check(t, "body", string(gunzipBody(t, encoded)), big)
+		})
+	}
+
+	// The safety invariant, stated the way a regression would look: for a client
+	// that never asked for gzip, every response shape comes out byte-identical --
+	// including the ones that would otherwise be compressed.
+	t.Run("safety invariant: no Accept-Encoding, no gzip", func(t *testing.T) {
+		shapes := []struct{ name, resp string }{
+			{"content-length json", jsonResp},
+			{"chunked text", "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n" + chunkBody(big) + "\r\n"},
+			{"close-delimited html", "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + big},
+			{"svg", fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: %d\r\n\r\n%s", len(big), big)},
+		}
+		for _, shape := range shapes {
+			_, gotResp := pair(t, compressPolicy(), "GET /x HTTP/1.1\r\nHost: a.example\r\n\r\n", shape.resp)
+			check(t, shape.name, gotResp, shape.resp)
+			if strings.Contains(strings.ToLower(gotResp), "content-encoding: gzip") {
+				t.Fatalf("%s: a client that never asked for gzip was sent a gzip body: %q", shape.name, gotResp)
+			}
+		}
+	})
+}
+
+// Case 19: keep-alive. The second request on the connection says nothing about
+// gzip, so its response must be identity: Content-Length intact, no chunk framing
+// invented for it. The reads interleave in the order a live connection sees them
+// -- request 1, response 1, request 2, response 2 -- because the response side can
+// only know what request 2 asked for once request 2's head has gone through the
+// request side. Draining both requests first is the pipelined case: Case 21.
+func TestCase19GzipKeepAliveSecondRequestIsIdentity(t *testing.T) {
+	big := strings.Repeat("compress me please. ", 64)
+	small := "identity body, no gzip"
+	second := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(small), small)
+
+	// The first response is framed both ways: with a Content-Length the transform
+	// consumes a body it can count, and with chunks it has to find the end of the
+	// input message and put a terminal chunk of its own before returning to heads.
+	cases := []struct{ name, respIn string }{
+		{
+			name:   "content-length framed first response",
+			respIn: fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(big), big) + second,
+		},
+		{
+			name:   "chunk framed first response",
+			respIn: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n" + chunkBody(big) + "\r\n" + second,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqIn := gzipRequest("/one") + "GET /two HTTP/1.1\r\nHost: a.example\r\n\r\n"
+			req, resp := NewPair(strings.NewReader(reqIn), strings.NewReader(tc.respIn), compressPolicy())
+
+			if got := readOnce(t, req); !strings.HasPrefix(got, "GET /one ") {
+				t.Fatalf("expected request 1's head first, got %q", got)
+			}
+
+			in := newHTTPStream(t, resp)
+			first, firstBody := in.next()
+			check(t, "first response encoding", first.Header.Get("Content-Encoding"), "gzip")
+			check(t, "first response body", string(gunzipBody(t, firstBody)), big)
+
+			if got := readOnce(t, req); !strings.HasPrefix(got, "GET /two ") {
+				t.Fatalf("expected request 2's head, got %q", got)
+			}
+
+			secondResp, secondBody := in.next()
+			in.done()
+			if got := secondResp.Header.Get("Content-Encoding"); got != "" {
+				t.Fatalf("the second response was compressed for a request that did not ask: Content-Encoding %q", got)
+			}
+			check(t, "second response Content-Length", secondResp.Header.Get("Content-Length"), strconv.Itoa(len(small)))
+			if got := strings.Join(secondResp.TransferEncoding, ","); got != "" {
+				t.Fatalf("the identity response was re-framed: %q", got)
+			}
+			check(t, "second response body", string(secondBody), small)
+			if len(secondResp.Header.Get("Vary")) != 0 {
+				t.Fatalf("an identity response was given a Vary it never had: %q", secondResp.Header.Get("Vary"))
+			}
+		})
+	}
+}
+
+// Case 20: the gzip failure path. A compressor writing into an in-memory buffer
+// has no writer to fail, so nothing in the public path can reach this code; the
+// test drives the handler directly to pin what it promises. The bytes already
+// produced still have to reach the client, the reason is logged once, and the rest
+// of the connection is copied raw rather than parsed into garbage.
+func TestCase20GzipFailureEmitsThenGoesRaw(t *testing.T) {
+	body := strings.Repeat("x", 300)
+	respIn := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+
+	upstream := &fakeConn{id: "http:upstream"}
+	reqReader, respReader := newPair(strings.NewReader(gzipRequest("/x")), strings.NewReader(respIn),
+		compressPolicy(), upstream, upstream)
+	resp := respReader.(*streamRewriter)
+
+	// The request head goes first, exactly as it would on a live connection: the
+	// response side only knows the client accepts gzip once that head is parsed.
+	readOnce(t, reqReader.(*streamRewriter))
+
+	head := readOnce(t, resp)
+	if !strings.Contains(head, "Content-Encoding: gzip") {
+		t.Fatalf("expected a compressed head, got %q", head)
+	}
+	if resp.gz == nil {
+		t.Fatalf("the transform should be live after the head")
+	}
+
+	// Bytes the compressor already produced, then a failure it cannot have.
+	partial := "partial output"
+	if _, err := resp.gz.buf.WriteString(partial); err != nil {
+		t.Fatalf("filling the compressor's output buffer failed: %v", err)
+	}
+	resp.gzipFail(errors.New("compressor exploded"))
+
+	if resp.gz != nil || resp.phase != stRaw {
+		t.Fatalf("a failed transform must hand the connection to the raw copy (gz=%v, phase=%v)", resp.gz, resp.phase)
+	}
+	if len(upstream.warned) != 1 {
+		t.Fatalf("expected exactly one warning, got %v", upstream.warned)
+	}
+	if !strings.Contains(upstream.warned[0], "compressor exploded") {
+		t.Fatalf("the warning does not name the reason: %q", upstream.warned[0])
+	}
+
+	// What was produced goes out as a chunk, then the source is copied verbatim.
+	check(t, "produced bytes", readOnce(t, resp), fmt.Sprintf("%x\r\n%s\r\n", len(partial), partial))
+	check(t, "passthrough", drain(t, resp), body)
+	if len(upstream.warned) != 1 {
+		t.Fatalf("the failure was logged more than once: %v", upstream.warned)
+	}
+}
+
+// Case 21: pipelined requests. One connState slot describes both requests, so the
+// response side uses the newer one's preferences -- the documented limitation.
+// What matters is which way it fails: a client whose latest request did not ask
+// for gzip gets identity responses, never a compressed one, and the connection
+// stays well-formed either way.
+func TestCase21GzipPipelinedRequestsStayWellFormed(t *testing.T) {
+	big := strings.Repeat("compress me please. ", 64)
+
+	reqIn := gzipRequest("/one") + "GET /two HTTP/1.1\r\nHost: a.example\r\n\r\n"
+	respIn := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(big), big) +
+		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(big), big)
+
+	// pair drains both requests before either response, which is exactly the shape
+	// the single slot cannot describe.
+	gotReq, gotResp := pair(t, compressPolicy(), reqIn, respIn)
+
+	if n := strings.Count(gotReq, "X-Forwarded-For"); n != 2 {
+		t.Fatalf("both pipelined requests should still be rewritten: %d", n)
+	}
+	if strings.Contains(strings.ToLower(gotResp), "content-encoding") {
+		t.Fatalf("a pipelined request that did not ask for gzip was answered compressed: %q", gotResp)
+	}
+	check(t, "pipelined responses", gotResp, respIn)
+
+	// And they are still two well-formed messages on one connection.
+	in := newHTTPStream(t, strings.NewReader(gotResp))
+	for i := 1; i <= 2; i++ {
+		_, body := in.next()
+		check(t, fmt.Sprintf("response %d body", i), string(body), big)
+	}
+	in.done()
+}
+
+// TestCompressibleTypes pins the declared set. It is a table rather than a chain
+// of conditions, so these cases are the table's contract: a type in the set is
+// compressed, parameters do not change the type, and everything else is left
+// alone.
+func TestCompressibleTypes(t *testing.T) {
+	cases := []struct {
+		contentType string
+		want        bool
+	}{
+		{"text/html", true},
+		{"text/plain; charset=utf-8", true},
+		{"TEXT/CSS", true},
+		{"text/event-stream", true},
+		{"application/json", true},
+		{"Application/JSON", true},
+		{"application/javascript", true},
+		{"application/xml", true},
+		{"application/xhtml+xml", true},
+		{"application/graphql", true},
+		{"application/wasm", true},
+		{"image/svg+xml", true},
+		{"", false},
+		{"text", false},
+		{"application/json-seq", false},
+		{"image/png", false},
+		{"application/octet-stream", false},
+		{"video/mp4", false},
+	}
+
+	for _, tc := range cases {
+		if got := compressibleType(tc.contentType); got != tc.want {
+			t.Fatalf("compressibleType(%q) = %v, want %v", tc.contentType, got, tc.want)
+		}
+	}
 }

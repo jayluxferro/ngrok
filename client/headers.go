@@ -61,6 +61,11 @@ func policyFromTunnel(tunnel mvc.Tunnel, clientAddr string) *rewriter.Policy {
 
 	return &rewriter.Policy{
 		HostHeader: tunnel.HostHeader,
+		// Compression is a per-tunnel wish, not a per-connection decision: the
+		// rewriter's skip matrix (SPEC 3.4) decides for each response whether
+		// this tunnel may gzip it, and it needs the flag even for a response
+		// that ends up not being compressed.
+		Compress: tunnel.Compress,
 
 		RequestHeaderAdd:     tunnel.RequestHeaderAdd,
 		RequestHeaderRemove:  tunnel.RequestHeaderRemove,
