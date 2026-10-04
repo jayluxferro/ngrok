@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -202,6 +204,21 @@ func Main() {
 	// ngrok clients
 	listeners["tunnel"] = tunnelListener(opts.tunnelAddr, tlsConfig)
 
+	// QUIC proxy sessions (SPEC cluster 7): opt-in, via -quicAddr / quic_addr.
+	// The default -- empty -- leaves the default footprint (one TCP port)
+	// unchanged and keeps msg.QuicCapability out of AuthResp, so clients keep
+	// the smux transport. The flag is what the capability advertisement
+	// reads, so it is set only once the listener is really accepting.
+	var quicLn *quic.Listener
+	if opts.quicAddr != "" {
+		var err error
+		if quicLn, err = startQuicListener(opts.quicAddr, tlsConfig); err != nil {
+			panic(err)
+		}
+		quicServing.Store(true)
+		log.Info("Listening for QUIC proxy sessions on %s", quicLn.Addr())
+	}
+
 	if opts.adminAddr != "" {
 		log.Info("Starting admin server on %s", opts.adminAddr)
 		adminSrv = startAdminServer(opts.adminAddr, opts.enablePprof, parseAdminAuth(opts.adminAuth, opts.adminToken), opts.adminRate)
@@ -214,6 +231,12 @@ func Main() {
 
 	for _, l := range listeners {
 		_ = l.Close()
+	}
+	// Closing the QUIC listener unblocks its accept loop and closes every
+	// session it accepted; the process is exiting either way, but the accept
+	// goroutine should not outlive the shutdown that closed everything else.
+	if quicLn != nil {
+		_ = quicLn.Close()
 	}
 	if adminSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

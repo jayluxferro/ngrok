@@ -1393,6 +1393,73 @@ if [[ "$AGENT_AUTH_OK" != "e2e-ok" ]]; then
   exit 1
 fi
 
+# tls 7a: YAML-only parity. Every feature flag this suite exercises has a
+# config-file twin; this scenario drives one client from a config file alone
+# -- no -proto, no -hostname, no -agent-tls-termination, no -tls-* flags, no
+# -traffic-policy-file -- and the config keys must produce the same tunnel
+# the flags produced above: agent TLS termination with a CA, a policy loaded
+# from traffic_policy_file, the tcp remote_port claim, and a pinned transport.
+echo "[e2e] yaml parity: every new feature key from the config file alone"
+cat > "$TMPDIR/yml-policy.yml" <<'YAML'
+on_http_request:
+  - name: basic-auth
+    config:
+      realm: yml-realm
+      credentials:
+        - ymler:ymlpass
+YAML
+cat > "$TMPDIR/ngrok-yml.yml" <<'YAML'
+server_addr: 127.0.0.1:14444
+trust_host_root_certs: true
+auth_token: alpha
+proxy_transport: tcp
+tunnels:
+  ymlzk:
+    proto: {https: "127.0.0.1:19001"}
+    hostname: ymlzk
+    agent_tls_termination: true
+    tls:
+      ca_crt: ZK_CA_CRT
+      ca_key: ZK_CA_KEY
+    traffic_policy_file: YML_POLICY
+    host_header: rewrite
+  ymlport:
+    proto: {tcp: "127.0.0.1:19001"}
+    remote_port: 14878
+YAML
+sed -i '' "s|ZK_CA_CRT|$TMPDIR/zk-ca.crt|; s|ZK_CA_KEY|$TMPDIR/zk-ca.key|; s|YML_POLICY|$TMPDIR/yml-policy.yml|" "$TMPDIR/ngrok-yml.yml"
+
+./bin/ngrok -config="$TMPDIR/ngrok-yml.yml" -log=/tmp/ngrok-e2e-yml-client.log \
+  start ymlzk ymlport >/tmp/ngrok-e2e-yml-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-yml-client.log "ymlzk (yaml agent-terminated + basic-auth)"
+wait_for_public_tls ymlzk "$TMPDIR/zk-ca.crt"
+
+YML_URL="$(sed -n 's/.*Tunnel established at \([^ ]*\).*/\1/p' /tmp/ngrok-e2e-yml-client.log | grep ':14878' | head -n 1)"
+if [[ "$YML_URL" != *":14878" ]]; then
+  echo "[e2e] the config-file remote_port did not claim its port: got \"$YML_URL\""
+  exit 1
+fi
+
+YML_CODE="$(policy_curl -D "$TMPDIR/yml-auth.headers" -o /dev/null \
+  --cacert "$TMPDIR/zk-ca.crt" --resolve ymlzk:18443:127.0.0.1 -H 'Host: ymlzk' \
+  https://ymlzk:18443/)"
+if [[ "$YML_CODE" != "401" ]]; then
+  echo "[e2e] the config-file policy must answer 401 without credentials, got $YML_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Basic realm="yml-realm"' "$TMPDIR/yml-auth.headers"; then
+  echo "[e2e] the config-file policy's challenge is missing or wrong:"
+  cat "$TMPDIR/yml-auth.headers"
+  exit 1
+fi
+
+YML_OK="$(curl -fsS -u ymler:ymlpass --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve ymlzk:18443:127.0.0.1 -H 'Host: ymlzk' https://ymlzk:18443/)"
+if [[ "$YML_OK" != "e2e-ok" ]]; then
+  echo "[e2e] the config-file tunnel did not admit its own credentials: \"$YML_OK\""
+  exit 1
+fi
+
 # tls 7: fixed remote TCP ports and their ownership. A claims the port, B
 # (a different token -- the second one this server was started with) is
 # refused it by name, and A's restart reclaims it.
@@ -1466,6 +1533,238 @@ wait_for_tunnel /tmp/ngrok-e2e-port-client-a2.log "tcp remote-port (client A res
 PORT_RESP="$(curl -fsS --max-time 10 http://127.0.0.1:14877/)"
 if [[ "$PORT_RESP" != "e2e-ok" ]]; then
   echo "[e2e] the restarted client did not reclaim its port: $PORT_RESP"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# QUIC agent transport (SPEC-CLUSTER7). Every scenario above runs its proxy
+# streams over TCP+smux; this group starts a THIRD ngrokd -- ports disjoint
+# from both existing servers -- with -quicAddr, so the QUIC listener (UDP on
+# the tunnel port: a port number is two independent bindings, one per
+# protocol) comes up and AuthResp starts advertising the proxy-quic
+# capability. A third server rather than a restart of the first, so every
+# prior scenario keeps the exact server it was written against (the same
+# reasoning the tls group documents for its second server).
+#
+# The assertions read the carrier off the client's log, not off a curl that
+# happened to work: a tunnel serves 200 over smux just as well, so only the
+# "Mux session established ... (<carrier> carrier)" line proves which
+# transport carried it. The restart scenario at the end is the flip side of
+# the capability story: with the QUIC listener gone, the same client binary
+# with the same auto config must land on smux and keep serving -- capability
+# negotiation is what makes the UDP outage survivable without operator input.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] starting the quic ngrokd (third server, ports distinct from the first two)"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18081 -httpsAddr=127.0.0.1:18444 \
+  -tunnelAddr=127.0.0.1:14445 -adminAddr=127.0.0.1:19091 -quicAddr=127.0.0.1:14445 \
+  >/tmp/ngrok-e2e-quic-ngrokd.log 2>&1 &
+QUIC_SERVER_PID=$!
+for i in {1..40}; do
+  if grep -q "Listening for QUIC proxy sessions" /tmp/ngrok-e2e-quic-ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for QUIC proxy sessions" /tmp/ngrok-e2e-quic-ngrokd.log 2>/dev/null; then
+  echo "[e2e] the quic ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-quic-ngrokd.log || true
+  exit 1
+fi
+
+# Clients of the third server. proxy_transport is deliberately ABSENT here:
+# auto is the default, and auto is the configuration real deployments will
+# run -- the scenario must prove QUIC wins selection, not that a pinned
+# setting was obeyed.
+cat > "$TMPDIR/ngrok-quic.yml" <<'YAML'
+server_addr: 127.0.0.1:14445
+trust_host_root_certs: true
+YAML
+
+# wait_for_quic_public <hostname>: the third server's http twin of
+# wait_for_public (same 404-means-not-yet logic, port 18081).
+wait_for_quic_public() {
+  local host="$1"
+  local code
+  for i in {1..40}; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $host" http://127.0.0.1:18081/ || true)"
+    if [[ "$code" != "404" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  echo "[e2e] the quic server's http listener never learned the hostname $host"
+  return 1
+}
+
+# wait_for_quic_public_tls <hostname> <ca>: the 18444 twin of
+# wait_for_public_tls -- same --resolve-sends-SNI and bare-Host reasoning,
+# same "404 or 000 means not serving yet".
+wait_for_quic_public_tls() {
+  local host="$1"
+  local ca="$2"
+  local code
+  for i in {1..40}; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$ca" --resolve "$host:18444:127.0.0.1" -H "Host: $host" "https://$host:18444/" || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  echo "[e2e] the quic server's https listener never learned the hostname $host"
+  return 1
+}
+
+# wait_for_carrier <logfile> <carrier> <baseline>: block until the log holds
+# MORE "(<carrier> carrier)" lines than the baseline count. The client
+# appends to -log= across reconnects, so "the line exists" proves nothing
+# after a restart -- the count is what separates this reconnect's carrier
+# from every earlier session's.
+wait_for_carrier() {
+  local logfile="$1" carrier="$2" baseline="$3" i have
+  for i in {1..80}; do
+    have="$(grep -Fc "($carrier carrier)" "$logfile" 2>/dev/null || true)"
+    if [[ "${have:-0}" -gt "$baseline" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "[e2e] the client never established a $carrier carrier (baseline $baseline)"
+  echo "[e2e] client log tail:"
+  tail -n 40 "$logfile" || true
+  return 1
+}
+
+# quic 1: capability negotiation and the QUIC carrier itself. Two log lines
+# carry the proof: the AuthResp advertisement (the client saw proxy-quic and
+# will prefer QUIC) and the established carrier (it did).
+echo "[e2e] quic 1: client with default (auto) transport picks the QUIC carrier"
+./bin/ngrok -config="$TMPDIR/ngrok-quic.yml" -log=/tmp/ngrok-e2e-quic-client-1.log \
+  -proto=http -hostname=quicweb 19001 >/tmp/ngrok-e2e-quic-client-1-stdout.log 2>&1 &
+QUIC_CLIENT1_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-quic-client-1.log "quicweb (auto transport)"
+if ! grep -q "Server offers proxy-quic" /tmp/ngrok-e2e-quic-client-1.log; then
+  echo "[e2e] the client did not see the server's proxy-quic capability:"
+  tail -n 20 /tmp/ngrok-e2e-quic-client-1.log || true
+  exit 1
+fi
+wait_for_carrier /tmp/ngrok-e2e-quic-client-1.log quic 0
+wait_for_quic_public quicweb
+
+echo "[e2e] quic 1: http round-trip through the QUIC carrier"
+QUIC_RESP="$(curl -fsS -H 'Host: quicweb' http://127.0.0.1:18081/)"
+if [[ "$QUIC_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the tunnel on the QUIC carrier did not serve the upstream: $QUIC_RESP"
+  exit 1
+fi
+
+# quic 2: the fallback proof, pinned from the other side. -proxy-transport=tcp
+# on a server that IS advertising proxy-quic: the client must take smux anyway
+# -- and the absence of the preference log line is part of the proof, because
+# that line is exactly what a tcp-pinned client must not print.
+echo "[e2e] quic 2: -proxy-transport=tcp on the same QUIC-capable server takes smux"
+./bin/ngrok -config="$TMPDIR/ngrok-quic.yml" -log=/tmp/ngrok-e2e-quic-client-2.log \
+  -proxy-transport=tcp -proto=http -hostname=tcpweb 19001 >/tmp/ngrok-e2e-quic-client-2-stdout.log 2>&1 &
+QUIC_CLIENT2_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-quic-client-2.log "tcpweb (-proxy-transport=tcp)"
+if grep -q "Server offers proxy-quic" /tmp/ngrok-e2e-quic-client-2.log; then
+  echo "[e2e] a tcp-pinned client logged the QUIC preference it must not act on:"
+  grep "Server offers proxy-quic" /tmp/ngrok-e2e-quic-client-2.log || true
+  exit 1
+fi
+wait_for_carrier /tmp/ngrok-e2e-quic-client-2.log smux 0
+
+echo "[e2e] quic 2: http round-trip through the smux carrier"
+TCP_RESP="$(curl -fsS -H 'Host: tcpweb' http://127.0.0.1:18081/)"
+if [[ "$TCP_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the tunnel on the smux carrier did not serve the upstream: $TCP_RESP"
+  exit 1
+fi
+
+# quic 3: composition -- agent-terminated TLS riding the QUIC carrier. The
+# two features are orthogonal legs of one tunnel: QUIC replaces the agent's
+# proxy stream to the server, agent TLS termination replaces the public leg's
+# terminator, and neither sees the other. Same CA model as the tls group
+# (reuse of its zk-ca is deliberate: one CA, one place to look). The 200 over
+# a CA-verified https chain is the end-to-end proof; the minted-leaf line is
+# the agent-side trace.
+echo "[e2e] quic 3: agent-terminated https over the QUIC carrier"
+./bin/ngrok -config="$TMPDIR/ngrok-quic.yml" -log=/tmp/ngrok-e2e-quic-client-3.log \
+  -proto=https -hostname=quiczk \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  19001 >/tmp/ngrok-e2e-quic-client-3-stdout.log 2>&1 &
+QUIC_CLIENT3_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-quic-client-3.log "quiczk (agent-terminated over quic)"
+wait_for_carrier /tmp/ngrok-e2e-quic-client-3.log quic 0
+wait_for_quic_public_tls quiczk "$TMPDIR/zk-ca.crt"
+
+QUIC_ZK_RESP="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve quiczk:18444:127.0.0.1 -H 'Host: quiczk' https://quiczk:18444/)"
+if [[ "$QUIC_ZK_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the agent-terminated tunnel over the QUIC carrier did not serve the upstream: $QUIC_ZK_RESP"
+  exit 1
+fi
+if ! grep -q 'Minted a .* leaf for "quiczk"' /tmp/ngrok-e2e-quic-client-3.log; then
+  echo "[e2e] the agent did not mint a CA leaf on the QUIC carrier:"
+  tail -n 20 /tmp/ngrok-e2e-quic-client-3.log || true
+  exit 1
+fi
+
+# quic 4: capability-driven resilience. The server restarts WITHOUT
+# -quicAddr -- the UDP listener (and with it the advertised capability) is
+# gone -- while client 1 stays up. The client must reconnect, see no
+# proxy-quic in the new AuthResp, and land on smux without operator input;
+# the tunnel keeps serving. Two count assertions carry the proof: the smux
+# carrier count grows past its pre-restart baseline, and the quic carrier
+# count stays frozen at it (a QUIC dial against the new server is not merely
+# failing, it is never attempted -- that is the capability gate, not
+# fallback-after-failure).
+echo "[e2e] quic 4: restarting the server without -quicAddr; the auto client must fall back to smux"
+QUIC_SMUX_BASE="$(grep -Fc '(smux carrier)' /tmp/ngrok-e2e-quic-client-1.log || true)"
+QUIC_QUIC_BASE="$(grep -Fc '(quic carrier)' /tmp/ngrok-e2e-quic-client-1.log || true)"
+kill "$QUIC_SERVER_PID" 2>/dev/null || true
+wait "$QUIC_SERVER_PID" 2>/dev/null || true
+
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18081 -httpsAddr=127.0.0.1:18444 \
+  -tunnelAddr=127.0.0.1:14445 -adminAddr=127.0.0.1:19091 \
+  >/tmp/ngrok-e2e-quic-ngrokd2.log 2>&1 &
+QUIC_SERVER2_PID=$!
+for i in {1..40}; do
+  if grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-quic-ngrokd2.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-quic-ngrokd2.log 2>/dev/null; then
+  echo "[e2e] the restarted (tcp-only) ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-quic-ngrokd2.log || true
+  exit 1
+fi
+if grep -q "Listening for QUIC proxy sessions" /tmp/ngrok-e2e-quic-ngrokd2.log 2>/dev/null; then
+  echo "[e2e] the restarted ngrokd brought the QUIC listener up without -quicAddr"
+  exit 1
+fi
+
+wait_for_carrier /tmp/ngrok-e2e-quic-client-1.log smux "$QUIC_SMUX_BASE"
+
+QUIC_QUIC_AFTER="$(grep -Fc '(quic carrier)' /tmp/ngrok-e2e-quic-client-1.log || true)"
+if [[ "$QUIC_QUIC_AFTER" != "$QUIC_QUIC_BASE" ]]; then
+  echo "[e2e] the client established a QUIC carrier against a server that no longer advertises proxy-quic:"
+  grep -F '(quic carrier)' /tmp/ngrok-e2e-quic-client-1.log || true
+  exit 1
+fi
+
+echo "[e2e] quic 4: the re-registered tunnels still serve over the smux carrier"
+QUIC_FALLBACK_RESP="$(curl -fsS -H 'Host: quicweb' http://127.0.0.1:18081/)"
+if [[ "$QUIC_FALLBACK_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the tunnel did not serve after the fallback to smux: $QUIC_FALLBACK_RESP"
+  exit 1
+fi
+QUIC_FALLBACK_ZK="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve quiczk:18444:127.0.0.1 -H 'Host: quiczk' https://quiczk:18444/)"
+if [[ "$QUIC_FALLBACK_ZK" != "e2e-ok" ]]; then
+  echo "[e2e] the agent-terminated tunnel did not serve after the fallback to smux: $QUIC_FALLBACK_ZK"
   exit 1
 fi
 

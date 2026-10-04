@@ -18,6 +18,7 @@ type serverConfig struct {
 	HttpAddr     string   `yaml:"http_addr"`
 	HTTPSAddr    string   `yaml:"https_addr"`
 	TunnelAddr   string   `yaml:"tunnel_addr"`
+	QuicAddr     string   `yaml:"quic_addr"`
 	AdminAddr    string   `yaml:"admin_addr"`
 	AdminAuth    string   `yaml:"admin_auth"`
 	AdminToken   string   `yaml:"admin_token"`

@@ -493,3 +493,60 @@ func TestTerminationEchoError(t *testing.T) {
 		})
 	}
 }
+
+// TestTrafficPolicyFileConfigKey pins the config-file twin of
+// -traffic-policy-file (the one YAML gap in the new-feature parity audit): a
+// named tunnel may point at a policy file instead of inlining traffic_policy,
+// the file is resolved at load and validated exactly like an inline document,
+// and the two spellings are alternatives, not layers.
+func TestTrafficPolicyFileConfigKey(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "api-policy.yml")
+	policyYAML := "on_http_request:\n  - name: basic-auth\n    config:\n      credentials:\n        - carol:s3cret\n"
+	if err := os.WriteFile(policyPath, []byte(policyYAML), 0o600); err != nil {
+		t.Fatalf("failed to write the policy file: %v", err)
+	}
+
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write %s: %v", name, err)
+		}
+		return p
+	}
+
+	load := func(path string) (*Configuration, error) {
+		return LoadConfiguration(&Options{config: path, command: "start", args: []string{"api"}})
+	}
+
+	// The happy path: the key resolves and lands on TrafficPolicy.
+	cfg, err := load(write("ok.yml", "server_addr: 127.0.0.1:14443\nauth_token: alpha\ntunnels:\n  api:\n    proto: {http: 127.0.0.1:18080}\n    traffic_policy_file: "+policyPath+"\n"))
+	if err != nil {
+		t.Fatalf("a tunnel pointing at a policy file must load, got: %v", err)
+	}
+	if cfg.Tunnels["api"] == nil || cfg.Tunnels["api"].TrafficPolicy == nil {
+		t.Fatal("traffic_policy_file must resolve onto the tunnel's TrafficPolicy at load")
+	}
+
+	// Both spellings at once is refused, naming the tunnel.
+	_, err = load(write("both.yml", "server_addr: 127.0.0.1:14443\nauth_token: alpha\ntunnels:\n  api:\n    proto: {http: 127.0.0.1:18080}\n    traffic_policy:\n      on_http_request:\n        - name: deny\n    traffic_policy_file: "+policyPath+"\n"))
+	if err == nil || !strings.Contains(err.Error(), "api") || !strings.Contains(err.Error(), "alternatives") {
+		t.Fatalf("inline and file policies together must be refused naming the tunnel, got: %v", err)
+	}
+
+	// A missing file is a load error naming the tunnel and the file.
+	_, err = load(write("missing.yml", "server_addr: 127.0.0.1:14443\nauth_token: alpha\ntunnels:\n  api:\n    proto: {http: 127.0.0.1:18080}\n    traffic_policy_file: "+filepath.Join(dir, "nope.yml")+"\n"))
+	if err == nil || !strings.Contains(err.Error(), "api") || !strings.Contains(err.Error(), "nope.yml") {
+		t.Fatalf("a missing policy file must name the tunnel and the file, got: %v", err)
+	}
+
+	// A malformed document in the file fails exactly as an inline one would.
+	badPath := filepath.Join(dir, "bad.yml")
+	if err := os.WriteFile(badPath, []byte("on_http_request:\n  - name: no-such-action\n"), 0o600); err != nil {
+		t.Fatalf("failed to write the bad policy: %v", err)
+	}
+	_, err = load(write("badcfg.yml", "server_addr: 127.0.0.1:14443\nauth_token: alpha\ntunnels:\n  api:\n    proto: {http: 127.0.0.1:18080}\n    traffic_policy_file: "+badPath+"\n"))
+	if err == nil || !strings.Contains(err.Error(), "no-such-action") {
+		t.Fatalf("an invalid document in a policy file must be refused at load, got: %v", err)
+	}
+}

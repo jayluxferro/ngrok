@@ -5,9 +5,9 @@
 // the stream to find each message head, apply the tunnel's header Policy, and
 // copy the rest -- bodies, chunk framing, trailers, websocket frames -- through
 // untouched. They are read-driven: no extra goroutines, no buffering beyond
-// each direction's connection-lifetime bufio.Reader, and no bytes produced
-// before the caller asks for them, so back-pressure is exactly what the raw
-// connection had.
+// each direction's pooled 64 KiB read buffer (see readBufPool), and no bytes
+// produced before the caller asks for them, so back-pressure is exactly what
+// the raw connection had.
 //
 // The rule that keeps this safe on a live tunnel is fail-open: anything the
 // machines cannot make sense of (a head past 64 KiB, a malformed start line, a
@@ -42,10 +42,11 @@ import (
 )
 
 const (
-	// readBufferSize is the size of each direction's connection-lifetime
-	// bufio.Reader. Every read goes through it, including the raw copies, so
-	// bytes that arrive bundled with a head (a head and the first body bytes
-	// usually share a TCP segment) stay in order across a phase change.
+	// readBufferSize is the size of each direction's connection-lifetime read
+	// buffer, the backing array pooled in readBufPool. Every read goes through
+	// it, including the raw copies, so bytes that arrive bundled with a head
+	// (a head and the first body bytes usually share a TCP segment) stay in
+	// order across a phase change.
 	readBufferSize = 64 * 1024
 
 	// maxHeadBytes caps a single request or response head. Past it we stop
@@ -876,13 +877,20 @@ func (st *connState) isUpgraded() bool {
 }
 
 // streamRewriter is one direction's read-driven state machine. It reads through
-// a single connection-lifetime bufio.Reader and queues transformed bytes in out,
-// from where Read hands them to the caller.
+// a single connection-lifetime pooledReader (the pair's pooled 64 KiB read
+// buffer) and queues transformed bytes in out, from where Read hands them to
+// the caller.
 type streamRewriter struct {
 	side side
 	dir  string // "request" or "response", for log messages
 
-	br *bufio.Reader
+	// br is the direction's read buffer. It exposes exactly the two
+	// bufio.Reader methods the state machine calls -- Read for the verbatim
+	// body copies, ReadSlice for head-line assembly (readLine) -- which is the
+	// inventory that fixed the pooledReader shape. Its backing array comes
+	// from readBufPool and goes back at filteredConn.Close; see the pooling
+	// block above newPairWithWake.
+	br *pooledReader
 	lg log.Logger
 	st *connState
 	cp *compiledPolicy
@@ -891,6 +899,10 @@ type streamRewriter struct {
 	// yet: the head being assembled, plus any line read but not yet classified.
 	// Fail-open flushes it verbatim, which is what makes "never lose bytes" hold
 	// even when the stream stops making sense.
+	//
+	// Every line here is a copy: readLine appends the ReadSlice result, which
+	// aliases br's pooled array, into this owned slice before returning. That
+	// copy-out is what lets the array be recycled at Close (see readBufPool).
 	//
 	// Bytes that were over-read into br's buffer -- the body that shared a
 	// segment with its head -- are deliberately not in here: they stay in br and
@@ -940,22 +952,402 @@ func newPair(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger) (
 	return newPairWithWake(reqSrc, respSrc, p, reqLog, respLog, nil)
 }
 
+// The pooled 64 KiB read buffer. This is the one per-connection allocation
+// that used to survive the whole connection: newPairWithWake handed each
+// direction a bufio.Reader over a freshly made readBufferSize array and
+// nothing ever gave the arrays back -- two connection-lifetime buffers on
+// every client HTTP connection (the X-Forwarded injection makes every live
+// tunnel policy non-noop, so none of them skip the wrapping) and on every
+// policy-hooked server connection. The pool below recycles them; the release
+// mechanics live on filteredConn.Close (conn.go), the one site a connection
+// is torn down from.
+
+// readBufPool holds the backing arrays of the pair's two per-direction
+// readers. It follows conn.joinBufPool's conventions deliberately -- pool
+// beside its only user, size const above, one buffer per concurrent copy --
+// and for the same reason it is a pool and not one package-level slice: both
+// directions of a connection read concurrently (conn.Join copies each
+// direction on its own goroutine), so a shared slice would have them
+// overwriting each other's in-flight bytes. One buffer per direction either
+// way; the pool's only job is to let the next connection reuse the array
+// instead of allocating 2x64 KiB per connection.
+//
+// readBuf is one pooled backing array. The pool holds *readBuf and not []byte
+// for an allocation reason, not a style one: sync.Pool.Put takes an
+// interface{}, and boxing a slice (three words) into one allocates on every
+// Put -- on this path one allocation per direction per connection, exactly
+// the kind of tax the pool exists to remove. Boxing a pointer is free, so the
+// pool circulates the *readBuf cell and the reader uses rb.b as the array.
+type readBuf struct {
+	b [readBufferSize]byte
+}
+
+// It is a *sync.Pool rather than a sync.Pool, and nil is allowed, so that
+// tests can turn pooling off and measure against it: with readBufPool nil,
+// buffers are allocated and dropped exactly as the bufio.NewReaderSize code
+// did, and every Put below is a no-op.
+var readBufPool = &sync.Pool{New: func() interface{} { return &readBuf{} }}
+
+func getReadBuf() *readBuf {
+	if readBufPool == nil {
+		return &readBuf{}
+	}
+	rb := readBufPool.Get().(*readBuf)
+	// The Get counterpart of testPutHook: Puts alone cannot prove the
+	// ownership invariant (an array may legitimately be Put, Got, and Put
+	// again as it recycles between directions), so the concurrency test needs
+	// to see both sides of the pool. Production leaves it nil; the cost is one
+	// nil check per buffer acquisition.
+	if testGetHook != nil {
+		testGetHook(rb.b[:])
+	}
+	return rb
+}
+
+// testPutHook observes every putReadBuf. See the comment in putReadBuf.
+var testPutHook func(b []byte)
+
+// testGetHook observes every pooled getReadBuf. See testPutHook.
+var testGetHook func(b []byte)
+
+// putReadBuf returns an array the reader no longer references, in any way:
+// the pool may hand it to another connection the instant this returns. The
+// callers guarantee that; see pooledReader.finish and pooledReader.release
+// for the two recycle points and why no view into the array can be live at
+// either.
+func putReadBuf(rb *readBuf) {
+	if readBufPool == nil {
+		return
+	}
+	readBufPool.Put(rb)
+	// Test hook, not a production path: sync.Pool cannot be inspected, and the
+	// release tests must observe that exactly one Put happened per buffer (the
+	// double-release hazard). Production leaves it nil; the cost is one nil
+	// check per recycled buffer.
+	if testPutHook != nil {
+		testPutHook(rb.b[:])
+	}
+}
+
+// maxConsecutiveEmptyReads is bufio.Reader's own limit, restated here because
+// bufio's is private: how many zero-byte reads fill will tolerate from a
+// source before declaring it stuck.
+const maxConsecutiveEmptyReads = 100
+
+// errNegativeRead mirrors bufio's panic for a Read implementation that lies
+// about its count. Like bufio's, it is a panic and not an error: a Reader
+// that returns n < 0 is broken, and continuing from it would corrupt framing.
+var errNegativeRead = errors.New("rewriter: source returned a negative read count")
+
+// pooledReader is one direction's read buffer: the Read and ReadSlice of a
+// bufio.Reader -- exactly the two methods the state machine calls on r.br,
+// the inventory that fixed this shape -- over a backing array from
+// readBufPool.
+//
+// bufio itself is not reused because it has no Reset and owns its array for
+// the reader's whole life; here the array goes back to the pool exactly once,
+// at filteredConn.Close. The semantics are mirrored from bufio.Reader method
+// for method, quirks included (a fill that reads nothing makes the next Read
+// return (0, nil) once before the error surfaces; ReadSlice scans forward
+// across fills; an error drains the buffer with the line it cut short). That
+// fidelity is load-bearing: the byte-ordering properties the package
+// documents -- "the first body bytes, which usually arrived in the same read,
+// stay in br for the next phase" -- are properties of those exact semantics,
+// and every test in the package runs over this reader to keep them honest.
+//
+// Recycling is built on one observation: a buffer may go back to the pool
+// only at a moment when no view into it is live and no read is in flight.
+// Both recycle points are chosen for that:
+//
+//   - finish (read side): a read is about to return an error from the source
+//     with nothing buffered. The return carries no bytes, io.Copy over this
+//     reader ends on exactly such a return, and the read is completing -- so
+//     this is where a Close already waiting for the buffer gets it.
+//   - release (close side): filteredConn.Close, once per connection. If the
+//     direction already ended, the buffer goes back here; if it is still
+//     copying (the normal shutdown order has the first direction to finish
+//     close the other one's legs), release only records the request and finish
+//     does the Put at that direction's own termination. Either way the array
+//     is never in the pool while this connection can still touch it.
+//
+// The bytes the state machine parses never alias the array past the read
+// that produced them: readLine copies each ReadSlice line into pending (an
+// owned slice) before returning, and every other path copies out of the
+// buffer into the caller's slice or into out. That copy-out is what makes
+// the recycle points safe, and TestReleasedBufferScribbleDoesNotCorrupt
+// keeps it true.
+//
+// Locking: r, w and err are confined to the goroutine that reads -- conn.Join
+// gives each direction exactly one reader goroutine, and nothing else reads a
+// streamRewriter's source. mu guards the fields the Close path touches from
+// another goroutine (buf, terminated, released, recycled) and is never
+// held across a source read, so Close never waits on I/O.
+type pooledReader struct {
+	src io.Reader
+
+	mu         sync.Mutex
+	buf        *readBuf // the pooled buffer cell; nil while recycled
+	terminated bool     // a read returned a source error with nothing buffered
+	released   bool     // release ran at least once; the next terminal read recycles
+	recycled   bool     // true between a Put and the next takeBuf re-lease
+
+	// Read state, confined to the reading goroutine. The layout mirrors
+	// bufio.Reader: buf[r:w] is the unconsumed span; err is the source's sticky
+	// error, returned once from an empty buffer and then cleared, so a caller
+	// that keeps reading after an error re-tries the source exactly as it would
+	// against bufio.
+	r   int
+	w   int
+	err error
+}
+
+func newPooledReader(src io.Reader) *pooledReader {
+	return &pooledReader{src: src}
+}
+
+// takeBuf returns the backing array, (re)acquiring it after a recycle. Only
+// the identity of the array is under mu: the caller uses the returned slice
+// without the lock, because only the reading goroutine ever writes into it.
+//
+// A read after a recycle should not happen -- termination is the end of the
+// copy -- but the state machine can make one more source read after a
+// finish-terminated one (the fail-open flush and the gzip transform's
+// close-delimited handoff both can), so a recycled direction re-acquires here
+// rather than touching an array another connection may now own. The pool is a
+// token system -- an array in it has no owner and every Get hands it to
+// exactly one taker -- so re-acquiring can never overlap owners: either we
+// get our own array back (still pooled, zero owners) or a fresh one. The new
+// array is a new lease (recycled resets), so the later terminal read puts it
+// back instead of leaking it out of circulation.
+func (pr *pooledReader) takeBuf() []byte {
+	pr.mu.Lock()
+	if pr.buf == nil {
+		pr.buf = getReadBuf()
+		pr.r, pr.w = 0, 0
+		pr.recycled = false
+	}
+	b := pr.buf.b[:]
+	pr.mu.Unlock()
+	return b
+}
+
+// stickyErr returns and clears the pending source error, as bufio's readErr
+// does: served once, then the source is asked again.
+func (pr *pooledReader) stickyErr() error {
+	err := pr.err
+	pr.err = nil
+	return err
+}
+
+// finish records that a read is returning a source error with nothing
+// buffered -- the shape of return io.Copy ends on, with no bytes in it. When
+// Close has already asked for the buffer back (released), this is where it
+// goes to the pool: no view into it is live (a (0, err) return carries no
+// bytes) and no read is in flight (this is that read, returning). Should the
+// state machine still make one more source read afterwards, takeBuf re-leases
+// an array (ours if nobody took it, otherwise a fresh one) and the next
+// terminal read recycles that one -- ownership never overlaps, nothing leaks,
+// however the Close and the copy end interleave.
+func (pr *pooledReader) finish() {
+	pr.mu.Lock()
+	pr.terminated = true
+	if pr.released && !pr.recycled && pr.buf != nil {
+		putReadBuf(pr.buf)
+		pr.buf, pr.recycled = nil, true
+	}
+	pr.mu.Unlock()
+}
+
+// release is filteredConn.Close's handle on the buffer. It runs at most once
+// per direction (the caller's sync.Once; the recycled flag below makes it
+// idempotent regardless). If the direction has ended, the buffer goes back to
+// the pool here: no read is in flight and the terminated read carried no
+// bytes, so no view into the array is live. If the direction is still
+// copying, release only records the request -- never touching the array the
+// other goroutine is reading or holding views into -- and finish recycles at
+// that direction's own termination. released stays set either way, so a
+// re-lease after a release-Put (see takeBuf) still recycles on its next
+// terminal read. With pooling off (readBufPool nil), both recycle points
+// degrade to dropping the array for the GC, which is the behavior this pool
+// replaced.
+func (pr *pooledReader) release() {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	pr.released = true
+	if pr.recycled {
+		return
+	}
+	if pr.terminated {
+		pr.recycled = true
+		if pr.buf != nil {
+			putReadBuf(pr.buf)
+			pr.buf = nil
+		}
+	}
+}
+
+// Read mirrors bufio.Reader.Read: buffered bytes are copied out first; an
+// empty buffer serves one source read, directly into p when p is at least the
+// buffer's size (the verbatim-copy phases, which hand io.Copy's whole
+// staging buffer in, pay no bounce through the array this way -- the same
+// direct path bufio has); a fill that reads nothing makes the next call
+// return (0, nil) once before the error surfaces, and io.Copy's retry is
+// what turns that into a clean EOF.
+func (pr *pooledReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		if pr.w > pr.r {
+			return 0, nil
+		}
+		err := pr.stickyErr()
+		if err != nil {
+			pr.finish()
+		}
+		return 0, err
+	}
+	if pr.r == pr.w && pr.err != nil {
+		err := pr.stickyErr()
+		pr.finish()
+		return 0, err
+	}
+	b := pr.takeBuf()
+	if pr.r == pr.w {
+		if len(p) >= len(b) {
+			// Large read, empty buffer: straight into p, no copy. The error is
+			// surfaced with the bytes in the same call, as bufio does, and a
+			// byte-less one ends the copy over this reader -- a recycle point.
+			n, err := pr.src.Read(p)
+			if n < 0 {
+				panic(errNegativeRead)
+			}
+			pr.err = err
+			if n == 0 && err != nil {
+				pr.finish()
+			}
+			return n, pr.stickyErr()
+		}
+		// One read, not fill's loop: as bufio puts it, do not try to read more.
+		pr.r = 0
+		n, err := pr.src.Read(b)
+		if n < 0 {
+			panic(errNegativeRead)
+		}
+		pr.w = n
+		if n == 0 {
+			pr.err = err
+			if err != nil {
+				pr.finish()
+			}
+			return 0, err
+		}
+	}
+	n := copy(p, b[pr.r:pr.w])
+	pr.r += n
+	return n, nil
+}
+
+// ReadSlice mirrors bufio.Reader.ReadSlice: scan for the delimiter, filling
+// as needed and never rescanning bytes a fill brought nothing new about; an
+// error drains the buffer together with the line it cut short; a buffer that
+// fills without a delimiter comes back whole with ErrBufferFull (which
+// readLine translates into errLineTooLong). The returned line aliases the
+// array and is valid only until the next read on this reader -- bufio's own
+// contract, and the reason readLine copies into pending before returning.
+func (pr *pooledReader) ReadSlice(delim byte) (line []byte, err error) {
+	s := 0 // scan start index: do not rescan area already scanned
+	for {
+		b := pr.takeBuf()
+		if s > pr.w-pr.r {
+			// The array was swapped under this call (a post-recycle read): the
+			// old scan offset means nothing on a fresh span.
+			s = pr.w - pr.r
+		}
+		if i := bytes.IndexByte(b[pr.r+s:pr.w], delim); i >= 0 {
+			i += s
+			line = b[pr.r : pr.r+i+1]
+			pr.r += i + 1
+			return line, nil
+		}
+		if pr.err != nil {
+			line = b[pr.r:pr.w]
+			pr.r = pr.w
+			empty := len(line) == 0
+			err = pr.stickyErr()
+			if empty {
+				// The line came back empty with the source's error: the copy
+				// over this reader ends here, so this is a recycle point.
+				pr.finish()
+			}
+			return line, err
+		}
+		if pr.w-pr.r >= len(b) {
+			pr.r = pr.w
+			return b, bufio.ErrBufferFull
+		}
+		s = pr.w - pr.r
+		pr.fill()
+	}
+}
+
+// fill mirrors bufio.Reader.fill: slide any unread span to the front of the
+// array, then tolerate up to maxConsecutiveEmptyReads zero-byte reads before
+// declaring the source stuck.
+func (pr *pooledReader) fill() {
+	b := pr.takeBuf()
+	if pr.r > 0 {
+		copy(b, b[pr.r:pr.w])
+		pr.w -= pr.r
+		pr.r = 0
+	}
+	if pr.w >= len(b) {
+		panic("rewriter: tried to fill full buffer")
+	}
+	for i := maxConsecutiveEmptyReads; i > 0; i-- {
+		n, err := pr.src.Read(b[pr.w:])
+		if n < 0 {
+			panic(errNegativeRead)
+		}
+		pr.w += n
+		if err != nil {
+			pr.err = err
+			return
+		}
+		if n > 0 {
+			return
+		}
+	}
+	pr.err = io.ErrNoProgress
+}
+
+// releaseBuffer hands this direction's read buffer back toward the pool on
+// behalf of filteredConn.Close. The mechanics and the safety argument are
+// pooledReader.release's; this method exists so the adapter can reach them
+// through the io.Reader it holds.
+func (r *streamRewriter) releaseBuffer() {
+	r.br.release()
+}
+
 // newPairWithWake is newPair plus the wake handle that unblocks the response
 // side when the request side terminates: see connState.wakeResponse for why the
 // response side needs to be unblocked rather than merely signalled, and why
 // nil is the right value for an in-memory pair.
+//
+// Each direction's reader takes its backing array from readBufPool here. On
+// the live path (NewConnPair) filteredConn.Close releases it; on the in-memory
+// path (NewPair, the tests) nothing ever calls Close, so the array is simply
+// garbage when the rewriters become unreachable -- the same lifecycle the
+// bufio.NewReaderSize code had, and no worse.
 func newPairWithWake(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger, wake func()) (req, resp io.Reader) {
 	cp := compilePolicy(p, reqLog)
 	st := &connState{wakeResponse: wake}
 
 	req = &streamRewriter{
 		side: sideRequest, dir: "request",
-		br: bufio.NewReaderSize(reqSrc, readBufferSize), lg: reqLog, st: st, cp: cp,
+		br: newPooledReader(reqSrc), lg: reqLog, st: st, cp: cp,
 		phase: stHead,
 	}
 	resp = &streamRewriter{
 		side: sideResponse, dir: "response",
-		br: bufio.NewReaderSize(respSrc, readBufferSize), lg: respLog, st: st, cp: cp,
+		br: newPooledReader(respSrc), lg: respLog, st: st, cp: cp,
 		phase: stHead,
 	}
 	return req, resp

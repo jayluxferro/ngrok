@@ -1,8 +1,10 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/quic-go/quic-go"
 	metrics "github.com/rcrowley/go-metrics"
 	"github.com/xtaci/smux/v2"
 	"io"
@@ -56,6 +58,35 @@ const (
 	// every mux conn would be redialed in a hot loop forever.
 	muxMinSessionLifetime = 5 * time.Second
 
+	// carrierKeepAlivePeriod and carrierMaxIdleTimeout are the session-keeping
+	// values every mux carrier runs (SPEC-CLUSTER7 5). They were smux's library
+	// defaults before there was a second carrier; with QUIC beside it they are
+	// pinned here and both adapters read them, so the two transports provably
+	// keep a session alive on the same clock instead of similar ones. The
+	// keepalive is load-bearing: it is what turns a server that vanished
+	// silently into a dead session -- and therefore into a reconnected one --
+	// without waiting for the next proxy stream to be attempted.
+	carrierKeepAlivePeriod = 10 * time.Second
+	carrierMaxIdleTimeout  = 30 * time.Second
+
+	// The names the two carriers go by in logs and tests. They are not wire
+	// values -- the server sees which transport dialed it, never this string.
+	carrierSmux = "smux"
+	carrierQuic = "quic"
+
+	// quicALPN is the wire-vocabulary constant (msg.QuicALPN), aliased so the
+	// dialer reads without the package qualifier. A mismatch fails the TLS
+	// handshake -- the cross-protocol refusal -- which is the carrier
+	// fallback's cue.
+	quicALPN = msg.QuicALPN
+
+	// quicMaxIncomingStreams mirrors the server's cap on concurrent proxy
+	// streams (server/quic.go, SPEC-CLUSTER7 4). The client never accepts
+	// streams -- the server only ever opens them into us in protocol
+	// violations -- so this states the symmetric budget rather than a working
+	// limit.
+	quicMaxIncomingStreams = 512
+
 	// agentTLSHandshakeTimeout bounds the public TLS handshake of an
 	// agent-terminated tunnel (SPEC-CLUSTER5 5.3). It is the server's
 	// connReadTimeout (server/main.go) on purpose: the server bounds how long
@@ -72,6 +103,51 @@ const (
         <p>Unable to initiate connection to <strong>%s</strong>. A web server must be running on port <strong>%s</strong> to complete the tunnel.</p>
 `
 )
+
+// quicHandshakeTimeout bounds the QUIC handshake of a carrier dial: the QUIC
+// equivalent of the TCP dial timeout, and the thing that keeps "the UDP path
+// is a black hole" from being discovered at leisure. It is a var rather than a
+// const only so the tests can shrink it -- a dead QUIC path must fail fast in
+// a test that then proves the smux fall-through.
+var quicHandshakeTimeout = 5 * time.Second
+
+// proxyTransport is the resolved form of the config's proxy_transport key
+// (client/config.go owns the string vocabulary and its validation): which
+// carrier the mux transport prefers, after the configuration has met the one
+// fact that can override it at construction time -- the http_proxy setting.
+// The capability gate is separate (quicPeerCap), because it is per control
+// session, not per process.
+type proxyTransport int
+
+const (
+	// proxyTransportAuto prefers QUIC per attempt and falls back to the smux
+	// path inside the same attempt when the QUIC dial fails. This is the
+	// default.
+	proxyTransportAuto proxyTransport = iota
+
+	// proxyTransportQuic is the explicit "quic" setting; it changes nothing
+	// about the capability gate, so it degrades to the smux path against a
+	// server that has not turned QUIC on.
+	proxyTransportQuic
+
+	// proxyTransportTCP pins the smux path (TCP+TLS under the smux frames),
+	// which is what the transport ran before SPEC-CLUSTER7.
+	proxyTransportTCP
+)
+
+// proxyTransportForConfig maps a validated proxy_transport value onto the
+// enum. The empty string is the value of a config (and a flag) that said
+// nothing: auto.
+func proxyTransportForConfig(value string) proxyTransport {
+	switch value {
+	case ProxyTransportQuic:
+		return proxyTransportQuic
+	case ProxyTransportTCP:
+		return proxyTransportTCP
+	default:
+		return proxyTransportAuto
+	}
+}
 
 type ClientModel struct {
 	log.Logger
@@ -119,6 +195,25 @@ type ClientModel struct {
 	// the watchdog replaces it while ReqProxy handlers read it.
 	muxMu sync.Mutex
 	mux   *muxSession
+
+	// proxyTransport is the carrier preference the configuration resolved to
+	// at construction (SPEC-CLUSTER7 5): auto, quic, or tcp -- with any
+	// http_proxy override already applied (there is no QUIC through an HTTP
+	// CONNECT proxy, so http_proxy set resolves auto and quic to tcp). Read
+	// only after construction: the watchdog and the dialer consult it from
+	// other goroutines.
+	proxyTransport proxyTransport
+
+	// quicPeerCap records whether the current control session's AuthResp
+	// advertised msg.QuicCapability. Atomic on purpose: it is written once per
+	// control session, but a watchdog from the *previous* control session can
+	// still be inside a dial when the next one rewrites it (control() returns
+	// while the watchdog is mid-dial; only the selects between dials watch the
+	// stop channel). The overlap then reads a stale-but-valid decision -- the
+	// previous session's answer about the same server -- instead of racing on
+	// the serverCaps map. The zero value is "not advertised", which is also
+	// what a model that has never run a control session must report.
+	quicPeerCap atomic.Bool
 
 	// Per-tunnel runtime for agent-terminated tunnels (SPEC-CLUSTER5 5.3),
 	// both keyed by public URL and both built when the tunnel is established
@@ -259,6 +354,21 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 	m.tlsConfig.InsecureSkipVerify = useInsecureSkipVerify()
 	if m.tlsConfig.InsecureSkipVerify {
 		m.Warn("TLS certificate verification is disabled (NGROK_INSECURE_SKIP_VERIFY=1)")
+	}
+
+	// Resolve the proxy transport (SPEC-CLUSTER7 5). The configured value was
+	// validated at load; the one override that can still happen here is
+	// http_proxy: QUIC is UDP end-to-end, and an HTTP CONNECT proxy cannot
+	// carry it, so a proxy URL forces the TCP path whatever was configured.
+	// The override is logged rather than applied in silence -- an operator who
+	// asked for quic (or accepted auto's preference for it) and silently never
+	// got it would be debugging a transport choice nobody admitted to making.
+	// It is stated once per process, here, because the resolution happens once
+	// per process.
+	m.proxyTransport = proxyTransportForConfig(config.ProxyTransport)
+	if m.proxyTransport != proxyTransportTCP && config.HttpProxy != "" {
+		m.proxyTransport = proxyTransportTCP
+		m.Info("http_proxy is set; using TCP for the proxy transport: QUIC needs UDP end-to-end, which an HTTP CONNECT proxy cannot carry")
 	}
 
 	return m
@@ -441,6 +551,20 @@ func (c *ClientModel) control() {
 	// later one with a stream.
 	if _, ok := c.serverCaps[msg.MuxCapability]; ok {
 		c.Info("Server offers %s; using one multiplexed proxy connection", msg.MuxCapability)
+
+		// SPEC-CLUSTER7 5: whether the proxy transport may prefer QUIC for
+		// this control session. QUIC rides the same watchdog and the same
+		// give-up arithmetic as the smux carrier, so it exists only when the
+		// mux transport does -- no mux capability means no second carrier
+		// either. The snapshot (not a live read of the map) is what the
+		// watchdog's dialer consults; see quicPeerCap for why it must be
+		// atomic.
+		_, quicCap := c.serverCaps[msg.QuicCapability]
+		c.quicPeerCap.Store(quicCap)
+		if quicCap && c.proxyTransport != proxyTransportTCP {
+			c.Info("Server offers %s; QUIC will be preferred for the proxy transport", msg.QuicCapability)
+		}
+
 		muxStop := make(chan struct{})
 		defer close(muxStop)
 		go c.muxWatchdog(muxStop, nil)
@@ -1101,21 +1225,208 @@ func (c *ClientModel) attachPolicyHooks(tunnel mvc.Tunnel, clientAddr string, p 
 	p.ResponseHook = compiled.ResponseHook(c, clientAddr)
 }
 
+// streamCarrier is the transport a mux session runs on (SPEC-CLUSTER7 5): the
+// one long-lived connection every proxy stream travels on. Before QUIC there
+// was exactly one -- an smux session on a TCP+TLS conn -- and the machinery
+// around it (the watchdog, the backoff, the publish/replace protocol) never
+// needed to know that. This interface is that ignorance made explicit: the
+// carrier opens and accepts net.Conn streams, closes as a whole, and can be
+// asked whether it is already dead. Everything else about a carrier -- how
+// frames travel, how keepalives are kept, how a dead peer is noticed -- is the
+// adapter's business, below.
+//
+// The failure semantics are the part the callers lean on, so they are the
+// contract, not implementation detail: when the carrier dies (peer gone,
+// transport timeout, keepalive given up), AcceptStream returns an error and
+// IsClosed turns true -- and every stream the carrier handed out fails, the
+// way a dropped TCP conn fails, which is what unwinds the relays built on
+// them.
+type streamCarrier interface {
+	// OpenStream opens one stream of the session. This side of the protocol
+	// opens every proxy stream; the server only ever accepts them.
+	OpenStream() (net.Conn, error)
+
+	// AcceptStream blocks until the peer opens a stream (a protocol surprise:
+	// nothing in this protocol has the server opening streams) or the session
+	// dies, in which case it returns the error. It is the death watch of the
+	// session -- the earliest signal either end has that the transport is
+	// gone.
+	AcceptStream() (net.Conn, error)
+
+	// Close tears the carrier down: every stream on it fails and the
+	// underlying transport goes away, which also unblocks AcceptStream. It
+	// must be safe to call more than once (the watchdog and the dying session
+	// itself both get there).
+	Close() error
+
+	// IsClosed reports whether the session is already dead. The muxSession()
+	// accessor reads it so that a ReqProxy answered in the window between a
+	// session dying and the watchdog noticing dials a conn instead of opening
+	// a stream that cannot work.
+	IsClosed() bool
+}
+
+// smuxCarrier is the original carrier (SPEC cluster 3, 3.1): an smux session
+// client on a TCP+TLS conn. Its behavior is the one streamCarrier's contract
+// was written down from -- Close the session and the conn under it, in that
+// order, which is the order muxSession.Close has always used.
+type smuxCarrier struct {
+	// conn is the TCP+TLS conn the smux frames travel on. The smux session
+	// closes it when it closes, but explicitly closing it here as well is the
+	// belt the watchdog has always worn: smux's close path has never been the
+	// thing the client's correctness leans on.
+	conn conn.Conn
+	sess *smux.Session
+}
+
+func (c *smuxCarrier) OpenStream() (net.Conn, error) {
+	// *smux.Stream is a net.Conn (it completes the addresses from the conn the
+	// session runs on), so it goes up the stack as-is.
+	return c.sess.OpenStream()
+}
+
+func (c *smuxCarrier) AcceptStream() (net.Conn, error) {
+	return c.sess.AcceptStream()
+}
+
+// Close closes the session first -- that is what fails every stream and
+// unblocks the accept half -- and then the conn underneath. Both errors are
+// dropped on purpose: this runs on the death path, where the session is
+// already on its way out, and every caller of streamCarrier.Close treats the
+// errors as noise.
+func (c *smuxCarrier) Close() error {
+	_ = c.sess.Close()
+	_ = c.conn.Close()
+	return nil
+}
+
+func (c *smuxCarrier) IsClosed() bool {
+	return c.sess.IsClosed()
+}
+
+// quicCarrier is the QUIC carrier (SPEC-CLUSTER7 5): one QUIC connection over
+// UDP, every proxy stream a QUIC bidirectional stream on it. The point of the
+// carrier is what QUIC does under the streams: packet loss on one stream no
+// longer head-of-line blocks the others, which on the smux carrier is exactly
+// what one lost TCP segment does to every multiplexed proxy connection at
+// once.
+type quicCarrier struct {
+	conn quic.Connection
+}
+
+func (c *quicCarrier) OpenStream() (net.Conn, error) {
+	stream, err := c.conn.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return newQuicStreamConn(stream, c.conn), nil
+}
+
+// AcceptStream is the carrier's death watch, and the context it runs under is
+// the connection's own: quic.Connection.Context is cancelled when the
+// connection dies (idle timeout, keepalive given up, peer closed, transport
+// error), so a dead session unblocks the accept by itself -- the same "AcceptStream
+// returns when the session dies" behavior the smux carrier gets from its
+// library -- without this adapter owning a goroutine or a timer of its own.
+func (c *quicCarrier) AcceptStream() (net.Conn, error) {
+	stream, err := c.conn.AcceptStream(c.conn.Context())
+	if err != nil {
+		return nil, err
+	}
+	return newQuicStreamConn(stream, c.conn), nil
+}
+
+// CloseWithError is QUIC's only whole-connection close, and it is the right
+// shape: one call ends every stream at once, which is the fan-out closing an
+// smux session has. The application error code is ours to choose -- both ends
+// run this protocol -- and the reason string is for the peer's log.
+func (c *quicCarrier) Close() error {
+	return c.conn.CloseWithError(quicSessionCloseCode, "closing mux session")
+}
+
+func (c *quicCarrier) IsClosed() bool {
+	select {
+	case <-c.conn.Context().Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// QUIC error codes. The stream code ends a single stream's receive side, the
+// session code closes a whole carrier; both are private to this protocol, so
+// zero (with the reason strings doing the explaining) is as good as any
+// registry entry either end could have disagreed about.
+const (
+	quicStreamResetCode  quic.StreamErrorCode      = 0
+	quicSessionCloseCode quic.ApplicationErrorCode = 0
+)
+
+// quicStreamConn adapts a quic.Stream to net.Conn.
+//
+// Two differences between the two types are the reason this exists:
+//
+//   - a quic.Stream has no LocalAddr/RemoteAddr -- those live on the
+//     connection -- and net.Conn requires them. The adapter carries the
+//     connection's addresses so that conn.Wrap (and every log line that
+//     renders a conn) works on a stream exactly as it does on an smux stream,
+//     which fills the addresses in from the conn its session runs on.
+//   - quic.Stream.Close only finishes the SEND side (a FIN); the receive side
+//     stays open until the peer closes its end. "Closed" has to mean more than
+//     that here: conn.Join closes a conn to unwind the relay, and a receive
+//     side that outlives the close would leave a read parked on a conn the
+//     rest of the program believes is dead -- smux's Close kills the whole
+//     stream, and the unwinding depends on it. So Close also cancels the
+//     receive side, which is what makes the peer's writes to this stream fail
+//     immediately. Neither half is an error to repeat (the library no-ops
+//     them), so Close stays idempotent the way conn.Conn users expect.
+type quicStreamConn struct {
+	quic.Stream
+	local  net.Addr
+	remote net.Addr
+}
+
+func newQuicStreamConn(stream quic.Stream, qconn quic.Connection) *quicStreamConn {
+	return &quicStreamConn{
+		Stream: stream,
+		local:  qconn.LocalAddr(),
+		remote: qconn.RemoteAddr(),
+	}
+}
+
+func (c *quicStreamConn) LocalAddr() net.Addr  { return c.local }
+func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
+
+func (c *quicStreamConn) Close() error {
+	c.Stream.CancelRead(quicStreamResetCode)
+	return c.Stream.Close()
+}
+
 // muxSession is the client's end of one multiplexed proxy connection (SPEC
-// cluster 3, 3.1): a single TCP+TLS conn to the server carrying every proxy
+// cluster 3, 3.1): a single carrier conn to the server carrying every proxy
 // stream, instead of one conn per proxy connection.
 //
 // The session is a shared failure domain -- if it dies, every stream on it dies
 // with it -- so nothing but proxy streams travels over it, and the watchdog
 // below is what makes that acceptable: streams that die mid-flight fail closed,
 // unwinding their joins exactly as a dropped dialed conn does, and a new
-// session is brought up behind them.
+// session is brought up behind them. Since SPEC-CLUSTER7 the carrier may be
+// QUIC (streamCarrier): the watchdog, the backoff and the publish protocol
+// below are the same code for both, because they never looked at the
+// transport in the first place.
 type muxSession struct {
 	log.Logger
 
-	// the conn carrying smux frames, and the session on it
-	conn conn.Conn
-	sess *smux.Session
+	// sess is the carrier the session runs on. The field keeps the name it had
+	// when the only carrier was smux: watch(), Close() and the muxSession()
+	// accessor read it, and after the generalization they are the same three
+	// lines they always were -- only the type got wider.
+	sess streamCarrier
+
+	// transport names the carrier for logs and tests ("smux" or "quic"); it is
+	// what tells a reader of the log (and the e2e) which transport actually
+	// carried the session.
+	transport string
 
 	// when the session was established, which is what tells a flaky transport
 	// (it lived, then died) from one that never worked (it died at once)
@@ -1127,13 +1438,13 @@ type muxSession struct {
 	closeOnce sync.Once
 }
 
-// newMuxSession wraps an established smux session and starts the goroutine that
+// newMuxSession wraps an established carrier and starts the goroutine that
 // turns its death into a closed done channel.
-func newMuxSession(muxConn conn.Conn, sess *smux.Session) *muxSession {
+func newMuxSession(carrier streamCarrier, transport string) *muxSession {
 	m := &muxSession{
 		Logger:      log.NewPrefixLogger("mux"),
-		conn:        muxConn,
-		sess:        sess,
+		sess:        carrier,
+		transport:   transport,
 		established: time.Now(),
 		done:        make(chan struct{}),
 	}
@@ -1146,9 +1457,9 @@ func newMuxSession(muxConn conn.Conn, sess *smux.Session) *muxSession {
 //
 // This side opens every proxy stream (the server only ever accepts them), so
 // the accept half of the session exists for exactly this: AcceptStream returns
-// when either end closes the session, when the transport dies, or when smux's
-// keepalive gives up on a peer that stopped answering. Nothing else here would
-// notice any of those before the next stream is attempted.
+// when either end closes the session, when the transport dies, or when the
+// carrier's keepalive gives up on a peer that stopped answering. Nothing else
+// here would notice any of those before the next stream is attempted.
 func (m *muxSession) watch() {
 	defer close(m.done)
 
@@ -1165,30 +1476,168 @@ func (m *muxSession) watch() {
 		stream.Close()
 	}
 
-	// Closing the smux session is what fails the streams and closes the conn
+	// Closing the carrier is what fails the streams and closes the transport
 	// underneath; errors from it are noise, because the session is already on
 	// its way out when AcceptStream returns.
 	m.Close()
 }
 
-// Close tears the session down: every stream on it fails and the conn goes
-// away, which is also what unblocks watch() and closes done.
+// Close tears the session down: every stream on it fails and the transport
+// goes away, which is also what unblocks watch() and closes done.
 func (m *muxSession) Close() {
 	m.closeOnce.Do(func() {
+		// The carrier owns everything the session used to close piecewise --
+		// for smux the session and the TCP conn under it, for QUIC the
+		// connection and every stream with it -- so one call is the whole
+		// teardown.
 		_ = m.sess.Close()
-		_ = m.conn.Close()
 	})
 }
 
 // muxConfig is the smux configuration for the client side of a mux session.
 //
-// The library defaults are kept -- 10s keepalive, 30s keepalive timeout, 4 MiB
-// receive window, 64 KiB per-stream buffer -- so that both ends run what smux
-// recommends. The keepalive is load-bearing here: it is what turns a server
-// that vanished silently into a dead session, and therefore into a reconnected
-// one, without waiting for a stream to be attempted.
+// The library defaults are kept -- 4 MiB receive window, 64 KiB per-stream
+// buffer -- except the two session-keeping values, which are pinned from the
+// carrier-wide consts (carrierKeepAlivePeriod, carrierMaxIdleTimeout) instead
+// of left as the library defaults they happen to equal: that is what makes
+// "both carriers keep a session alive on the same clock" a property of one
+// source of truth rather than a coincidence of two defaults (SPEC-CLUSTER7 5).
+// The keepalive is load-bearing here: it is what turns a server that vanished
+// silently into a dead session, and therefore into a reconnected one, without
+// waiting for a stream to be attempted.
 func muxConfig() *smux.Config {
-	return smux.DefaultConfig()
+	cfg := smux.DefaultConfig()
+	cfg.KeepAliveInterval = carrierKeepAlivePeriod
+	cfg.KeepAliveTimeout = carrierMaxIdleTimeout
+	return cfg
+}
+
+// quicConfig is the QUIC transport configuration for the client side of a
+// carrier session (SPEC-CLUSTER7 5). There are deliberately no configuration
+// knobs behind it: the keepalives are the shared carrier consts, and the
+// stream budgets mirror the server's listener. What each field is for:
+//
+//   - KeepAlivePeriod/MaxIdleTimeout are the QUIC counterparts of smux's
+//     keepalive ping and its give-up timeout (see muxConfig for why they are
+//     load-bearing).
+//   - MaxIncomingStreams mirrors the server's cap; the server opens no
+//     streams, so this states the symmetric budget rather than a working
+//     limit.
+//   - MaxIncomingUniStreams refuses unidirectional streams outright: the
+//     protocol opens none, and the negative value is the only spelling
+//     quic-go reads as "none" (zero means the library default, 100).
+//   - HandshakeIdleTimeout bounds the dial (see quicHandshakeTimeout).
+func quicConfig() *quic.Config {
+	return &quic.Config{
+		KeepAlivePeriod:       carrierKeepAlivePeriod,
+		MaxIdleTimeout:        carrierMaxIdleTimeout,
+		MaxIncomingStreams:    quicMaxIncomingStreams,
+		MaxIncomingUniStreams: -1,
+		HandshakeIdleTimeout:  quicHandshakeTimeout,
+	}
+}
+
+// quicTransportAllowed reports whether the current attempt may try the QUIC
+// carrier: the configuration must not have resolved to TCP (proxy_transport
+// tcp, or the http_proxy override that newClientModel applied), and the
+// current control session's AuthResp must have advertised
+// msg.QuicCapability. The capability half is the compatibility rule of
+// SPEC-CLUSTER7 3: a server whose QUIC listener is down -- or that predates
+// the feature entirely -- is never dialed over UDP, whatever the config asks
+// for, and "quic" degrades to the smux path for exactly that reason.
+func (c *ClientModel) quicTransportAllowed() bool {
+	if c.proxyTransport == proxyTransportTCP {
+		return false
+	}
+	return c.quicPeerCap.Load()
+}
+
+// dialSession establishes one mux session on the best carrier available for
+// this attempt (SPEC-CLUSTER7 5): QUIC when the configuration allows it and
+// the server advertised the capability, the smux path otherwise -- including
+// immediately after a failed QUIC dial, which falls through to the smux dial
+// inside the same watchdog attempt cycle rather than spending an attempt of
+// its own. A QUIC dial failure is a fallback signal, not a condition to
+// retry: an ALPN mismatch is an old server on that port, an unreachable UDP
+// path is a middlebox or a firewall, and neither improves by being dialed
+// twice in a row. The next attempt prefers QUIC again, and the give-up
+// arithmetic (which counts failed attempts, not carriers) never sees the QUIC
+// leg on its own.
+func (c *ClientModel) dialSession() (*muxSession, error) {
+	if c.quicTransportAllowed() {
+		sess, err := c.dialQuicSession()
+		if err == nil {
+			return sess, nil
+		}
+		c.Info("QUIC session dial failed (%v); using the TCP mux path for this attempt", err)
+	}
+	return c.dialMuxSession()
+}
+
+// dialQuicSession establishes one QUIC carrier to the server: dial it with the
+// model's TLS configuration (the same TrustHostRootCerts / embedded CA /
+// NGROK_INSECURE_SKIP_VERIFY decision the control channel made -- only the
+// ALPN is added, cloned rather than mutated so the control conn's config is
+// untouched), declare the session by carrying RegMux on the first stream, and
+// hand the connection to the mux machinery as the carrier.
+//
+// The address is the server address, UDP side: the QUIC listener is expected
+// on the same host and port the TCP server runs on (a port number is two
+// independent bindings, one per protocol). There is no advertisement channel
+// for a different address -- AuthResp carries a capability, not an endpoint --
+// so an operator running QUIC elsewhere has nothing to point this client at,
+// and the honest state is that the capability then stays off.
+//
+// RegMux over the first stream is the same session bind the smux path makes on
+// the raw conn before smux takes over: same message, same credentials, same
+// server-side refusal (an unknown client or a wrong secret gets the conn
+// closed, which shows up here as a session that dies at once, handled like any
+// other mux failure). The registration stream is closed once the message is
+// away -- the server retires its end right after reading it, and a stream
+// retired on both ends does not sit on the session's stream budget for the
+// session's life.
+func (c *ClientModel) dialQuicSession() (*muxSession, error) {
+	// http_proxy cannot reach this line (the constructor resolves it to TCP),
+	// which is load-bearing: quic.DialAddr opens UDP directly and would skip a
+	// configured CONNECT proxy in silence, sending traffic somewhere the
+	// operator explicitly routed away from.
+	//
+	// A nil tls.Config means what it means on the TCP path (conn.Dial skips
+	// StartTLS for one): library defaults. QUIC has no un-TLS'd mode, so the
+	// nil is substituted, never skipped -- and defaults verify the server
+	// certificate, which is exactly the fallback signal against a server this
+	// client does not trust.
+	tlsCfg := &tls.Config{}
+	if c.tlsConfig != nil {
+		tlsCfg = c.tlsConfig.Clone()
+	}
+	tlsCfg.NextProtos = []string{quicALPN}
+
+	qconn, err := quic.DialAddr(context.Background(), c.serverAddr, tlsCfg, quicConfig())
+	if err != nil {
+		return nil, fmt.Errorf("QUIC dial to %s failed: %v", c.serverAddr, err)
+	}
+
+	// RegMux carries the session's credentials like RegProxy does (see
+	// dialMuxSession): attaching a mux session to a client id means every
+	// stream on it is a proxy connection for that client's tunnels.
+	stream, err := qconn.OpenStream()
+	if err != nil {
+		qconn.CloseWithError(quicSessionCloseCode, "failed to open the registration stream")
+		return nil, fmt.Errorf("failed to open the QUIC registration stream: %v", err)
+	}
+	regConn := conn.Wrap(newQuicStreamConn(stream, qconn), "mux")
+	if err = msg.WriteMsg(regConn, &msg.RegMux{ClientId: c.id, Secret: c.sessionSecretValue()}); err != nil {
+		regConn.Close()
+		qconn.CloseWithError(quicSessionCloseCode, "failed to register the session")
+		return nil, fmt.Errorf("failed to write RegMux on the QUIC session: %v", err)
+	}
+	// The bind stream's only job is done: retire it (both directions) so it
+	// stops counting against the session's stream budget. Nothing in the
+	// protocol reads or writes it again.
+	regConn.Close()
+
+	return newMuxSession(&quicCarrier{conn: qconn}, carrierQuic), nil
 }
 
 // dialMuxSession establishes one mux conn to the server: dial it (through the
@@ -1229,7 +1678,7 @@ func (c *ClientModel) dialMuxSession() (*muxSession, error) {
 		return nil, err
 	}
 
-	return newMuxSession(muxConn, sess), nil
+	return newMuxSession(&smuxCarrier{conn: muxConn, sess: sess}, carrierSmux), nil
 }
 
 // muxWatchdog owns the mux transport for one control session (SPEC 3.1): it
@@ -1283,7 +1732,11 @@ func (c *ClientModel) muxWatchdog(stop <-chan struct{}, sess *muxSession) {
 			}
 		}
 
-		newSess, err := c.dialMuxSession()
+		// dialSession picks the carrier for this attempt (QUIC first when
+		// allowed, the smux path otherwise or after a failed QUIC dial) -- the
+		// watchdog's counting, backoff and give-up below are the same for both,
+		// because a failed attempt is a failed attempt whatever it failed on.
+		newSess, err := c.dialSession()
 		if err != nil {
 			attempts++
 			c.Warn("Failed to establish mux session (attempt %d/%d): %v", attempts, muxMaxAttempts, err)
@@ -1302,7 +1755,7 @@ func (c *ClientModel) muxWatchdog(stop <-chan struct{}, sess *muxSession) {
 
 		sess = newSess
 		c.setMuxSession(sess)
-		c.Info("Mux session established with %v", c.serverAddr)
+		c.Info("Mux session established with %v (%s carrier)", c.serverAddr, sess.transport)
 	}
 }
 

@@ -2,23 +2,64 @@ package rewriter
 
 import (
 	"io"
+	"sync"
 
 	"ngrok/conn"
 )
 
+// bufferReleaser is the release handle the pair's readers carry: it lets
+// filteredConn.Close return the direction's pooled 64 KiB read buffer to
+// readBufPool without knowing anything about the state machine behind the
+// reader. See readBufPool in rewriter.go for the pool, and
+// pooledReader.release for the recycling mechanics.
+type bufferReleaser interface {
+	releaseBuffer()
+}
+
 // filteredConn is the conn.Conn adapter for one direction: Read returns
-// rewriter-transformed bytes, while everything else -- Write, Close, the
-// deadlines, CloseRead, Id, SetType and the log.Logger methods -- is the
-// embedded connection's own behavior. Delegating rather than reimplementing
+// rewriter-transformed bytes, while everything else -- Write, the deadlines,
+// CloseRead, Id, SetType and the log.Logger methods -- is the embedded
+// connection's own behavior. Delegating rather than reimplementing
 // keeps the wrapper invisible to conn.Join and to the rest of the plumbing that
 // writes to and logs through these connections.
 type filteredConn struct {
 	conn.Conn
 	r io.Reader
+
+	// releaseOnce guards the one buffer release this adapter is responsible
+	// for. It is per-adapter, and conn.Join closes each leg from both pipe
+	// goroutines, so Close here runs twice per direction in every join; the
+	// Once keeps that from ever turning into a double Put of the same array
+	// (two connections would hold one buffer -- the corruption class
+	// TestJoinStagingBufferIsNotShared pins for joinBufPool). Idempotent again
+	// inside pooledReader.release, which is also where the "safe when pooling
+	// is off" behavior lives.
+	releaseOnce sync.Once
 }
 
 func (c *filteredConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
+}
+
+// Close closes the wrapped connection first and then releases the direction's
+// read buffer, once. The order matters: closing the underlying connection is
+// what ends a read the other join goroutine still has parked in this
+// direction's rewriter (a read is never woken by the release below), and the
+// release itself never waits -- it recycles the buffer if this direction's
+// copy has ended, or marks it for recycling at that copy's own termination
+// (pooledReader.release). This is the ONE release site for the pair's
+// buffers: conn.Join defers Close on both legs of both directions
+// (conn/conn.go), so the client relay and the server join need no changes,
+// and every path out of a joined pair goes through here exactly once per
+// direction.
+func (c *filteredConn) Close() error {
+	err := c.Conn.Close()
+	c.releaseOnce.Do(func() {
+		if rl, ok := c.r.(bufferReleaser); ok {
+			rl.releaseBuffer()
+		}
+	})
+	return err
 }
 
 // NewConnPair is NewPair for the live path: it wraps the two readers in

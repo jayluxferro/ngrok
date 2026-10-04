@@ -11,6 +11,7 @@ type Options struct {
 	httpAddr     string
 	httpsAddr    string
 	tunnelAddr   string
+	quicAddr     string
 	adminAddr    string
 	adminAuth    string
 	adminToken   string
@@ -37,6 +38,7 @@ func parseArgs() *Options {
 	httpAddr := flag.String("httpAddr", ":80", "Public address for HTTP connections, empty string to disable")
 	httpsAddr := flag.String("httpsAddr", ":443", "Public address listening for HTTPS connections, emptry string to disable")
 	tunnelAddr := flag.String("tunnelAddr", ":4443", "Public address listening for ngrok client")
+	quicAddr := flag.String("quicAddr", "", "Public address listening for QUIC proxy sessions (UDP), empty string to disable")
 	adminAddr := flag.String("adminAddr", "", "Address for admin endpoints (/healthz, /metrics), empty to disable")
 	adminAuth := flag.String("adminAuth", "", "Admin basic auth in user:password format")
 	adminToken := flag.String("adminToken", "", "Admin token required via X-Ngrok-Admin-Token")
@@ -88,6 +90,7 @@ func parseArgs() *Options {
 		seen.str(httpAddr, cfg.HttpAddr, "httpAddr")
 		seen.str(httpsAddr, cfg.HTTPSAddr, "httpsAddr")
 		seen.str(tunnelAddr, cfg.TunnelAddr, "tunnelAddr")
+		seen.str(quicAddr, cfg.QuicAddr, "quicAddr")
 		seen.str(adminAddr, cfg.AdminAddr, "adminAddr")
 		seen.str(adminAuth, cfg.AdminAuth, "adminAuth")
 		seen.str(adminToken, cfg.AdminToken, "adminToken")
@@ -124,6 +127,7 @@ func parseArgs() *Options {
 		httpAddr:     *httpAddr,
 		httpsAddr:    *httpsAddr,
 		tunnelAddr:   *tunnelAddr,
+		quicAddr:     *quicAddr,
 		adminAddr:    *adminAddr,
 		adminAuth:    *adminAuth,
 		adminToken:   *adminToken,

@@ -1,4 +1,156 @@
 # Changelog
+## 1.0.9 - 2026-10-04 - QUIC agent transport + pooled rewriter buffers
+
+Two throughput changes with the same target: the cost of moving many streams
+through one tunnel. QUIC becomes an alternative carrier for the multiplexed
+agent→server proxy connection, so one lost packet no longer stalls every
+stream behind it (that is what TCP head-of-line blocking does to a smux
+carrier), and the rewriter stops allocating its two 64 KiB read buffers per
+connection. Both are invisible when they work: with QUIC disabled -- the
+default -- nothing changes for anyone.
+
+### Server
+
+QUIC is opt-in and off by default. `-quicAddr` (or `quic_addr` in the server
+config) turns on a UDP listener beside the TCP tunnel listener -- a port
+number is two independent bindings, one per protocol, so the QUIC endpoint
+lives on the same port the clients already know:
+
+```yaml
+# ngrokd config
+quic_addr: 0.0.0.0:4443    # empty (the default) = QUIC disabled
+```
+
+The default footprint is unchanged: one TCP port. With the listener up, the
+server advertises a new `proxy-quic` capability in AuthResp, and only then --
+the capability is what authorizes clients to dial UDP at all, so a server
+that never opted in is never QUIC-dialed, and one that stops advertising it
+stops receiving QUIC sessions without any operator action.
+
+The QUIC handshake reuses the tunnel listener's certificate pair and requires
+the ALPN protocol `ngrok` in both directions. A peer that answers with any
+other protocol -- an old server on that port, or some other UDP service --
+fails the handshake and nothing else happens; cross-protocol misdirection is
+refused by TLS, not by hope.
+
+Sessions mirror the smux flow exactly, with no new message types: the first
+stream of a QUIC session carries `RegMux` (the session bind -- unknown
+client closed, secret compared in constant time, replace-and-close-prior in
+the control's session slot), and every later stream carries `RegProxy`, which
+re-verifies the client id and secret per stream exactly as the smux path
+does. The smux session shape was extracted into a `streamSession` interface
+(`AcceptStream`/`Close`) that both carriers implement, and both hand
+identical `net.Conn`s to `RegisterProxy` -- downstream of that handoff, the
+transport a stream arrived on is unknowable, which is the point.
+
+### Client
+
+`proxy_transport` selects the carrier the multiplexed proxy connection rides
+(`auto` by default), or `-proxy-transport` on the command line:
+
+```yaml
+# ngrok client config
+server_addr: your-server.com:4443
+proxy_transport: auto   # auto (default) | quic | tcp
+```
+
+- **`auto`** prefers QUIC whenever the server advertised `proxy-quic`, and on
+  a failed QUIC dial falls through to the TCP+smux path *inside the same
+  attempt* -- a fallback spends no extra attempt of the give-up arithmetic,
+  which still counts 8. The preference is re-evaluated per attempt, so a
+  server whose QUIC listener comes and goes sees clients follow it with no
+  configuration change.
+- **`quic`** pins the QUIC carrier, subject to the same capability gate: a
+  server that does not advertise `proxy-quic` gets a smux session even from a
+  client that asked for QUIC. The capability, not the config, decides what is
+  possible; the config decides what is preferred.
+- **`tcp`** pins today's behavior byte-for-byte.
+
+Named tunnels also gain `traffic_policy_file`, the config-file twin of
+`-traffic-policy-file`: the policy lives in the named file instead of inline
+under `traffic_policy`, is resolved once at load with the same validation an
+inline document gets, and naming both spellings on one tunnel is refused --
+they are alternatives, like the two cert models in the `tls` block.
+
+`http_proxy` forces `tcp` regardless of the setting, logged at INFO: an HTTP
+CONNECT proxy carries TCP and cannot carry the UDP a QUIC session needs, and
+a client that silently ignored the override would look healthy and never
+move a stream.
+
+The QUIC dial uses the same TLS trust decision as the control channel
+(`trust_host_root_certs`, embedded CAs, `NGROK_INSECURE_SKIP_VERIFY`) with
+only the ALPN added. Keepalive (10s) and idle timeout (30s) are the values
+smux already ran, shared by both carriers, with no new knobs.
+
+### Rewriter buffer pooling
+
+Every connection the header rewriter serves paid for two 64 KiB `bufio`
+backing arrays -- one per direction -- on the client's HTTP relay and on
+every policy-hooked server connection. Both now come from a package-private
+`sync.Pool`: **two allocations per connection saved**, with zero call-site
+changes outside `rewriter/`. The buffers are read-only scratch, so recycling
+is safe; what makes it *correct* is the release discipline:
+
+- **One release site.** `filteredConn.Close` returns each direction's buffer
+  to the pool through a `sync.Once`. Every path out of a joined pair already
+  goes through that Close, so client relay and server join needed no changes
+  -- and a double release, which would hand one buffer to two live
+  connections, is structurally impossible rather than merely avoided.
+- **Ownership is tested, not asserted.** The suite covers the corruption
+  class head-on: exactly-once release under concurrent Close, a scribbled
+  (poisoned) released buffer never reaching a live connection, release at
+  mid-stream termination, and an `AllocsPerRun` test that pins the
+  per-connection drop so a future change cannot quietly give it back.
+
+Deliberately not pooled: the request-head replay buffer (it escapes into the
+connection's replay path and lives as long as the connection does) and the
+tee readers used by analyzer goroutines (they can outlive the join). Pooling
+those would trade a real aliasing hazard for two allocations.
+
+### Both
+
+- **quic-go is pinned at v0.45.0** -- the newest release declaring `go 1.21`,
+  this fork's toolchain pin (v0.46+ needs go 1.22). The upgrade rides the
+  eventual deliberate toolchain bump; the pin and its reason live in go.mod.
+- **Watchdog, backoff and session-lifetime logic are carrier-blind.** A dead
+  QUIC session is handled like a dead smux session: an attempt, a backoff, a
+  fallback. The e2e suite proves the flip side by restarting the server
+  without `-quicAddr` under a live client: it reconnects, sees no capability,
+  lands on smux, and keeps serving.
+- The public edge does not speak HTTP/3; nothing about visitor connections
+  changes. QUIC carries the agent leg only.
+
+### Known limitations
+
+- **Loopback benchmarks establish parity, not superiority -- and the table
+  says so in the table.** `scripts/bench.sh` prints the QUIC rows with a NOTE
+  row attached: loopback has no packet loss, and QUIC's win is per-stream
+  independence *under loss*, so the head-of-line-blocking win cannot show on
+  a lossless wire. Measured on the development box (macOS), the QUIC carrier
+  matched smux on conn-rate (deltas inside the harness's own documented
+  same-binaries noise band) and ran 11-16% behind on keep-alive, and was
+  ~8x behind on bulk (≈58-60 vs ≈470-480 MiB/s): quic-go's batched UDP
+  syscalls (`recvmmsg`) and GSO are Linux-only, so on darwin every datagram
+  is a per-packet syscall at bulk rates. Linux numbers are unmeasured; treat
+  the bulk gap as a property of this box until measured elsewhere.
+- **The control channel stays on TCP+TLS, by design.** It is low-volume and
+  latency-tolerant, and keeping it independent of the experimental transport
+  is what makes a QUIC outage survivable: the control connection negotiates
+  every capability, so a broken QUIC path is a fallback, not an outage.
+- **First-QUIC-dial latency on lossy paths is unmeasured.** A QUIC handshake
+  can need more round trips than TCP+TLS on a lossy path, which could make
+  the first stream slower than smux for small transfers. What is known: the
+  handshake is bounded (5s), a failed or timed-out dial falls through to smux
+  in the same attempt, and the fallback is the reason the uncertainty above
+  is a latency question, not an availability one.
+- **A firewall that silently drops UDP** shows up as a QUIC dial failure and
+  the client falls back to smux per attempt -- correct, but the QUIC dial is
+  re-attempted on every reconnect. Open the tunnel port's UDP side
+  end-to-end if you want the QUIC carrier, not just its TCP side.
+- **No QUIC through `http_proxy`** -- not a missing feature but a protocol
+  fact (CONNECT cannot carry UDP); the client forces tcp there and says so at
+  INFO.
+
 ## 1.0.8 - 2026-10-04 - Traffic-policy authentication actions
 
 Four request-phase actions that ask who is calling before a request goes any

@@ -93,6 +93,13 @@ type Options struct {
 	tlsKey              string
 	tlsCaCrt            string
 	tlsCaKey            string
+
+	// proxyTransport is the value of -proxy-transport (SPEC-CLUSTER7 5): a
+	// client-level setting like -authtoken, not a per-tunnel one, so it
+	// overrides the config file's proxy_transport key whenever it is not
+	// empty. The empty default is what makes "flag not given" observable, and
+	// LoadConfiguration validates whichever value won.
+	proxyTransport string
 }
 
 // stringList is a flag.Value that accumulates each occurrence of a repeatable
@@ -144,6 +151,11 @@ func ParseArgs() (opts *Options, err error) {
 		"authtoken",
 		"",
 		"Authentication token for identifying an ngrok.com account")
+
+	proxyTransport := flag.String(
+		"proxy-transport",
+		"",
+		"Transport carrying the multiplexed proxy connection to the server: 'auto' (default: QUIC when the server offers it, falling back to TCP), 'quic' or 'tcp'. Setting http_proxy forces TCP regardless: QUIC needs UDP end-to-end, which an HTTP CONNECT proxy cannot carry.")
 
 	httpauth := flag.String(
 		"httpauth",
@@ -261,6 +273,7 @@ func ParseArgs() (opts *Options, err error) {
 		subdomain:            *subdomain,
 		protocol:             *protocol,
 		authtoken:            *authtoken,
+		proxyTransport:       *proxyTransport,
 		hostname:             *hostname,
 		hostHeader:           *hostHeader,
 		requestHeaderAdd:     *requestHeaderAdd,

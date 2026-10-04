@@ -20,13 +20,25 @@ import (
 )
 
 type Configuration struct {
-	HttpProxy          string                          `yaml:"http_proxy,omitempty"`
-	ServerAddr         string                          `yaml:"server_addr,omitempty"`
-	InspectAddr        string                          `yaml:"inspect_addr,omitempty"`
-	InspectAuth        string                          `yaml:"inspect_auth,omitempty"`
-	InspectToken       string                          `yaml:"inspect_token,omitempty"`
-	InspectMaxBodySize int64                           `yaml:"inspect_max_body_bytes,omitempty"`
-	ProxyMaxConcurrent int                             `yaml:"proxy_max_concurrency,omitempty"`
+	HttpProxy          string `yaml:"http_proxy,omitempty"`
+	ServerAddr         string `yaml:"server_addr,omitempty"`
+	InspectAddr        string `yaml:"inspect_addr,omitempty"`
+	InspectAuth        string `yaml:"inspect_auth,omitempty"`
+	InspectToken       string `yaml:"inspect_token,omitempty"`
+	InspectMaxBodySize int64  `yaml:"inspect_max_body_bytes,omitempty"`
+	ProxyMaxConcurrent int    `yaml:"proxy_max_concurrency,omitempty"`
+
+	// ProxyTransport selects the carrier the multiplexed proxy connection
+	// (SPEC cluster 3, 3.1) travels on (SPEC-CLUSTER7 5): "auto" prefers QUIC
+	// when the server offers it and falls back to TCP per attempt, "quic" and
+	// "tcp" pin one carrier (pinning quic still respects the capability gate:
+	// a server without msg.QuicCapability is never dialed over UDP). The
+	// value is validated against the enum at load -- a typo is a startup
+	// error, not a silently different transport -- and resolved against
+	// http_proxy in newClientModel, which is where the override is logged:
+	// QUIC is UDP end-to-end, and an HTTP CONNECT proxy cannot carry it, so a
+	// proxy URL always resolves to TCP.
+	ProxyTransport     string                          `yaml:"proxy_transport,omitempty"`
 	TrustHostRootCerts bool                            `yaml:"trust_host_root_certs,omitempty"`
 	AuthToken          string                          `yaml:"auth_token,omitempty"`
 	Tunnels            map[string]*TunnelConfiguration `yaml:"tunnels,omitempty"`
@@ -110,6 +122,15 @@ type TunnelConfiguration struct {
 	// and is not a shape this struct can carry. docs/CHANGELOG.md has the
 	// deviation and the one nested spelling it does not catch.
 	TrafficPolicy *policy.TrafficPolicy `yaml:"traffic_policy,omitempty"`
+
+	// TrafficPolicyFile is traffic_policy_file, the config-file twin of
+	// -traffic-policy-file: the policy lives in the named file instead of
+	// inline under traffic_policy. It is resolved once at load -- the file is
+	// read and its document takes TrafficPolicy's place -- so validation and
+	// the wire see one policy however it was sourced. Naming both a file and
+	// an inline policy is refused, exactly like naming both cert models in
+	// the tls block.
+	TrafficPolicyFile string `yaml:"traffic_policy_file,omitempty"`
 }
 
 // Compress reports whether responses on this tunnel may be gzip-compressed
@@ -138,6 +159,26 @@ const (
 	// (msg.BindingInternal, msg.InternalSuffix). The client checks them so that
 	// a config that could never be reachable fails at load instead of at
 	// registration; the server is what enforces them.
+)
+
+// The proxy_transport vocabulary (SPEC-CLUSTER7 5). This is client-side
+// configuration, not wire vocabulary, so the consts live here rather than in
+// package msg: the server never sees the value -- it sees which carrier the
+// client dialed, and says whether QUIC exists at all with its AuthResp
+// capability.
+const (
+	// ProxyTransportAuto prefers QUIC per watchdog attempt when the server
+	// advertises msg.QuicCapability, falling back to the TCP path within the
+	// same attempt on a failed QUIC dial. The default.
+	ProxyTransportAuto = "auto"
+
+	// ProxyTransportQuic pins the QUIC carrier, subject to the same
+	// capability gate and the same http_proxy override as auto.
+	ProxyTransportQuic = "quic"
+
+	// ProxyTransportTCP pins the TCP+smux carrier, which is what the
+	// transport ran before SPEC-CLUSTER7.
+	ProxyTransportTCP = "tcp"
 )
 
 func LoadConfiguration(opts *Options) (config *Configuration, err error) {
@@ -277,6 +318,21 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
+		// traffic_policy_file is resolved here, before validateTrafficPolicy,
+		// so the validation below polices one policy however it was sourced:
+		// a malformed document in the file produces the same loud load-time
+		// error an inline one does, naming the tunnel and the file.
+		if t.TrafficPolicyFile != "" {
+			if t.TrafficPolicy != nil {
+				err = fmt.Errorf("Tunnel %s: traffic_policy and traffic_policy_file are alternatives -- choose one, not both", name)
+				return
+			}
+			if t.TrafficPolicy, err = loadTrafficPolicyFile(t.TrafficPolicyFile); err != nil {
+				err = fmt.Errorf("Tunnel %s: %v", name, err)
+				return
+			}
+		}
+
 		if err = validateTrafficPolicy(name, t); err != nil {
 			return
 		}
@@ -298,6 +354,30 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	config.Path = configPath
 	if opts.authtoken != "" {
 		config.AuthToken = opts.authtoken
+	}
+
+	// -proxy-transport (SPEC-CLUSTER7 5), like -authtoken, is a client-level
+	// setting rather than a per-tunnel one. The flag's empty default leaves
+	// the config file's value standing; an explicit value overrides it. The
+	// switch below validates whichever won, so a typo is the same startup
+	// error by either road.
+	if opts.proxyTransport != "" {
+		config.ProxyTransport = opts.proxyTransport
+	}
+
+	// Validate proxy_transport now, after the flag had its say and before
+	// anything dials. Case and surrounding space are normalized first, the
+	// way binding is: "QUIC" means "quic", not a startup error about a value
+	// the operator clearly meant.
+	config.ProxyTransport = strings.ToLower(strings.TrimSpace(config.ProxyTransport))
+	switch config.ProxyTransport {
+	case "":
+		config.ProxyTransport = ProxyTransportAuto
+	case ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP:
+	default:
+		err = fmt.Errorf("proxy_transport must be one of '%s', '%s' or '%s', got '%s' (in the config file or via -proxy-transport)",
+			ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP, config.ProxyTransport)
+		return
 	}
 
 	// -remote-port is a uint64 flag feeding a uint16 wire field: reject an

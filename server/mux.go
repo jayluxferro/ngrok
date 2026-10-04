@@ -1,9 +1,10 @@
 package server
 
 // This file implements the server end of the multiplexed proxy transport (SPEC
-// cluster 3, section 3.1): one long-lived smux connection per client, carrying
-// every proxy connection that client serves as a stream instead of as a fresh
-// TCP+TLS dial.
+// cluster 3, section 3.1): one long-lived multiplexed connection per client,
+// carrying every proxy connection that client serves as a stream instead of as
+// a fresh TCP+TLS dial. Since SPEC cluster 7 the carrier is pluggable: smux
+// over TCP+TLS (here) or QUIC (server/quic.go), both shaped as streamSession.
 //
 // The design goal is how little of the server changes. A stream is wrapped into
 // a conn.Conn, reads the same RegProxy message a dialed proxy conn sends, and
@@ -13,6 +14,7 @@ package server
 // round trip per proxied connection that no longer happen, not a new data path.
 
 import (
+	"net"
 	"sync"
 	"time"
 
@@ -31,6 +33,25 @@ const (
 	// a fresh connection.
 	muxStreamReadTimeout = 10 * time.Second
 )
+
+// streamSession is the transport-level shape of a multiplexed proxy session
+// (SPEC cluster 7): something a client opens per-proxy streams on, and whose
+// death ends them all. smux over TCP+TLS and a QUIC connection both implement
+// it, which is what lets the control's session slot (Control.SetMuxSession),
+// the accept loop and the per-stream RegProxy re-verification below stay
+// transport-blind -- the carrier is exactly the part that differs.
+type streamSession interface {
+	// AcceptStream returns the next stream the client opened, blocking until
+	// one arrives, and returns an error once the session is dead -- which is
+	// what makes the accept loop double as the session's death watch.
+	AcceptStream() (net.Conn, error)
+
+	// Close tears the session down, failing every stream still on it. Closing
+	// must be idempotent: the session is closed from three places (its own
+	// accept loop, the control shutting down or replacing it, and the handler
+	// that accepted it).
+	Close() error
+}
 
 // muxConfig is the smux configuration for the server side of a mux session.
 //
@@ -149,6 +170,13 @@ func newMuxSession(muxConn conn.Conn, sess *smux.Session, ctl *Control, clientId
 	return m
 }
 
+// AcceptStream implements streamSession. smux's Stream is already a net.Conn,
+// so the stream travels through conn.Wrap and the rest of the conn.Conn stack
+// as itself; nothing is adapted.
+func (m *MuxSession) AcceptStream() (net.Conn, error) {
+	return m.sess.AcceptStream()
+}
+
 // acceptLoop turns every stream the client opens into a proxy connection, and
 // doubles as the session's death watch.
 //
@@ -164,33 +192,40 @@ func (m *MuxSession) acceptLoop() {
 	}()
 
 	for {
-		stream, err := m.sess.AcceptStream()
+		stream, err := m.AcceptStream()
 		if err != nil {
 			m.Info("Mux session ended: %v", err)
 			m.Close()
 			return
 		}
 
-		go m.handleStream(stream)
+		go registerProxyStream(m.id, m.ctl, stream)
 	}
 }
 
-// handleStream registers one mux stream as a proxy connection.
+// registerProxyStream registers one accepted stream -- of either transport --
+// as a proxy connection. This is the shape MuxSession.handleStream had when
+// smux was the only carrier; the QUIC session (server/quic.go) hands its
+// streams to the same function, which is the load-bearing half of the
+// streamSession equivalence: whatever the carrier, what reaches
+// RegisterProxy is produced by exactly this code.
 //
 // The steps mirror NewProxy's -- read RegProxy, find the control it names,
 // register -- with checks that only a stream can make: the client id must be
 // the one this session registered as, the control it names must still be this
 // session's control, and the session secret in the RegProxy must be the
-// control's. The streams of one mux conn are not authenticated individually by
-// the transport, so each one re-states the session's credentials; anything that
-// does not line up is closed and never pooled. That is either a bug or an
-// attempt to borrow somebody else's tunnels.
+// control's. The streams of one mux session are not authenticated individually
+// by the transport (a QUIC stream no more than an smux one), so each one
+// re-states the session's credentials; anything that does not line up is
+// closed and never pooled. That is either a bug or an attempt to borrow
+// somebody else's tunnels.
 //
-// The secret check is not redundant with NewMux's: a mux session outlives the
-// control connection's authentication, its streams are opened at the client's
-// discretion, and m.id/controlRegistry alone say only that the sender knows a
-// public identifier.
-func (m *MuxSession) handleStream(stream *smux.Stream) {
+// The secret check is not redundant with the session bind's: a mux session
+// outlives the control connection's authentication, its streams are opened at
+// the client's discretion, and sessionId/controlRegistry alone say only that
+// the sender knows a public identifier. ("Mux stream" in the messages covers
+// both carriers: they are the same multiplexed proxy transport.)
+func registerProxyStream(sessionId string, ctl *Control, stream net.Conn) {
 	// A control that shuts down while a stream is registering closes the pool
 	// channel under it. NewProxy guards its registration the same way: the panic
 	// must take down this stream (the deferred close) and not the process.
@@ -216,19 +251,19 @@ func (m *MuxSession) handleStream(stream *smux.Stream) {
 		return
 	}
 
-	if regPxy.ClientId != m.id || controlRegistry.Get(regPxy.ClientId) != m.ctl {
-		pxyConn.Warn("Rejecting mux stream for %s: session belongs to %s", regPxy.ClientId, m.id)
+	if regPxy.ClientId != sessionId || controlRegistry.Get(regPxy.ClientId) != ctl {
+		pxyConn.Warn("Rejecting mux stream for %s: session belongs to %s", regPxy.ClientId, sessionId)
 		pxyConn.Close()
 		return
 	}
 
-	if !secretMatches(m.ctl.secret, regPxy.Secret) {
+	if !secretMatches(ctl.secret, regPxy.Secret) {
 		pxyConn.Warn("Rejecting mux stream for %s: invalid session secret", regPxy.ClientId)
 		pxyConn.Close()
 		return
 	}
 
-	m.ctl.RegisterProxy(pxyConn)
+	ctl.RegisterProxy(pxyConn)
 }
 
 // Close tears the session down: the smux session (and with it every stream) and

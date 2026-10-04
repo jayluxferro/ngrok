@@ -46,14 +46,17 @@ type Control struct {
 	// proxy connections
 	proxies chan conn.Conn
 
-	// mux session (SPEC 3.1): the client's multiplexed proxy connection, if it
-	// opened one. Its streams are this control's proxy connections, so it is
-	// attached when the client registers it, replaced when the client
-	// reconnects, and closed when this control shuts down. muxMu guards the
-	// slot: the tunnel listener attaches sessions while the stopper (and the
-	// session's own accept loop) clear them.
+	// mux session (SPEC 3.1, and since cluster 7 over either carrier): the
+	// client's multiplexed proxy connection, if it opened one. Its streams are
+	// this control's proxy connections, so it is attached when the client
+	// registers it, replaced when the client reconnects, and closed when this
+	// control shuts down. The slot holds the transport-blind streamSession
+	// interface, so a session over smux and one over QUIC live here
+	// identically. muxMu guards the slot: the tunnel (or QUIC) listener
+	// attaches sessions while the stopper (and the session's own accept loop)
+	// clear them.
 	muxMu sync.Mutex
-	mux   *MuxSession
+	mux   streamSession
 
 	// identifier: the client id this session was registered under. It is
 	// immutable from the moment NewControl has decided it -- the affinity
@@ -247,12 +250,21 @@ func NewControl(ctlConn conn.Conn, authMsg *msg.Auth) {
 	// Secret is the session secret the client must present to resume this id
 	// and to register proxy connections and mux sessions for it. It is written
 	// to the control channel and nowhere else.
+	//
+	// QuicCapability is advertised only while the QUIC listener is up
+	// (server/quic.go): the capability promises a listener that does not exist
+	// in the default configuration, and a client that never sees the cap keeps
+	// the transport it has always used.
+	caps := []string{"sha256_tokens", "rate_limits", msg.MuxCapability}
+	if quicServing.Load() {
+		caps = append(caps, msg.QuicCapability)
+	}
 	c.out <- &msg.AuthResp{
 		Version:   version.Proto,
 		MmVersion: version.MajorMinor(),
 		ClientId:  c.id,
 		Secret:    c.secret,
-		Caps:      []string{"sha256_tokens", "rate_limits", msg.MuxCapability},
+		Caps:      caps,
 	}
 
 	// As a performance optimization, ask for a proxy connection up front
@@ -465,16 +477,18 @@ func (c *Control) stopper() {
 
 // SetMuxSession attaches a client's multiplexed proxy connection to this
 // control (SPEC 3.1), replacing -- and closing -- whatever session the client
-// had before.
+// had before, whichever transport each one rides (the replace-and-close-prior
+// semantics are transport-blind, so a client may move between smux and QUIC
+// the way it would between two mux conns).
 //
 // A second mux session for one control is what a client that reconnected looks
 // like: the previous one is dead or dying by definition, and its streams must
 // never be handed to a public connection again, so the old session is closed
 // rather than left to be discovered as stale.
-func (c *Control) SetMuxSession(m *MuxSession) {
+func (c *Control) SetMuxSession(s streamSession) {
 	c.muxMu.Lock()
 	old := c.mux
-	c.mux = m
+	c.mux = s
 	c.muxMu.Unlock()
 
 	if old != nil {
@@ -482,31 +496,41 @@ func (c *Control) SetMuxSession(m *MuxSession) {
 	}
 }
 
-// MuxSession returns this control's mux session, or nil when the client has not
-// registered one (a pre-mux agent, or the window before it does).
-func (c *Control) MuxSession() *MuxSession {
+// boundSession returns this control's mux session whatever transport carries
+// it (smux or QUIC), or nil when the client has not registered one (a pre-mux
+// agent, or the window before it does).
+func (c *Control) boundSession() streamSession {
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
 	return c.mux
 }
 
+// MuxSession returns this control's smux-backed mux session, or nil when the
+// client has not registered one -- or registered it over QUIC, in which case
+// the session is in the slot but is not an *MuxSession; boundSession returns
+// whatever transport is actually carrying it.
+func (c *Control) MuxSession() *MuxSession {
+	m, _ := c.boundSession().(*MuxSession)
+	return m
+}
+
 // takeMuxSession detaches and returns the control's mux session, if any, so the
 // caller can close it without holding the lock.
-func (c *Control) takeMuxSession() *MuxSession {
+func (c *Control) takeMuxSession() streamSession {
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
 
-	m := c.mux
+	s := c.mux
 	c.mux = nil
-	return m
+	return s
 }
 
 // clearMuxSession drops the control's reference to a session that is closing on
 // its own (its accept loop ended), so that a dead session is not reported as a
 // live one.
-func (c *Control) clearMuxSession(m *MuxSession) {
+func (c *Control) clearMuxSession(s streamSession) {
 	c.muxMu.Lock()
-	if c.mux == m {
+	if c.mux == s {
 		c.mux = nil
 	}
 	c.muxMu.Unlock()

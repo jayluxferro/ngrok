@@ -271,6 +271,37 @@ configurable header, plain 401 — there is no standard challenge for a
 custom header) round out the set; see [docs/CHANGELOG.md](docs/CHANGELOG.md)
 for their exact config shapes and the current limitations.
 
+**QUIC proxy transport (agent leg).** The multiplexed connection that carries
+tunnel traffic between agent and server can ride QUIC instead of TCP+smux, so
+a lost packet stalls only its own stream rather than every stream behind it
+(TCP head-of-line blocking). It is negotiated by capability and off unless
+the server opts in — the server gains a UDP listener beside its TCP tunnel
+listener (a port number is two independent bindings, one per protocol):
+
+```yaml
+# ngrokd config
+quic_addr: 0.0.0.0:4443   # empty (the default) = QUIC disabled
+```
+
+and the client picks a carrier — `auto` (the default) prefers QUIC whenever
+the server advertised the `proxy-quic` capability and falls back to TCP+smux
+on any failed QUIC dial within the same reconnect attempt; `quic` pins QUIC
+(still only when the server offers it); `tcp` pins today's behavior:
+
+```yaml
+# ngrok client config
+server_addr: your-server.com:4443
+proxy_transport: auto     # auto (default) | quic | tcp
+```
+
+The QUIC handshake uses the tunnel listener's certificate and the same trust
+decision as the control connection, and requires the ALPN protocol `ngrok` —
+a peer answering with anything else fails the handshake and the client falls
+back. `http_proxy` forces `tcp` regardless (an HTTP CONNECT proxy cannot
+carry the UDP a QUIC session needs). **Firewall note:** the tunnel port's
+*UDP* side must be open end-to-end; a path that silently drops UDP degrades
+to smux on every attempt — never an outage, but never QUIC either.
+
 **Tunnel an IoT/TCP device.** A plain tcp tunnel forwards raw bytes to a
 local service port — e.g. a Levis IoT node listening on `127.0.0.1:5681`:
 
@@ -299,6 +330,10 @@ Options:
   -subdomain=name    Request a specific subdomain
   -hostname=name     Request a specific hostname
   -authtoken=token   Authentication token (for self-hosted server)
+  -proxy-transport=name
+                     Carrier for the multiplexed proxy connection to the server:
+                     auto (default: QUIC when the server offers it, falling back to
+                     TCP), quic, or tcp. Setting http_proxy forces TCP regardless
   -remote-port=N     Claim this fixed public port for a tcp tunnel (reconnects keep it;
                      another auth token is refused it)
   -agent-tls-termination
@@ -320,6 +355,9 @@ Options:
   -httpAddr=:80      HTTP listening address (for public tunnel traffic)
   -httpsAddr=:443    HTTPS listening address (for public tunnel traffic)
   -tunnelAddr=:4443  Tunnel control connection address (for ngrok clients, TLS-encrypted)
+  -quicAddr=addr     Public address listening for QUIC proxy sessions (UDP), empty
+                     string to disable; the tunnel port's number works as the QUIC
+                     port too (one TCP + one independent UDP binding)
   -adminAddr=:9090   Admin address for /healthz and /metrics (empty to disable)
   -config=path       YAML config file for ngrokd options
   -adminAuth=u:p     Basic auth for all admin endpoints

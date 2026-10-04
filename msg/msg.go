@@ -246,6 +246,26 @@ const (
 	// connection, which is exactly what a mixed-version deployment needs.
 	MuxCapability = "proxy-mux"
 
+	// QuicCapability is the AuthResp capability that tells a client the server
+	// is running a QUIC listener (SPEC cluster 7), so its proxy streams may
+	// ride a QUIC session -- where a lost packet stalls only the stream it
+	// belongs to -- instead of the TCP+smux carrier. Unlike proxy-mux it gates
+	// something on the server side: the listener is opt-in (-quicAddr), so the
+	// cap is advertised only while it is up, and a client that never sees it
+	// keeps the transport it has always used, which is exactly what a
+	// mixed-version deployment needs.
+	QuicCapability = "proxy-quic"
+
+	// QuicALPN is the application protocol the QUIC transport requires in its
+	// TLS handshake, both directions. Like the rest of the wire vocabulary it
+	// lives here and nowhere else: the ALPN check is what refuses
+	// cross-protocol misdirection (a QUIC client hitting a TCP-only port, or
+	// the reverse) at the handshake, and a mismatch is a refused handshake --
+	// which the client treats as its cue to fall back to the smux carrier,
+	// so even a version skew fails safe. But fail-safe drift is still drift;
+	// one spelling is one spelling.
+	QuicALPN = "ngrok"
+
 	// BindingPublic and BindingInternal are the accepted values of
 	// ReqTunnel.Binding. The empty string is what the wire carries for a public
 	// endpoint, so "public" is a configuration spelling only: the client

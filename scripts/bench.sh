@@ -53,6 +53,26 @@
 #               its chain against the harness's own CA -- a run that silently
 #               lost the zero-knowledge path would fail, not slow down.
 #
+#   quic columns  after each variant's smux numbers, the stack is torn down and
+#               brought back up with the QUIC carrier: ngrokd additionally
+#               runs -quicAddr (UDP on the tunnel port) and the client pins
+#               proxy_transport: quic. bulk, conn-rate and keep-alive run
+#               again, emitting quic_-prefixed keys; the harness FAILS the run
+#               if the client log does not show an established QUIC carrier,
+#               so a silent smux degradation can never be reported as a quic
+#               number. The tls-conn-rate scenarios deliberately do not run
+#               here -- the carrier under test is the agent leg, and one
+#               http endpoint exercises it exactly as well as three.
+#
+#               THE HONESTY CAVEAT, which the table carries too (see the NOTE
+#               row in ROWS): loopback has no packet loss, and QUIC's reason
+#               to exist is per-stream independence under loss -- one lost
+#               packet stalls every stream on the smux carrier and no stream
+#               on the QUIC one. A lossless loopback cannot show that win.
+#               These numbers establish PARITY between the carriers on the
+#               happy path (and the cost of the QUIC handshake on
+#               conn-rate's fresh sessions), not superiority.
+#
 # Honesty rules this script tries to keep:
 #
 #   - No knobs for the numbers. Fixed body size, fixed request counts, fixed
@@ -344,6 +364,10 @@ EOF
 # keeps both rather than pretending the difference is not there.
 scenario_bulk() {
   local label="$1"
+  # key_prefix: "quic_" for the QUIC-carrier leg, empty for the smux one. The
+  # measurement itself is identical -- only the names it reports under differ,
+  # so the two carriers' rows can share a table without displacing each other.
+  local key_prefix="${2:-}"
   local raw="$WORKDIR/bulk-$label.txt"
   local i
 
@@ -354,10 +378,11 @@ scenario_bulk() {
       -H "Host: $BENCH_HOST" "$BASE_URL/bulk" >> "$raw"
   done
 
-  python3 - "$raw" "$BULK_BYTES" "$BULK_RUNS" >> "$WORKDIR/result-$label.env" <<'PY'
+  python3 - "$raw" "$BULK_BYTES" "$BULK_RUNS" "$key_prefix" >> "$WORKDIR/result-$label.env" <<'PY'
 import sys
 
 raw_path, want, runs_expected = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+prefix = sys.argv[4]
 whole, streaming = [], []
 for line in open(raw_path):
     parts = line.split()
@@ -378,11 +403,11 @@ if len(whole) != runs_expected:
 whole.sort()
 streaming.sort()
 mid = len(whole) // 2  # median of an odd run count
-print("bulk_mib_s=%.2f" % whole[mid])
-print("bulk_runs_mib_s=%s" % ",".join("%.2f" % v for v in whole))
-print("bulk_stream_mib_s=%.2f" % streaming[mid])
-print("bulk_bytes=%d" % want)
-print("bulk_runs=%d" % runs_expected)
+print(prefix + "bulk_mib_s=%.2f" % whole[mid])
+print(prefix + "bulk_runs_mib_s=%s" % ",".join("%.2f" % v for v in whole))
+print(prefix + "bulk_stream_mib_s=%.2f" % streaming[mid])
+print(prefix + "bulk_bytes=%d" % want)
+print(prefix + "bulk_runs=%d" % runs_expected)
 PY
 }
 
@@ -400,13 +425,15 @@ PY
 # every response must come back 200 with the fixture's exact body.
 scenario_conn_rate() {
   local label="$1"
-  python3 - "$BENCH_HOST" "$BENCH_HTTP_PORT" "$CONN_RATE_REQUESTS" >> "$WORKDIR/result-$label.env" <<'PY'
+  local key_prefix="${2:-}"
+  python3 - "$BENCH_HOST" "$BENCH_HTTP_PORT" "$CONN_RATE_REQUESTS" "$key_prefix" >> "$WORKDIR/result-$label.env" <<'PY'
 import http.client
 import math
 import sys
 import time
 
 host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+prefix = sys.argv[4]
 times = []
 for i in range(n):
     started = time.perf_counter()
@@ -433,13 +460,19 @@ def pct(p):
     return ordered[max(0, math.ceil(p * n) - 1)]
 
 
-print("conn_rate_rps=%.1f" % (n / total))
-print("conn_rate_total_s=%.3f" % total)
-print("conn_rate_p50_ms=%.2f" % (pct(0.50) * 1000))
-print("conn_rate_p95_ms=%.2f" % (pct(0.95) * 1000))
-print("conn_rate_min_ms=%.2f" % (ordered[0] * 1000))
-print("conn_rate_max_ms=%.2f" % (ordered[-1] * 1000))
-print("conn_rate_n=%d" % n)
+print(prefix + "conn_rate_rps=%.1f" % (n / total))
+print(prefix + "conn_rate_total_s=%.3f" % total)
+print(prefix + "conn_rate_p50_ms=%.2f" % (pct(0.50) * 1000))
+print(prefix + "conn_rate_p95_ms=%.2f" % (pct(0.95) * 1000))
+print(prefix + "conn_rate_min_ms=%.2f" % (ordered[0] * 1000))
+print(prefix + "conn_rate_max_ms=%.2f" % (ordered[-1] * 1000))
+print(prefix + "conn_rate_n=%d" % n)
+# The report's QUIC tail-latency row is keyed quic_p95_ms -- the one place
+# the table drops the scenario name, because the row's point is "the tail on
+# the QUIC carrier" beside the smux p95 row above it. Same number, explicit
+# alias rather than a renamed key, so the JSON keeps the canonical name too.
+if prefix:
+    print(prefix + "p95_ms=%.2f" % (pct(0.95) * 1000))
 PY
 }
 
@@ -456,12 +489,14 @@ PY
 # code are checked, so a run that half-failed cannot be read as a fast one.
 scenario_keepalive() {
   local label="$1"
-  python3 - "$BENCH_HOST" "$BENCH_HTTP_PORT" "$KEEPALIVE_REQUESTS" >> "$WORKDIR/result-$label.env" <<'PY'
+  local key_prefix="${2:-}"
+  python3 - "$BENCH_HOST" "$BENCH_HTTP_PORT" "$KEEPALIVE_REQUESTS" "$key_prefix" >> "$WORKDIR/result-$label.env" <<'PY'
 import subprocess
 import sys
 import time
 
 host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+prefix = sys.argv[4]
 url = "http://127.0.0.1:%d/?n=[1-%d]" % (port, n)
 cmd = [
     "curl", "-sS", "--max-time", "300",
@@ -490,10 +525,10 @@ for i, line in enumerate(lines):
         sys.exit("keep-alive: transfer %d answered %s" % (i + 1, code))
     conns += int(opens)
 
-print("keepalive_rps=%.1f" % (n / wall))
-print("keepalive_wall_s=%.3f" % wall)
-print("keepalive_conns=%d" % conns)
-print("keepalive_n=%d" % n)
+print(prefix + "keepalive_rps=%.1f" % (n / wall))
+print(prefix + "keepalive_wall_s=%.3f" % wall)
+print(prefix + "keepalive_conns=%d" % conns)
+print(prefix + "keepalive_n=%d" % n)
 PY
 }
 
@@ -707,6 +742,114 @@ warmup() {
     || die "https warmup through variant '$label' failed (agent-terminated endpoint)"
 }
 
+# --- QUIC variant lifecycle ---------------------------------------------------
+#
+# The QUIC leg re-runs the http scenarios with the carrier swapped. Everything
+# about the stack is the same shape as start_stack/stop_stack -- same ports,
+# same fixture, same public hostname -- so a quic number and its smux neighbor
+# in the table differ by the carrier and nothing else. Two differences:
+#
+#   - ngrokd gets -quicAddr on the tunnel port. A port number is two
+#     independent bindings, one per protocol, so the QUIC listener sits on
+#     UDP alongside the TCP tunnel listener, which is exactly where the
+#     client looks for it (it dials the server address, UDP side).
+#   - the client config pins proxy_transport: quic and registers only the
+#     http endpoint: the pinned setting is what makes the leg deterministic
+#     (auto would also pick QUIC here, but a pin cannot drift), and the
+#     https endpoints are not measured on this leg.
+
+start_stack_quic() {
+  local label="$1" dir="$2" port
+
+  # Same ownership check as start_stack: this harness owns these ports, and
+  # anything already holding one belongs to a stale run.
+  for port in "$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_TUNNEL_PORT" "$BENCH_ADMIN_PORT"; do
+    if port_in_use "$port"; then
+      die "port $port is already in use before the QUIC variant of '$label' -- stop_stack did not release it"
+    fi
+  done
+
+  # Own log namespace ($label-quic): the smux leg's logs stay intact for
+  # dump_logs, and the carrier wait below cannot match a line the smux leg
+  # wrote into a shared file.
+  rm -f /tmp/ngrok-bench-"$label"-*.log
+
+  python3 "$WORKDIR/bench_upstream.py" "$BENCH_UPSTREAM_PORT" "$BULK_BYTES" \
+    > "/tmp/ngrok-bench-$label-upstream.log" 2>&1 &
+  UPSTREAM_PID=$!
+  PIDS+=("$UPSTREAM_PID")
+
+  "$dir/ngrokd" \
+    -domain=localhost \
+    -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
+    -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
+    -tunnelAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
+    -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
+    -quicAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
+    > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
+  NGROKD_PID=$!
+  PIDS+=("$NGROKD_PID")
+  # Unlike start_stack's sleep 1, wait for the thing that matters: the QUIC
+  # listener line proves -quicAddr was accepted AND the capability is being
+  # advertised (it is only sent once the listener is up).
+  local i
+  for i in $(seq 1 40); do
+    if grep -q "Listening for QUIC proxy sessions" "/tmp/ngrok-bench-$label-ngrokd.log" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if ! grep -q "Listening for QUIC proxy sessions" "/tmp/ngrok-bench-$label-ngrokd.log" 2>/dev/null; then
+    dump_logs "$label"
+    die "the QUIC listener never came up for variant '$label'"
+  fi
+
+  cat > "$WORKDIR/ngrok-bench-$label.yml" <<YAML
+server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
+trust_host_root_certs: true
+proxy_transport: quic
+tunnels:
+  bench:
+    hostname: $BENCH_HOST
+    proto:
+      http: $BENCH_UPSTREAM_PORT
+YAML
+
+  "$dir/ngrok" -config="$WORKDIR/ngrok-bench-$label.yml" \
+    -log="/tmp/ngrok-bench-$label-client.log" start bench \
+    > "/tmp/ngrok-bench-$label-client-stdout.log" 2>&1 &
+  CLIENT_PID=$!
+  PIDS+=("$CLIENT_PID")
+}
+
+# wait_for_quic_carrier <label>: the honesty gate on the whole QUIC leg.
+# proxy_transport: quic DEGRADES to smux when the capability is missing --
+# that is the right client behavior and the wrong bench result, because it
+# would report smux numbers under a quic_ key. The carrier line in the client
+# log is the only place the truth lives, so the run aborts without one.
+wait_for_quic_carrier() {
+  local label="$1" i
+  for i in $(seq 1 40); do
+    if grep -q "(quic carrier)" "/tmp/ngrok-bench-$label-client.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  log "the client never established a QUIC carrier for variant '$label' -- refusing to report quic numbers"
+  dump_logs "$label"
+  return 1
+}
+
+warmup_quic() {
+  local label="$1"
+  # One discarded request: on this leg it pays the QUIC handshake, the
+  # session's RegMux bind and the first stream's RegProxy, none of which any
+  # measured request pays again -- the same one-time-cost rule warmup()
+  # applies to the smux and TLS legs.
+  curl -sS --max-time 60 -o /dev/null -H "Host: $BENCH_HOST" "$BASE_URL/small" \
+    || die "warmup request through variant '$label' (quic) failed"
+}
+
 run_variant() {
   local label="$1" dir="$2"
   CURRENT_LABEL="$label"
@@ -733,7 +876,41 @@ run_variant() {
   scenario_tls_conn_rate "$label"
 
   stop_stack
+
+  # The QUIC leg appends quic_-prefixed keys to the SAME result file, so a
+  # variant's numbers travel together and the report's quic rows render in
+  # both single and compare modes without a second pass. The legs run one
+  # after the other because they need the same ports -- which puts them under
+  # the same mid-run-drift caveat the header documents for the two-dir form.
+  run_variant_quic "$label" "$dir"
+
   log "variant '$label' done (logs: /tmp/ngrok-bench-$label-*.log)"
+}
+
+run_variant_quic() {
+  local label="$1" dir="$2"
+  # Distinct log namespace, shared result file: the quic keys land next to
+  # the smux ones for this variant, while the logs of the two legs stay
+  # separated (the carrier wait greps a file the smux leg never wrote).
+  local qlog="$label-quic"
+  CURRENT_LABEL="$qlog"
+  log "=== variant '$qlog': $dir (QUIC carrier) ==="
+
+  start_stack_quic "$qlog" "$dir"
+  wait_for_tunnel "$qlog"
+  wait_for_quic_carrier "$qlog"
+  wait_for_public "$qlog"
+  warmup_quic "$qlog"
+
+  log "quic bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
+  scenario_bulk "$label" "quic_"
+  log "quic conn-rate: $CONN_RATE_REQUESTS requests, Connection: close"
+  scenario_conn_rate "$label" "quic_"
+  log "quic keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
+  scenario_keepalive "$label" "quic_"
+
+  stop_stack
+  log "variant '$qlog' done (logs: /tmp/ngrok-bench-$qlog-*.log)"
 }
 
 # --- reporting ---------------------------------------------------------------
@@ -755,6 +932,10 @@ write_params() {
     echo "tls_requests=$TLS_REQUESTS"
     echo "tls_edge_host=$BENCH_TLS_EDGE_HOST"
     echo "tls_zk_host=$BENCH_TLS_ZK_HOST"
+    # The QUIC leg's wiring, for the JSON record: the QUIC listener shares the
+    # tunnel port (UDP beside TCP), and the client pins the carrier.
+    echo "quic_addr_port=$BENCH_TUNNEL_PORT"
+    echo "quic_client_proxy_transport=quic"
     if [[ "$mode" == "compare" ]]; then
       echo "baseline_dir=$first"
       echo "current_dir=$second"
@@ -790,6 +971,20 @@ ROWS = [
     ("tls agent-passthrough req/s (same listener, CA-verified)", "tls_agent_rps", "%.1f"),
     ("tls agent-passthrough p50 ms (lower is better)", "tls_agent_p50_ms", "%.2f"),
     ("tls agent-passthrough p95 ms (lower is better)", "tls_agent_p95_ms", "%.2f"),
+    # The quic rows and the note row under them are one unit: the note is not
+    # prose about the table, it IS a row of it, because the caveat changes
+    # what the numbers are allowed to claim (SPEC-CLUSTER7 gate 6). Loopback
+    # delivers no packet loss, and QUIC's win is per-stream independence
+    # UNDER LOSS -- a lossless wire makes the two carriers look the same by
+    # construction, so these rows establish parity on the happy path (plus
+    # the cost of QUIC handshakes on conn-rate's fresh sessions), never
+    # superiority. The key is deliberately absent from every result file, so
+    # cell() renders the value columns as n/a and only the text is read.
+    ("quic bulk MiB/s (median of 3, QUIC carrier)", "quic_bulk_mib_s", "%.1f"),
+    ("quic conn-rate req/s (200 x Connection: close)", "quic_conn_rate_rps", "%.1f"),
+    ("quic conn-rate p95 ms (lower is better)", "quic_p95_ms", "%.2f"),
+    ("quic keep-alive req/s (1000, one curl)", "quic_keepalive_rps", "%.1f"),
+    ("NOTE quic rows: loopback has no packet loss, so QUIC's head-of-line-blocking win cannot show here -- these numbers establish parity with the smux rows, not superiority", "quic_caveat_row_marker", "%s"),
 ]
 
 
@@ -841,7 +1036,7 @@ print(
     )
 )
 print(
-    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}"
+    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}; QUIC leg re-runs bulk/conn-rate/keep-alive with server -quicAddr + client proxy_transport=quic"
     % (
         int(params.get("bulk_bytes", 0)) // 1024 // 1024,
         params.get("bulk_runs", "?"),
