@@ -6,8 +6,7 @@
 // rules. This build supports the cheap subset of ngrok's action set:
 //
 //	on_tcp_connect   restrict-ips, deny, log
-//	on_http_request  add-headers, remove-headers, deny, custom-response, log, set-vars,
-//	                 basic-auth, bearer-auth, apikey-auth, jwt-validation
+//	on_http_request  add-headers, remove-headers, deny, custom-response, log, set-vars
 //	on_http_response add-headers, remove-headers, log
 //
 // A rule is one action with an optional name and optional conditions:
@@ -85,15 +84,6 @@ const (
 	ActionLog            = "log"
 	ActionSetVars        = "set-vars"
 	ActionRestrictIPs    = "restrict-ips"
-
-	// The request-phase authentication actions (SPEC-CLUSTER6). They are
-	// terminators like deny, but they answer with the challenge their scheme
-	// prescribes -- always a 401, never a configured status -- and they are
-	// no-ops for a request that carries acceptable credentials.
-	ActionBasicAuth     = "basic-auth"
-	ActionBearerAuth    = "bearer-auth"
-	ActionAPIKeyAuth    = "apikey-auth"
-	ActionJWTValidation = "jwt-validation"
 )
 
 // phase is one of the three points in a connection's life a policy can act on.
@@ -179,16 +169,6 @@ type compiledAction struct {
 
 	enforce     bool         // restrict-ips
 	allow, deny []*net.IPNet // restrict-ips
-
-	// auth carries the whole runtime of a request-phase authentication action
-	// (basic-auth, bearer-auth, apikey-auth, jwt-validation): the digests of
-	// the configured credentials, the prebuilt 401 challenge, and -- for
-	// jwt-validation -- the parser and the JWKS cache. Only set for those four
-	// action types; built by the same traversal that validates their config
-	// (auth_actions.go, jwt.go), which is why a compiled policy holds no
-	// credential material it does not need: the static-credential actions keep
-	// only digests.
-	auth authAction
 }
 
 // headerPair is one header a rule wants set: the name as configured and the
@@ -418,23 +398,6 @@ func (c *Compiled) evalRequest(st *evalState, req *http.Request) *rewriter.Reque
 			st.info("deny: %s %s refused with status %d", req.Method, requestTarget(req), a.statusCode)
 			verdict.Terminate = &rewriter.SyntheticResponse{StatusCode: a.statusCode}
 			return verdict
-
-		case ActionBasicAuth, ActionBearerAuth, ActionAPIKeyAuth, ActionJWTValidation:
-			// The authentication actions are terminators that take the same
-			// path deny takes, with two differences the scheme fixes and no
-			// config can change: the answer is always a 401 carrying the
-			// challenge their scheme prescribes (spec section 4), and a request
-			// that carries acceptable credentials is admitted as a no-op --
-			// the action adds nothing and the later rules proceed. The
-			// decision itself lives behind a.auth, built per action type at
-			// load time; this line is the only place in the executor that
-			// knows the actions exist, which is what keeps adding one of them
-			// a validator-plus-implementation change and not a dispatch change.
-			if ch := a.auth.authenticate(req, st); ch != nil {
-				st.info("%s: %s %s refused with status %d", a.action, req.Method, requestTarget(req), ch.StatusCode)
-				verdict.Terminate = ch
-				return verdict
-			}
 
 		case ActionCustomResponse:
 			st.info("custom-response: answering %s %s with status %d",
@@ -689,13 +652,7 @@ func (st *evalState) info(format string, args ...interface{}) {
 // expression failing on every message is one bug, and this is the fail-open
 // rule made visible.
 func (st *evalState) warnOnce(a *compiledAction, format string, args ...interface{}) {
-	st.warnOnceAbout(a.where, format, args...)
-}
-
-// warnOnceAbout is warnOnce for a failure whose identity is a rule's where
-// string rather than a compiledAction at hand (the auth actions carry their
-// where as a plain field). Same bookkeeping, same once-per-connection rule.
-func (st *evalState) warnOnceAbout(key, format string, args ...interface{}) {
+	key := a.where
 	if st.ruleWarned == nil {
 		st.ruleWarned = map[string]bool{}
 	}

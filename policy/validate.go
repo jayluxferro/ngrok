@@ -43,15 +43,6 @@ var actionPhases = map[string][]phase{
 	ActionRemoveHeaders:  {phaseRequest, phaseResponse},
 	ActionCustomResponse: {phaseRequest},
 	ActionSetVars:        {phaseRequest},
-
-	// The authentication actions (SPEC-CLUSTER6) are request-phase only: they
-	// read credentials out of request heads, and a TCP connection in the
-	// connect phase has no headers to read, and a response in the response
-	// phase is the wrong time to be asking who sent it.
-	ActionBasicAuth:     {phaseRequest},
-	ActionBearerAuth:    {phaseRequest},
-	ActionAPIKeyAuth:    {phaseRequest},
-	ActionJWTValidation: {phaseRequest},
 }
 
 // phaseActions lists, in a stable order, the actions a phase implements, for
@@ -336,51 +327,6 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 		if len(a.allow) == 0 && len(a.deny) == 0 {
 			return nil, fmt.Errorf("%s: restrict-ips needs at least one CIDR in \"allow\" or \"deny\"", where)
 		}
-
-	case ActionBasicAuth:
-		// The four authentication actions follow (SPEC-CLUSTER6). Each is
-		// built by the function that owns its runtime (auth_actions.go,
-		// jwt.go); this case only checks the keys first, so that a typo'd
-		// field is refused with the same "unknown config field" message every
-		// other action gives, and hands the rest of the validation over.
-		if err := checkConfigKeys(where, cfg, "realm", "credentials"); err != nil {
-			return nil, err
-		}
-		auth, err := buildBasicAuth(where, cfg)
-		if err != nil {
-			return nil, err
-		}
-		a.auth = auth
-
-	case ActionBearerAuth:
-		if err := checkConfigKeys(where, cfg, "tokens"); err != nil {
-			return nil, err
-		}
-		auth, err := buildBearerAuth(where, cfg)
-		if err != nil {
-			return nil, err
-		}
-		a.auth = auth
-
-	case ActionAPIKeyAuth:
-		if err := checkConfigKeys(where, cfg, "header", "keys"); err != nil {
-			return nil, err
-		}
-		auth, err := buildAPIKeyAuth(where, cfg)
-		if err != nil {
-			return nil, err
-		}
-		a.auth = auth
-
-	case ActionJWTValidation:
-		if err := checkConfigKeys(where, cfg, "jwks_uri", "issuer", "audience", "algorithms", "leeway_seconds", "claims"); err != nil {
-			return nil, err
-		}
-		auth, err := buildJWTValidation(where, cfg)
-		if err != nil {
-			return nil, err
-		}
-		a.auth = auth
 	}
 
 	return a, nil

@@ -17,7 +17,6 @@ require (
 
 require (
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/kr/binarydist v0.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
