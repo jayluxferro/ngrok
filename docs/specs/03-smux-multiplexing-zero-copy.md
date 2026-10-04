@@ -1,6 +1,7 @@
-# SPEC Cluster 3: Throughput — smux Multiplexing, Zero-Copy Legs, Bench Harness
+# Spec 03 — smux multiplexing and zero-copy throughput
 
-Status: approved (user: "Let's fire", Sept 2026). Workstreams: A (mux) + C (bench/docs) parallel; B (zero-copy) after A.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives (the throughput cluster)
 

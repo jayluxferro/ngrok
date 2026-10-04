@@ -1,9 +1,7 @@
-# SPEC-CLUSTER6: Traffic-policy authentication actions
+# Spec 06 — Traffic-policy authentication actions
 
-Status: approved (user: "add different header authentication supports etc, apikey, bearer etc all").
-Scope: the server-side policy engine (policy/ package) — four new on_http_request
-actions. Because the engine evaluates on both sides (server for edge tunnels, agent
-for agent-terminated tunnels, per SPEC-CLUSTER5), all four work everywhere automatically.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

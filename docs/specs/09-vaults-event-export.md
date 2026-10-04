@@ -1,9 +1,7 @@
-# SPEC-CLUSTER9: Vaults/secrets + event export
+# Spec 09 — Secret vaults and event export
 
-Status: spec ready; implementation gated on cluster 8 (shared files: client/config.go,
-policy/*, server/observability-adjacent). Standing directive covers it.
-Pre-authorized by SPEC-CLUSTER6 §2 ("credentials are inline config values for now; vault
-refs come cluster 9") and the eval doc's "fork can add file/env sources ngrok lacks".
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

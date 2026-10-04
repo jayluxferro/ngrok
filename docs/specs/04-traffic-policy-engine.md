@@ -1,6 +1,7 @@
-# SPEC Cluster 4: Server-Side Traffic Policy Engine (cheap subset) + restrict-ips
+# Spec 04 — Server-side traffic policy engine
 
-Status: approved (user: "push till we are better than commercial", Sept 2026). Workstreams: A (engine) then B (client + e2e + docs). Sequential: B needs A's policy package.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

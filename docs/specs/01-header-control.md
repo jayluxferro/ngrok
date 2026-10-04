@@ -1,7 +1,7 @@
-# SPEC: HTTP Header Manipulation for the ngrok fork
+# Spec 01 — HTTP header control
 
-Status: approved for implementation (user selected "Header cluster now", Sept 2026).
-Scope: client-side only. Server untouched.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

@@ -1,8 +1,7 @@
-# SPEC-CLUSTER5: Fixed TCP ports + zero-knowledge TLS (agent TLS termination)
+# Spec 05 — Zero-knowledge TLS and fixed remote TCP ports
 
-Status: approved. Scope decided with the user: zero-knowledge TLS only (no jwt/vault bundling),
-all three agent cert models (explicit cert/key, CA-minted, ephemeral fallback). TCP fixed port
-rides along (user request: "specify a specific port so it doesn't keep changing").
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

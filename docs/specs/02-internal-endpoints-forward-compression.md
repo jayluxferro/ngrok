@@ -1,6 +1,7 @@
-# SPEC Cluster 2: Internal Endpoints, Forward-To, Endpoint Pooling, Response Compression
+# Spec 02 — Internal endpoints, forward-to, pooling, compression
 
-Status: approved (user selected "Start cluster 2", Sept 2026). Three workstreams: A + B parallel, C after both.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

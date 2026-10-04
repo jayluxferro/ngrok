@@ -1,9 +1,7 @@
-# SPEC-CLUSTER8: UDP tunnels
+# Spec 08 — UDP tunnels
 
-Status: spec ready; implementation gated on cluster 7 landing (file overlap: server/tunnel.go,
-client/model.go, msg/, go-adjacent config). The user's standing directive covers it.
-Commercial ngrok has no UDP tunnels; this is pure differentiation, and it composes with
-cluster 7 (the proxy leg carrying the flows may itself be QUIC).
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

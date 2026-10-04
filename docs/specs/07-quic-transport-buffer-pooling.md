@@ -1,9 +1,7 @@
-# SPEC-CLUSTER7: QUIC agent transport + rewriter buffer pooling
+# Spec 07 — QUIC agent transport and pooled rewriter buffers
 
-Status: approved (user: "work autonomously till everything is done"; cluster 7 = the
-AI-workload throughput push). Goal: kill TCP head-of-line blocking across multiplexed
-proxy streams (one lost packet on the smux carrier stalls EVERY stream today), and cut
-the per-connection allocation tax on the HTTP data path.
+Status: shipped (see the changelog entry for its release; this document is the design record)
+
 
 ## 1. Objectives
 

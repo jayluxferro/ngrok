@@ -866,14 +866,30 @@ run_variant() {
   wait_for_public_tls "$label" "$BENCH_TLS_ZK_HOST" "$WORKDIR/bench-ca.crt"
   warmup "$label"
 
-  log "bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
-  scenario_bulk "$label"
-  log "conn-rate: $CONN_RATE_REQUESTS requests, Connection: close"
-  scenario_conn_rate "$label"
-  log "keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
-  scenario_keepalive "$label"
-  log "tls-conn-rate: $TLS_REQUESTS requests x {edge, agent-terminated} over https"
-  scenario_tls_conn_rate "$label"
+  # BENCH_SCENARIOS selects a subset (default: all four) so a focused run --
+  # e.g. BENCH_SCENARIOS="bulk conn-rate keep-alive" for a QUIC-parity
+  # question -- fits a coffee break instead of the full suite's half hour.
+  # Unselected scenarios simply emit no keys; the report renders them n/a.
+  local want
+  for want in ${BENCH_SCENARIOS:-bulk conn-rate keep-alive tls-conn-rate}; do
+    case "$want" in
+      bulk)
+        log "bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
+        scenario_bulk "$label" ;;
+      conn-rate)
+        log "conn-rate: $CONN_RATE_REQUESTS requests, Connection: close"
+        scenario_conn_rate "$label" ;;
+      keep-alive)
+        log "keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
+        scenario_keepalive "$label" ;;
+      tls-conn-rate)
+        log "tls-conn-rate: $TLS_REQUESTS requests x {edge, agent-terminated} over https"
+        scenario_tls_conn_rate "$label" ;;
+      *)
+        echo "unknown scenario '$want' (bulk | conn-rate | keep-alive | tls-conn-rate)" >&2
+        exit 2 ;;
+    esac
+  done
 
   stop_stack
 
@@ -902,12 +918,27 @@ run_variant_quic() {
   wait_for_public "$qlog"
   warmup_quic "$qlog"
 
-  log "quic bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
-  scenario_bulk "$label" "quic_"
-  log "quic conn-rate: $CONN_RATE_REQUESTS requests, Connection: close"
-  scenario_conn_rate "$label" "quic_"
-  log "quic keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
-  scenario_keepalive "$label" "quic_"
+  # The QUIC leg honors the same BENCH_SCENARIOS selection (minus
+  # tls-conn-rate, which the quic leg has never run -- its TLS endpoints
+  # ride the smux-carried stack by design; see the header note).
+  local want
+  for want in ${BENCH_SCENARIOS:-bulk conn-rate keep-alive}; do
+    case "$want" in
+      bulk)
+        log "quic bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
+        scenario_bulk "$label" "quic_" ;;
+      conn-rate)
+        log "quic conn-rate: $CONN_RATE_REQUESTS requests, Connection: close"
+        scenario_conn_rate "$label" "quic_" ;;
+      keep-alive)
+        log "quic keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
+        scenario_keepalive "$label" "quic_" ;;
+      tls-conn-rate) ;; # not a quic-leg scenario; skipped by design
+      *)
+        echo "unknown scenario '$want'" >&2
+        exit 2 ;;
+    esac
+  done
 
   stop_stack
   log "variant '$qlog' done (logs: /tmp/ngrok-bench-$qlog-*.log)"
