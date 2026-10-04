@@ -162,7 +162,7 @@ func (s *quicTestServer) serve() {
 // serveConn serves one QUIC session exactly like server/quic.go is specified
 // to: the first stream carries RegMux and binds the session; every stream
 // after it carries RegProxy and is answered with StartProxy.
-func (s *quicTestServer) serveConn(qconn quic.Connection) {
+func (s *quicTestServer) serveConn(qconn *quic.Conn) {
 	ctx := qconn.Context()
 
 	stream, err := qconn.AcceptStream(ctx)
@@ -193,7 +193,7 @@ func (s *quicTestServer) serveConn(qconn quic.Connection) {
 
 // serveStream runs the server half of the proxy handshake on one stream and
 // hands the public conn to the test.
-func (s *quicTestServer) serveStream(stream quic.Stream, qconn quic.Connection) {
+func (s *quicTestServer) serveStream(stream *quic.Stream, qconn *quic.Conn) {
 	pxyConn := conn.Wrap(newQuicStreamConn(stream, qconn), "pxy")
 
 	pxyConn.SetReadDeadline(time.Now().Add(quicTestTimeout))

@@ -60,7 +60,7 @@ func quicTestListener(t *testing.T) *quic.Listener {
 // snakeoil cert accepted), and the accept loop running on the goroutine
 // startQuicListener spawned. What the client does from here -- first stream
 // carries RegMux -- is quicTestBind's business.
-func quicTestPair(t *testing.T) quic.Connection {
+func quicTestPair(t *testing.T) *quic.Conn {
 	t.Helper()
 
 	ql := quicTestListener(t)
@@ -72,7 +72,7 @@ func quicTestPair(t *testing.T) quic.Connection {
 // a fallback -- that refusal is itself asserted in
 // TestQuicDialWithoutALPNFails), certificates accepted as tests accept
 // snakeoil.
-func quicTestDial(t *testing.T, addr string) quic.Connection {
+func quicTestDial(t *testing.T, addr string) *quic.Conn {
 	t.Helper()
 
 	tlsCfg := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{quicALPN}}
@@ -91,7 +91,7 @@ func quicTestDial(t *testing.T, addr string) quic.Connection {
 //
 // A nil ctl (the unknown-client test has no control to wait for) skips the
 // detach wait on cleanup.
-func quicTestBind(t *testing.T, qconn quic.Connection, ctl *Control, clientId, secret string) {
+func quicTestBind(t *testing.T, qconn *quic.Conn, ctl *Control, clientId, secret string) {
 	t.Helper()
 
 	bindConn := conn.Wrap(quicTestOpenStream(t, qconn), "quic")
@@ -108,7 +108,7 @@ func quicTestBind(t *testing.T, qconn quic.Connection, ctl *Control, clientId, s
 // quicTestOpenStream opens one stream and hands it through the same
 // net.Conn adaptation the server applies, wrapped the way the client wraps a
 // stream: open, adapt, conn.Wrap.
-func quicTestOpenStream(t *testing.T, qconn quic.Connection) conn.Conn {
+func quicTestOpenStream(t *testing.T, qconn *quic.Conn) conn.Conn {
 	t.Helper()
 
 	stream, err := qconn.OpenStream()
@@ -125,7 +125,7 @@ func quicTestOpenStream(t *testing.T, qconn quic.Connection) conn.Conn {
 // quicTestProxyStream opens one proxy stream on a bound session the way the
 // client's proxyStream does -- open, wrap, RegProxy -- and returns the client
 // end. The pooled half is the test's to take from the control.
-func quicTestProxyStream(t *testing.T, qconn quic.Connection, clientId, secret string) conn.Conn {
+func quicTestProxyStream(t *testing.T, qconn *quic.Conn, clientId, secret string) conn.Conn {
 	t.Helper()
 
 	streamConn := quicTestOpenStream(t, qconn)
@@ -196,7 +196,7 @@ func waitForBoundSessionDetach(t *testing.T, ctl *Control) {
 // Connection's Context is canceled when the connection is closed, from either
 // side -- the one wait that covers both the explicit CloseWithError paths and
 // the replacement close.
-func waitForQuicClosed(t *testing.T, qconn quic.Connection) {
+func waitForQuicClosed(t *testing.T, qconn *quic.Conn) {
 	t.Helper()
 
 	select {

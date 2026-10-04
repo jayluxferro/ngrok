@@ -1611,7 +1611,7 @@ func (c *smuxCarrier) IsClosed() bool {
 // what one lost TCP segment does to every multiplexed proxy connection at
 // once.
 type quicCarrier struct {
-	conn quic.Connection
+	conn *quic.Conn
 }
 
 func (c *quicCarrier) OpenStream() (net.Conn, error) {
@@ -1623,7 +1623,7 @@ func (c *quicCarrier) OpenStream() (net.Conn, error) {
 }
 
 // AcceptStream is the carrier's death watch, and the context it runs under is
-// the connection's own: quic.Connection.Context is cancelled when the
+// the connection's own: quic.Conn.Context is cancelled when the
 // connection dies (idle timeout, keepalive given up, peer closed, transport
 // error), so a dead session unblocks the accept by itself -- the same "AcceptStream
 // returns when the session dies" behavior the smux carrier gets from its
@@ -1681,12 +1681,12 @@ const (
 //     immediately. Neither half is an error to repeat (the library no-ops
 //     them), so Close stays idempotent the way conn.Conn users expect.
 type quicStreamConn struct {
-	quic.Stream
+	*quic.Stream
 	local  net.Addr
 	remote net.Addr
 }
 
-func newQuicStreamConn(stream quic.Stream, qconn quic.Connection) *quicStreamConn {
+func newQuicStreamConn(stream *quic.Stream, qconn *quic.Conn) *quicStreamConn {
 	return &quicStreamConn{
 		Stream: stream,
 		local:  qconn.LocalAddr(),

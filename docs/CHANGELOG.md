@@ -1,4 +1,27 @@
 # Changelog
+## 1.0.13 - 2026-10-04 - Toolchain bump and cel-go module migration
+
+The deliberate dependency migration the 1.21 pin was holding back. The go
+directive moves to 1.23.0, cel-go moves from its dead module path
+(github.com/google/cel-go, last release v0.31) to cel.dev/cel-go v0.32.0,
+and quic-go rides the unlocked ceiling to v0.54.0.
+
+The cel-go change is a module-path move, not an API migration: every
+identifier policy/ uses survived intact, the pinned refusal substrings
+("recursion limit", "code point size exceeds limit", the undeclared-
+reference hint) all behave identically, and the full policy suite --
+including its fuzz corpus -- passed with zero test edits. quic-go's
+v0.45→v0.54 delta is interface-to-struct renames in this codebase's
+terms; the e2e quic group (carrier round-trips, fallback, agent-TLS
+over QUIC, UDP over the QUIC carrier) is the wire-behavior judge and is
+green unchanged.
+
+CI pins go 1.23 in all three workflows; the dependency updater's skip
+class and toolchain guard now reason about the 1.23 floor (cel-go v0.32
+requires it; holding there keeps quic-go at v0.54.0, the newest release
+declaring 1.23 -- v0.55 needs 1.24). Transitive floors rode the two
+bumps; the old cel-go-v0.20 dependency graph dropped away.
+
 ## 1.0.12 - 2026-10-04 - Adversarial audit round: hardening
 
 A four-stream adversarial audit (code correctness, security, QA coverage,

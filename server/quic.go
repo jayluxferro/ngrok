@@ -212,7 +212,7 @@ const quicBindTimeout = connReadTimeout
 // control with the replace-and-close-prior semantics of Control.SetMuxSession.
 // Everything after the first stream is the per-stream path that
 // registerProxyStream shares with smux, byte for byte.
-func handleQuicSession(qconn quic.Connection) {
+func handleQuicSession(qconn *quic.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("QUIC session bind failed with error: %v", r)
@@ -294,7 +294,7 @@ type QuicSession struct {
 	ctl *Control
 
 	// the QUIC connection carrying the streams
-	conn quic.Connection
+	conn *quic.Conn
 
 	log.Logger
 
@@ -303,7 +303,7 @@ type QuicSession struct {
 
 // newQuicSession wraps an authenticated QUIC connection and starts accepting
 // proxy streams on it.
-func newQuicSession(qconn quic.Connection, ctl *Control, clientId string) *QuicSession {
+func newQuicSession(qconn *quic.Conn, ctl *Control, clientId string) *QuicSession {
 	q := &QuicSession{
 		id:     clientId,
 		ctl:    ctl,
@@ -377,20 +377,20 @@ func (q *QuicSession) Id() string {
 
 // quicStreamConn adapts a quic.Stream to net.Conn.
 //
-// quic.Stream (v0.45.0) carries every net.Conn method -- Read, Write, Close,
+// quic.Stream (v0.54.0) carries every net.Conn method -- Read, Write, Close,
 // and deadlines that actually bound the calls, which is what
 // registerProxyStream's read timeout and conn.Join's shutdown lean on --
 // except LocalAddr and RemoteAddr: a stream has no addresses of its own. The
 // session's are the right answer for the logging and diagnostics that read
 // them, so the adapter records them once, at accept time.
 type quicStreamConn struct {
-	quic.Stream
+	*quic.Stream
 	local  net.Addr
 	remote net.Addr
 }
 
 // newQuicStreamConn adapts one accepted stream of qconn to a net.Conn.
-func newQuicStreamConn(qconn quic.Connection, stream quic.Stream) *quicStreamConn {
+func newQuicStreamConn(qconn *quic.Conn, stream *quic.Stream) *quicStreamConn {
 	return &quicStreamConn{
 		Stream: stream,
 		local:  qconn.LocalAddr(),

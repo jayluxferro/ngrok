@@ -1793,7 +1793,7 @@ func TestPolicyConditionThatIsNotABoolIsRefusedAtLoad(t *testing.T) {
 // tunnel.go compiles it), and this package does not bound either dimension
 // itself: compileExpr hands cel-go whatever string it was given.
 //
-// The numbers are cel-go's (v0.20.1), and they are asserted here rather than
+// The numbers are cel-go's (v0.32.0), and they are asserted here rather than
 // described in a comment so that a dependency bump that loses either limit
 // fails this test instead of killing the server:
 //

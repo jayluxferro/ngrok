@@ -8,7 +8,7 @@ const (
 	Proto = "2"
 	Major = "1"
 	Minor = "0"
-	Patch = "12"
+	Patch = "13"
 )
 
 func MajorMinor() string {

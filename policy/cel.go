@@ -35,7 +35,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/cel-go/cel"
+	"cel.dev/cel-go/cel"
 )
 
 // celVar is one declared name in a phase's environment: the variable's dotted
