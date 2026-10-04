@@ -35,8 +35,14 @@ jobs:
           # strings to `go get` as module names.
           for mod in $(go list -m -f '{{.Path}}' all | tail -n +2); do
             if ! go get -u "$mod" 2>/tmp/goget.err; then
-              if grep -q 'requires go >=' /tmp/goget.err; then
-                echo "::warning::skipping $mod: newest release needs a newer Go than the pinned 1.21 toolchain"
+              # Two refusals are upstream facts an automated bump cannot
+              # adopt, not failures: a release that needs a newer Go than
+              # the pinned toolchain, and a module that renamed its path
+              # (e.g. github.com/google/cel-go -> cel.dev/cel-go, which is
+              # a source-tree migration, never an automated bump). Anything
+              # else (network, resolution) stays fatal.
+              if grep -qE 'requires go >=|but was required as' /tmp/goget.err; then
+                echo "::warning::skipping $mod: newest release cannot be auto-adopted on the pinned go 1.21 toolchain (needs newer Go, or the module renamed its path)"
                 skipped="$skipped $mod"
               else
                 cat /tmp/goget.err >&2
@@ -46,7 +52,7 @@ jobs:
           done
           go mod tidy
           if [ -n "$skipped" ]; then
-            echo "### Skipped (need newer Go than 1.21):${skipped}" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Skipped (cannot auto-adopt on go 1.21):${skipped}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run tests
