@@ -30,7 +30,10 @@ jobs:
           # module at a time instead: skip exactly the toolchain-floor
           # refusals (warned and summarized), fail on any other error.
           skipped=""
-          for mod in $(go list -m all | tail -n +2); do
+          # -f '{{.Path}}' is load-bearing: bare `go list -m all` prints
+          # "PATH VERSION" rows, and word-splitting those would feed version
+          # strings to `go get` as module names.
+          for mod in $(go list -m -f '{{.Path}}' all | tail -n +2); do
             if ! go get -u "$mod" 2>/tmp/goget.err; then
               if grep -q 'requires go >=' /tmp/goget.err; then
                 echo "::warning::skipping $mod: newest release needs a newer Go than the pinned 1.21 toolchain"
