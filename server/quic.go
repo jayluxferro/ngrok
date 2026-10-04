@@ -72,6 +72,26 @@ const (
 // as long as the process does. Tests set and restore it.
 var quicServing atomic.Bool
 
+// quicListener holds the process's QUIC listener once startQuicListener has
+// brought it up (SPEC-CLUSTER8 §3.1). It exists so the port-claim registry
+// can see the one UDP socket ngrokd itself listens on -- without it, a udp
+// tunnel asking for the QUIC listener's port number would find no server-owned
+// listener in its way until the kernel's EADDRINUSE said so in words that name
+// nobody. The listener lives as long as the process does and is never
+// replaced, so tests that do not start one simply leave this nil.
+var quicListener atomic.Pointer[quic.Listener]
+
+// quicListenerAddr returns the address the QUIC listener is bound to, or nil
+// when it is not running.
+func quicListenerAddr() *net.UDPAddr {
+	if l := quicListener.Load(); l != nil {
+		if addr, ok := l.Addr().(*net.UDPAddr); ok {
+			return addr
+		}
+	}
+	return nil
+}
+
 // quicConfig is the QUIC configuration for the server side of a session.
 func quicConfig() *quic.Config {
 	return &quic.Config{
@@ -107,6 +127,12 @@ func startQuicListener(addr string, tlsConfig *tls.Config) (*quic.Listener, erro
 	if err != nil {
 		return nil, err
 	}
+
+	// Record the listener before anything can claim its port: the
+	// port-claim registry reads this (ownListenerAt), so a udp tunnel asking
+	// for the QUIC listener's port number is refused by name rather than
+	// colliding with the kernel.
+	quicListener.Store(ql)
 
 	go quicAcceptLoop(ql)
 	return ql, nil

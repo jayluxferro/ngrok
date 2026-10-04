@@ -8,6 +8,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost, allowing y
 
 - **HTTP/HTTPS Tunneling**: Expose local web servers to the internet
 - **TCP Tunneling**: Tunnel arbitrary TCP traffic, with fixed, owned remote ports (`-remote-port`)
+- **UDP Tunneling**: Expose local UDP services (DNS resolvers, game servers, IoT devices) on a public UDP port, datagram-preserving, with the same fixed, owned remote ports
 - **Zero-Knowledge TLS**: Terminate https TLS in the agent — the server routes by SNI and never sees plaintext or your certificates
 - **Web Interface**: Inspect HTTP requests and responses in real-time
 - **Terminal UI**: Beautiful terminal interface for monitoring tunnels
@@ -96,7 +97,7 @@ ngrok/
 ├── conn/            # Connection handling
 ├── log/             # Logging utilities
 ├── msg/             # Protocol messages
-├── proto/           # Protocol implementations (HTTP, TCP)
+├── proto/           # Protocol implementations (HTTP, TCP, UDP)
 ├── util/            # Utility functions
 ├── main/            # Entry points
 │   ├── ngrok/       # Client main
@@ -316,6 +317,62 @@ On the command line, claim a deterministic public port for it:
 to your auth token until the tunnel closes: reconnects get the same port back,
 and another token asking for it is refused at registration.
 
+**Tunnel a UDP service.** A udp tunnel forwards datagrams, not a byte stream:
+the public side is a UDP port, every datagram a public client sends arrives
+whole at the local service, and replies go back out from the tunnel's public
+port with that port as their source — so even a stateless client (a DNS
+resolver above all) accepts the answer. Expose a local resolver:
+
+```bash
+ngrok -proto=udp 53
+```
+
+or a device that speaks UDP — the same Levis-style IoT node as above, over
+its datagram protocol:
+
+```bash
+ngrok -proto=udp -remote-port=5681 127.0.0.1:5681
+```
+
+Port claims are per protocol — the kernel keeps the spaces apart, so
+`udp:5353` and `tcp:5353` are different ports and can be held at once
+(`remote_port` works for both).
+
+The config-file shape works too — a tunnel whose every protocol is
+port-routed simply keeps its name instead of having it silently turned into
+a subdomain the endpoint cannot use:
+
+```yaml
+tunnels:
+  dns:
+    proto: {udp: "127.0.0.1:53"}
+    remote_port: 5353
+```
+
+What UDP keeps, and what that costs: the tunnel is datagram-preserving and
+adds no reliability — loss, reordering and unreachable ports behave exactly
+as they would point-to-point, and a dead local service is silence, not an
+error page. Admission is per **flow** (a flow is one public `ip:port` that
+has sent a datagram): the first datagram runs the same gates a TCP
+connection gets — rate limit, connection cap, `on_tcp_connect` — and a flow
+with no traffic in either direction expires after 30 seconds on both ends. A
+refused flow answers nothing at all: UDP has no protocol to deliver a 403
+in, so a deny in `on_tcp_connect` (this is the one policy phase a udp tunnel
+can carry) looks identical to an unreachable port. The server log says which
+it was ("Traffic policy refused the flow from ...").
+
+**Firewall note:** the tunnel's public *UDP* port must be open end-to-end.
+TCP reachability proves nothing about UDP on the same number — a path that
+silently drops UDP produces exactly the silence of a dead service, on every
+datagram.
+
+**Operator exposure:** a public UDP forwarder reflects what your local
+service sends back to whoever established a flow — replies go only to the
+flow's own source address (never a third host), admission is gated per flow
+(`-publicRate`, `-maxConnPerIP`, `on_tcp_connect`), and the 30-second idle
+window bounds a flow's life. If the local service amplifies (small query,
+large answer), put source policy on the tunnel before exposing it.
+
 ## Command Line Options
 
 **Client (`ngrok`):**
@@ -334,8 +391,9 @@ Options:
                      Carrier for the multiplexed proxy connection to the server:
                      auto (default: QUIC when the server offers it, falling back to
                      TCP), quic, or tcp. Setting http_proxy forces TCP regardless
-  -remote-port=N     Claim this fixed public port for a tcp tunnel (reconnects keep it;
-                     another auth token is refused it)
+  -remote-port=N     Claim this fixed public port for a tcp or udp tunnel (reconnects
+                     keep it; another auth token is refused it; port spaces are
+                     per-protocol, so tcp:N and udp:N are independent claims)
   -agent-tls-termination
                      Terminate public https TLS in this agent: the server routes by SNI
                      and relays TLS bytes unread (zero-knowledge TLS)

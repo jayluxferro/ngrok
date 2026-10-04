@@ -23,6 +23,8 @@ Examples:
 	ngrok -forward-to=https://svc.internal 80
 	ngrok -traffic-policy-file=policy.yml -hostname=guarded 8080
 	ngrok -proto=tcp -remote-port=2222 22
+	ngrok -proto=udp 53
+	ngrok -proto=udp -remote-port=5353 5353
 	ngrok -agent-tls-termination -tls-ca-crt=ca.pem -tls-ca-key=ca.key -hostname=app.example.com 8080
 
 
@@ -180,7 +182,7 @@ func ParseArgs() (opts *Options, err error) {
 	protocol := flag.String(
 		"proto",
 		msg.ProtoHTTPPlusHTTPS,
-		"The protocol of the traffic over the tunnel: 'http', 'https' or 'tcp', or several of them joined with '+' to serve the same tunnel over each (default: 'http+https', which is an http and an https endpoint)")
+		"The protocol of the traffic over the tunnel: 'http', 'https', 'tcp' or 'udp', or several of them joined with '+' to serve the same tunnel over each (default: 'http+https', which is an http and an https endpoint)")
 
 	hostHeader := flag.String(
 		"host-header",
@@ -235,7 +237,7 @@ func ParseArgs() (opts *Options, err error) {
 	remotePort := flag.Uint64(
 		"remote-port",
 		0,
-		"Claim this specific public port for a tcp tunnel instead of a random one (0 lets the server choose). A port the server's own listeners use, one another auth token has already claimed, or one below 1024 (which the server process needs privileges to bind) is refused at registration. (TCP only)")
+		"Claim this specific public port for a tcp or udp tunnel instead of a random one (0 lets the server choose). A port the server's own listeners use, one another auth token has already claimed, or one below 1024 (which the server process needs privileges to bind) is refused at registration. (TCP or UDP only)")
 
 	agentTLSTermination := flag.Bool(
 		"agent-tls-termination",

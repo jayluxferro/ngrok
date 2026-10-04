@@ -300,7 +300,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 				return
 			}
 
-			if (t.Hostname != "" || t.Subdomain != "") && k == msg.ProtoTCP {
+			// Port-routed protocols (tcp, and udp since SPEC-CLUSTER8) are
+			// addressed by their public port, not by a name, so a name on one
+			// is a control that could never mean anything. The check is per
+			// protocol key, before the loader's default-subdomain assignment
+			// below -- which deliberately escapes it for tcp and now udp, as
+			// it always has: the server decides what a named port-routed
+			// registration means, exactly as it has for tcp.
+			if (t.Hostname != "" || t.Subdomain != "") && (k == msg.ProtoTCP || k == msg.ProtoUDP) {
 				err = fmt.Errorf("Tunnel %s hostname/subdomain are only valid for http/https protocols", name)
 				return
 			}
@@ -337,8 +344,17 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
-		// use the name of the tunnel as the subdomain if none is specified
-		if t.Hostname == "" && t.Subdomain == "" {
+		// use the name of the tunnel as the subdomain if none is specified.
+		// Port-routed protocols (tcp, udp) never take a name -- the server
+		// refuses hostname/subdomain on them because their url is the bound
+		// port -- so a tunnel whose every protocol is port-routed must not
+		// have its name turned into a subdomain it cannot register with.
+		// (tcp endpoints used to tolerate the ignored subdomain; udp's
+		// refusal is the honest spelling of the same rule, and skipping the
+		// assignment changes nothing a tcp tunnel ever saw. Mixed
+		// http+nameless-port tunnels keep the assignment: their http leg uses
+		// it and the tcp leg always ignored it.)
+		if t.Hostname == "" && t.Subdomain == "" && tunnelHasNameRoutedProto(t) {
 			// XXX: a crude heuristic, really we should be checking if the last part
 			// is a TLD
 			if len(strings.Split(name, ".")) > 1 {
@@ -546,7 +562,7 @@ func normalizeAddress(addr string, propName string) (string, error) {
 
 func validateProtocol(proto, propName string) (err error) {
 	switch proto {
-	case msg.ProtoHTTP, msg.ProtoHTTPS, msg.ProtoHTTPPlusHTTPS, msg.ProtoTCP:
+	case msg.ProtoHTTP, msg.ProtoHTTPS, msg.ProtoHTTPPlusHTTPS, msg.ProtoTCP, msg.ProtoUDP:
 	default:
 		err = fmt.Errorf("Invalid protocol for %s: %s", propName, proto)
 	}
@@ -761,10 +777,16 @@ func validateForwardTo(tunnelName string, t *TunnelConfiguration) error {
 
 // validateRemotePort checks a tunnel's remote_port claim (SPEC-CLUSTER5 4.1).
 // It is the single home of the client-side rules -- the two the loader has
-// always applied (tcp only, exactly one protocol) plus the two this feature
-// adds -- and it runs for config-file tunnels and for the CLI-synthesized
-// "default" tunnel alike, so a flag and a config key are refused for the same
-// reasons in the same words.
+// always applied (exactly one protocol; the protocol must be one a public port
+// is meaningful for) plus the privileged-port note -- and it runs for
+// config-file tunnels and for the CLI-synthesized "default" tunnel alike, so a
+// flag and a config key are refused for the same reasons in the same words.
+//
+// Since SPEC-CLUSTER8 the protocol rule accepts tcp and udp: a remote_port
+// claims a public port, and a udp tunnel's public side is a port exactly the
+// way a tcp one is. The two port spaces are independent on the wire (the
+// server's claim registry is keyed by (proto, port)), but from the client this
+// is one rule about one field.
 //
 // Ownership of a claimed port is the server's business (its port-claim
 // registry); what the client can know without a server is the shape of a claim
@@ -775,11 +797,11 @@ func validateRemotePort(tunnelName string, t *TunnelConfiguration) error {
 	}
 
 	if len(t.Protocols) != 1 {
-		return fmt.Errorf("Tunnel %s remote_port requires exactly one protocol (tcp)", tunnelName)
+		return fmt.Errorf("Tunnel %s remote_port requires exactly one protocol (tcp or udp)", tunnelName)
 	}
 	for proto := range t.Protocols {
-		if proto != msg.ProtoTCP {
-			return fmt.Errorf("Tunnel %s remote_port is only valid for tcp protocol", tunnelName)
+		if proto != msg.ProtoTCP && proto != msg.ProtoUDP {
+			return fmt.Errorf("Tunnel %s remote_port is only valid for tcp or udp protocol", tunnelName)
 		}
 	}
 
@@ -1145,4 +1167,17 @@ func SaveAuthToken(configPath, authtoken string) (err error) {
 
 	err = os.WriteFile(configPath, newConfigBytes, 0600)
 	return
+}
+
+// tunnelHasNameRoutedProto reports whether any of the tunnel's protocols is
+// routed by name (http, https) rather than by a bound port (tcp, udp). The
+// auto-subdomain step consults it: a name a port-routed endpoint cannot
+// register with must not be assigned to one.
+func tunnelHasNameRoutedProto(t *TunnelConfiguration) bool {
+	for k := range t.Protocols {
+		if k == msg.ProtoHTTP || k == msg.ProtoHTTPS {
+			return true
+		}
+	}
+	return false
 }

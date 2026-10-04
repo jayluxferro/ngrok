@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"github.com/quic-go/quic-go"
 	metrics "github.com/rcrowley/go-metrics"
@@ -110,6 +111,14 @@ const (
 // const only so the tests can shrink it -- a dead QUIC path must fail fast in
 // a test that then proves the smux fall-through.
 var quicHandshakeTimeout = 5 * time.Second
+
+// udpIdleTimeout is how long a udp flow may sit with no traffic in either
+// direction before this end closes it (SPEC-CLUSTER8 3.2). It mirrors the
+// server's per-flow expiry (30s there) so both ends agree that a silent flow
+// has ended -- either side's expiry tears down its half, and the proxy conn
+// close propagates the same way a dropped tcp tunnel's does. Like
+// quicHandshakeTimeout it is a var only so the tests can shrink it.
+var udpIdleTimeout = 30 * time.Second
 
 // proxyTransport is the resolved form of the config's proxy_transport key
 // (client/config.go owns the string vocabulary and its validation): which
@@ -278,6 +287,13 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 	protoMap[msg.ProtoHTTP] = proto.NewHttp()
 	protoMap[msg.ProtoHTTPS] = protoMap[msg.ProtoHTTP]
 	protoMap[msg.ProtoTCP] = proto.NewTcp()
+	// udp (SPEC-CLUSTER8 3.2) is registered in the map the control loop
+	// resolves NewTunnel.Protocol through, but deliberately not in protocols:
+	// that slice is the list of protocols the controller builds inspector
+	// views for, and udp has none (SPEC-CLUSTER8 2 -- no inspector for udp).
+	// tcp sits in it as a harmless default-case entry; udp simply never
+	// reaches a view at all.
+	protoMap[msg.ProtoUDP] = proto.NewUdp()
 	protocols := []proto.Protocol{protoMap[msg.ProtoHTTP], protoMap[msg.ProtoTCP]}
 
 	m := &ClientModel{
@@ -879,6 +895,19 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 		return
 	}
 
+	// A udp tunnel's flow shares none of the steps below (SPEC-CLUSTER8 3.2):
+	// its local leg is a connected UDP socket, not conn.Dial's TCP conn; its
+	// proxy leg carries length-framed datagrams, not a byte stream, so relay's
+	// raw join would be wrong in both directions; there is no TLS to terminate
+	// (agent termination is an https-leg feature) and no 502 to write -- udp
+	// is not IsHTTP and stays so, and a public UDP caller whose local service
+	// is dead gets silence, the same thing an unreachable UDP port gives
+	// everywhere else.
+	if tunnel.Protocol.GetName() == msg.ProtoUDP {
+		c.serveUdpFlow(remoteConn, tunnel, startPxy.ClientAddr)
+		return
+	}
+
 	// Step 1: dial the local upstream FIRST, before any TLS work, exactly as
 	// this path always has. The order is load-bearing for the dead-upstream
 	// case: on an agent-terminated tunnel the 502 has to go out over a
@@ -948,6 +977,270 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 		m.bytesOutCount.Inc(bytesOut)
 	})
 	c.update()
+}
+
+// serveUdpFlow is the udp tunnel's counterpart of the dial+relay pair the
+// byte-stream protocols run (SPEC-CLUSTER8 3.2). The server established one
+// flow for one public client address and hands it to us as one proxy
+// connection; from here on that connection carries framed datagrams
+// (proto.ReadDatagramFrame / proto.WriteDatagramFrame) in both directions,
+// and the local leg is a CONNECTED UDP socket toward the configured local
+// service.
+//
+// Connectedness is the quiet half of the design: replies from the local
+// service need no per-packet routing decision, and -- the security-relevant
+// direction -- the socket only ever delivers datagrams from the service the
+// tunnel points at, so a public client can never use the agent as a reflector
+// toward a third host. The server runs the mirror-image socket toward its
+// public client (SPEC-CLUSTER8 3.1) for the same reason in the other
+// direction.
+func (c *ClientModel) serveUdpFlow(remoteConn conn.Conn, tunnel mvc.Tunnel, clientAddr string) {
+	start := time.Now()
+
+	raddr, err := net.ResolveUDPAddr("udp", tunnel.LocalAddr)
+	if err != nil {
+		remoteConn.Warn("Failed to resolve private UDP leg %s: %v", tunnel.LocalAddr, err)
+		remoteConn.Close()
+		return
+	}
+
+	// The dial itself cannot fail because the service is down -- UDP has no
+	// handshake -- so unlike the tcp path, the outcome of this call says
+	// nothing about the local service, only about the local address. A dead
+	// service surfaces later, as a write error (ICMP port-unreachable on the
+	// connected socket), and is answered there the udp way: a quiet close.
+	localConn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		remoteConn.Warn("Failed to open private UDP leg %s for client %s: %v", tunnel.LocalAddr, clientAddr, err)
+		remoteConn.Close()
+		return
+	}
+
+	f := &udpFlow{
+		Logger:   log.NewPrefixLogger("udp"),
+		remote:   remoteConn,
+		local:    localConn,
+		activity: make(chan struct{}, 1),
+		done:     make(chan struct{}),
+	}
+	// One owner of the teardown, reached from every path out (either pump's
+	// first error, the idle watcher, or this defer): idempotent by Once.
+	defer f.teardown()
+
+	// The same connection metrics the tcp relay feeds: the server gates and
+	// counts a udp flow per connection (SPEC-CLUSTER8 3.1), so the client's
+	// accounting should read the same way. Unlike the relay's byte counts --
+	// which are raw copy counts, framing included -- these are datagram
+	// payloads only: the framing is transport plumbing, and a metrics graph
+	// that moved when the framing constant changed would be lying about the
+	// tunnel's traffic.
+	m := c.metrics
+	m.proxySetupTimer.Update(time.Since(start))
+	m.connMeter.Mark(1)
+	c.update()
+
+	// One buffer per direction, one reader per buffer, for the life of the
+	// flow -- the joinBufPool rule (conn/conn.go) without the pool: a udp flow
+	// is short-lived by construction (the idle expiry below), so the buffers
+	// die with it instead of recycling through a pool sized for steady-state
+	// copying. 128 KiB per live flow is the honest price of 64 KiB datagrams
+	// in both directions.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		defer f.teardown()
+		f.pumpProxyToLocal(make([]byte, proto.MaxDatagramSize))
+	}()
+	go func() {
+		defer wg.Done()
+		defer f.teardown()
+		f.pumpLocalToProxy(make([]byte, proto.MaxDatagramSize))
+	}()
+	go func() {
+		defer wg.Done()
+		f.watchIdle()
+	}()
+
+	m.connTimer.Time(func() {
+		// Both pumps must be out before this returns: the callers close
+		// remoteConn on return, and a pump still parked in a read of it must
+		// not outlive the close's owner. The pumps' defers run teardown before
+		// wg.Done (LIFO), so by the time Wait returns, f.done is closed and
+		// the watcher -- counted in the same WaitGroup -- is out too.
+		wg.Wait()
+	})
+	bytesIn, bytesOut := f.bytesIn.Load(), f.bytesOut.Load()
+	m.bytesIn.Update(bytesIn)
+	m.bytesOut.Update(bytesOut)
+	m.bytesInCount.Inc(bytesIn)
+	m.bytesOutCount.Inc(bytesOut)
+	c.update()
+}
+
+// udpFlow is one live udp flow: the server-side twin of a public client's
+// address, seen from the agent as one proxy connection plus one connected
+// local socket. Everything about its lifetime is Close-based -- see teardown.
+type udpFlow struct {
+	log.Logger
+
+	remote conn.Conn    // the proxy leg: a stream on whatever mux carrier is up
+	local  *net.UDPConn // the connected local leg
+
+	// activity carries idle-refresh pings from the pumps to the watcher. One
+	// slot, sent non-blocking, coalescing on purpose: a refresh is idempotent,
+	// and a pump must never block on telling the watcher about traffic -- the
+	// datagram itself is the proof of life, the ping is just the report.
+	activity chan struct{}
+
+	// done is closed by teardown; the watcher waits on it so that a flow the
+	// pumps ended stops resetting a timer that no longer matters.
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// Payload byte counts, written by the pumps and read by serveUdpFlow after
+	// wg.Wait. Atomic rather than plain because the codebase's cross-goroutine
+	// counters are (model.go's lastPong), and because nothing here enforces
+	// that every future reader waits first.
+	bytesIn  atomic.Int64 // datagram payload, proxy -> local
+	bytesOut atomic.Int64 // datagram payload, local -> proxy
+}
+
+// teardown ends the flow: both legs closed, done closed, exactly once.
+//
+// Close, not a read deadline, is what ends a parked pump: the proxy leg is a
+// stream on an smux session or a QUIC one, and Stream.Read does not re-check
+// deadlines while parked -- it samples the deadline once on entry (the
+// rationale rewriter/conn.go records for the client relay, and
+// terminatePublicTLS backs up with a timer that closes). A closed conn is the
+// one ending every read in this program obeys, so one teardown unblocks both
+// pumps whatever each is parked in.
+func (f *udpFlow) teardown() {
+	f.closeOnce.Do(func() {
+		f.remote.Close()
+		f.local.Close()
+		close(f.done)
+	})
+}
+
+// ping reports one datum of activity to the idle watcher. Coalesced by
+// design; see udpFlow.activity.
+func (f *udpFlow) ping() {
+	select {
+	case f.activity <- struct{}{}:
+	default:
+	}
+}
+
+// pumpProxyToLocal moves datagrams from the proxy leg into the local service:
+// one framed datagram off the stream, one whole datagram into the socket.
+// There is no reassembly and no coalescing -- the frame boundary IS the
+// datagram boundary, which is the property the framing test pins
+// (SPEC-CLUSTER8 6.3).
+func (f *udpFlow) pumpProxyToLocal(buf []byte) {
+	defer f.teardown()
+	for {
+		n, err := proto.ReadDatagramFrame(f.remote, buf)
+		if err != nil {
+			if errors.Is(err, proto.ErrDatagramTooLarge) {
+				// The peer sent a frame no conforming sender produces. The
+				// flow is over either way; the WARN is what tells a human the
+				// close was the peer's desynchronization, not a dropped
+				// session.
+				f.remote.Warn("udp flow protocol error from the proxy leg, closing: %v", err)
+				return
+			}
+			f.remote.Debug("udp flow proxy read ended: %v", err)
+			return
+		}
+		f.ping()
+		if _, err := f.local.Write(buf[:n]); err != nil {
+			// The local service is gone (on a connected socket an ICMP
+			// port-unreachable from an earlier datagram surfaces right here)
+			// or its socket buffer is full. First failure closes the flow
+			// quietly: udp is not IsHTTP and stays so -- there is no 502 page
+			// a UDP caller could read, and inventing one would be the only
+			// option worse than silence (SPEC-CLUSTER8 3.2).
+			f.Debug("udp flow local write failed, closing: %v", err)
+			return
+		}
+		f.bytesIn.Add(int64(n))
+		f.ping()
+	}
+}
+
+// pumpLocalToProxy moves datagrams from the local service into the proxy leg:
+// one datagram off the connected socket, one framed datagram onto the stream.
+func (f *udpFlow) pumpLocalToProxy(buf []byte) {
+	defer f.teardown()
+	for {
+		// Read, not ReadFromUDP: the socket is connected, so the kernel
+		// delivers only the local service's datagrams -- no address is
+		// reported because no routing decision is left to make.
+		n, err := f.local.Read(buf)
+		if err != nil {
+			f.Debug("udp flow local read ended: %v", err)
+			return
+		}
+		f.ping()
+		if err := proto.WriteDatagramFrame(f.remote, buf[:n]); err != nil {
+			f.remote.Debug("udp flow proxy write failed, closing: %v", err)
+			return
+		}
+		f.bytesOut.Add(int64(n))
+		f.ping()
+	}
+}
+
+// watchIdle closes the flow after udpIdleTimeout with no traffic in either
+// direction (SPEC-CLUSTER8 3.2: the client mirrors the server's per-flow
+// expiry, so both ends agree a silent flow has ended and neither half waits
+// on the other to notice).
+//
+// The timer is owned by this goroutine alone -- Timer.Reset is only sound
+// from the goroutine that drains the timer's channel -- so the pumps report
+// activity on the one-slot channel instead of touching it. Both branches that
+// Reset do the documented dance: Stop, and when Stop reports a fire already
+// queued, drain it before Reset, so a fire is never lost (which would strand
+// a live flow until the pumps end it) and never doubled (which would cut a
+// live flow one window early).
+func (f *udpFlow) watchIdle() {
+	timer := time.NewTimer(udpIdleTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-f.activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(udpIdleTimeout)
+
+		case <-timer.C:
+			// The window closed. A ping can be sitting in the channel from
+			// just before the fire -- activity that arrived inside the
+			// expiring window, reported to a watcher that was not scheduled
+			// in time to Reset. It counts: grant a fresh window.
+			select {
+			case <-f.activity:
+				// The fire was consumed by this branch, so Reset is safe.
+				timer.Reset(udpIdleTimeout)
+			default:
+				f.Debug("udp flow idle for %v, closing", udpIdleTimeout)
+				f.teardown()
+				return
+			}
+
+		case <-f.done:
+			// The pumps ended the flow (an error, or the server closed the
+			// proxy leg); teardown already ran, so there is nothing left to
+			// guard.
+			return
+		}
+	}
 }
 
 // agentTerminated reports whether THIS proxy connection's public side

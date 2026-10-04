@@ -287,6 +287,7 @@ const (
 	ProtoHTTP  = "http"
 	ProtoHTTPS = "https"
 	ProtoTCP   = "tcp"
+	ProtoUDP   = "udp"
 
 	// ProtoHTTPPlusHTTPS is the client's spelling for one endpoint with both
 	// HTTP legs ("ngrok http+https 8080"). It exists in the client's

@@ -46,6 +46,15 @@ type Tunnel struct {
 	// tcp listener
 	listener *net.TCPListener
 
+	// udpConn is this tunnel's public UDP socket, bound at registration the
+	// way listener binds a TCP one (SPEC-CLUSTER8 §3.1). A udp tunnel owns
+	// the socket; a pooling member shares its creator's and leaves it nil.
+	udpConn *net.UDPConn
+
+	// flows is the udp tunnel's flow table (server/udp.go), created when the
+	// socket is bound. Nil for every non-udp tunnel.
+	flows *udpFlowTable
+
 	// control connection
 	ctl *Control
 
@@ -345,6 +354,25 @@ func (t *Tunnel) validateRequest() error {
 			// to this client and ignoring forward_to.
 			return fmt.Errorf("%s: forward_to is only supported for http and https endpoints", what)
 		}
+	case msg.ProtoUDP:
+		// UDP is port-routed and nothing else (SPEC-CLUSTER8 §3.1): the
+		// public side of the endpoint is udp://domain:port, so the two HTTP
+		// naming fields have no path that could ever honor them. The TCP case
+		// tolerates them by ignoring them (a legacy of upstream's shape);
+		// UDP is new and gets the honest refusal instead -- accepting a
+		// hostname and then binding a port would register an endpoint that
+		// answers at an address the client never asked for. The refusals
+		// mirror TCP's wording, adapted: internal endpoints and forward_to
+		// chains are refused for the same reasons they are refused on TCP.
+		if m.Binding == msg.BindingInternal {
+			return fmt.Errorf("%s: Internal UDP endpoints are not supported yet, use http or https", what)
+		}
+		if m.ForwardTo != "" {
+			return fmt.Errorf("%s: forward_to is only supported for http and https endpoints", what)
+		}
+		if m.Hostname != "" || m.Subdomain != "" {
+			return fmt.Errorf("%s: udp endpoints are port-routed and cannot use hostname or subdomain (a udp url is udp://%s:<port>)", what, opts.domain)
+		}
 	case msg.ProtoHTTP, msg.ProtoHTTPS:
 	default:
 		return fmt.Errorf("%s: Protocol %s is not supported", what, m.Protocol)
@@ -404,6 +432,9 @@ func (t *Tunnel) register() error {
 	switch m.Protocol {
 	case msg.ProtoTCP:
 		return t.registerTcp()
+
+	case msg.ProtoUDP:
+		return t.registerUdp()
 
 	case msg.ProtoHTTP, msg.ProtoHTTPS:
 		// Internal endpoints are invisible to the public listener, so they do
@@ -498,6 +529,118 @@ func (t *Tunnel) registerTcp() error {
 	return bindTcp(0)
 }
 
+// registerUdp binds a public UDP socket for this tunnel, or joins the socket
+// that an existing pooling member already bound (SPEC-CLUSTER8 §3.1). It is
+// registerTcp's shape throughout -- pooling join, custom port claim, affinity
+// cache, random port -- with one deliberate difference: no vhost step exists
+// on this path, because a udp endpoint is named by its port alone
+// (validateRequest refuses hostname/subdomain), so the url is always spelled
+// from the ACTUALLY bound port, never from a requested one.
+func (t *Tunnel) registerUdp() error {
+	m := t.req
+
+	// A pooling UDP tunnel shares the port -- and therefore the socket --
+	// that the first member bound; it never binds a second one. The bucket is
+	// identified by the remote port the client asked for, or by the affinity
+	// cache for a client coming back to its old port; the registry keys are
+	// protocol-namespaced (client-ip-udp:..., client-id-udp:...), so a udp
+	// tunnel's cached url can never collide with a tcp one. The bind race two
+	// pooling clients can lose is left alone, as in TCP: the kernel's
+	// EADDRINUSE is a clean error to the loser, not a corrupted pool.
+	if m.Pooling {
+		if url := t.pooledUdpUrl(); url != "" && tunnelRegistry.IsPooling(url) {
+			t.url = url
+			return tunnelRegistry.Register(t.url, t)
+		}
+	}
+
+	bindUdp := func(port int) error {
+		sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: port})
+		if err != nil {
+			return t.ctl.conn.Error("Error binding UDP listener: %v", err)
+		}
+		t.udpConn = sock
+		t.flows = newUdpFlowTable(t)
+
+		// create the url from the port the kernel actually handed back: a
+		// random-bind tunnel's url must name the port datagrams can reach it
+		// on, and a requested port's url is true by the same test.
+		addr := sock.LocalAddr().(*net.UDPAddr)
+		t.url = fmt.Sprintf("udp://%s:%d", opts.domain, addr.Port)
+
+		// register it
+		if err = tunnelRegistry.RegisterAndCache(t.url, t); err != nil {
+			// This should never be possible because the OS will
+			// only assign available ports to us.
+			sock.Close()
+			t.udpConn = nil
+			t.flows = nil
+			return fmt.Errorf("UDP socket bound, but failed to register %s", t.url)
+		}
+
+		t.flows.start()
+		go t.listenUdp(sock)
+		return nil
+	}
+
+	// use the custom remote port you asked for
+	if m.RemotePort != 0 {
+		return t.bindClaimedUdp(int(m.RemotePort), bindUdp)
+	}
+
+	// try to return to you the same port you had before
+	cachedUrl := tunnelRegistry.GetCachedRegistration(t)
+	if cachedUrl != "" {
+		parts := strings.Split(cachedUrl, ":")
+		portPart := parts[len(parts)-1]
+		port, parseErr := strconv.Atoi(portPart)
+		if parseErr != nil {
+			t.ctl.conn.Error("Failed to parse cached url port as integer: %s", portPart)
+		} else if bindErr := t.bindClaimedUdp(port, bindUdp); bindErr != nil {
+			// we have a valid, cached port, but we could not claim or bind it.
+			// As in TCP, a claim refusal reads exactly like the bind failure
+			// it sits next to -- the port is gone -- and a random one is the
+			// fallback it always was.
+			t.ctl.conn.Warn("Failed to get custom port %d: %v, trying a random one", port, bindErr)
+		} else {
+			// success, we're done
+			return nil
+		}
+	}
+
+	// Bind for UDP datagrams
+	return bindUdp(0)
+}
+
+// bindClaimedUdp is bindClaimedTcp's claim-then-bind sequence in the UDP
+// port space: the claim registry is consulted before the kernel sees the
+// bind, and a bind that fails releases the claim again -- a port this server
+// could not bind must not stay locked against the account that asked for it.
+// The protocol dimension of the claim is this tunnel's own protocol: TCP and
+// UDP port spaces are independent (SPEC-CLUSTER8 §3.1).
+func (t *Tunnel) bindClaimedUdp(port int, bindUdp func(int) error) error {
+	if err := portClaims.Claim(msg.ProtoUDP, port, t.owner); err != nil {
+		return fmt.Errorf("%s: %w", endpointName(t.req), err)
+	}
+
+	t.claimedPort = port
+	if err := bindUdp(port); err != nil {
+		portClaims.Release(msg.ProtoUDP, port, t.owner)
+		t.claimedPort = 0
+		return err
+	}
+	return nil
+}
+
+// pooledUdpUrl returns the url this pooling UDP tunnel would share with an
+// existing bucket, or "" when that cannot be known without binding a port.
+func (t *Tunnel) pooledUdpUrl() string {
+	if t.req.RemotePort != 0 {
+		return fmt.Sprintf("udp://%s:%d", opts.domain, t.req.RemotePort)
+	}
+	return tunnelRegistry.GetCachedRegistration(t)
+}
+
 // bindClaimedTcp claims port for this tunnel's account and binds it, in that
 // order: the ownership registry (SPEC-CLUSTER5 4.1) is consulted before the
 // kernel sees the bind, so a port another account holds is refused with the
@@ -513,13 +656,13 @@ func (t *Tunnel) registerTcp() error {
 // construction: a tunnel that joins a pooling bucket never binds, and so
 // never claims, and its Shutdown has nothing to release.
 func (t *Tunnel) bindClaimedTcp(port int, bindTcp func(int) error) error {
-	if err := portClaims.Claim(port, t.owner); err != nil {
+	if err := portClaims.Claim(msg.ProtoTCP, port, t.owner); err != nil {
 		return fmt.Errorf("%s: %w", endpointName(t.req), err)
 	}
 
 	t.claimedPort = port
 	if err := bindTcp(port); err != nil {
-		portClaims.Release(port, t.owner)
+		portClaims.Release(msg.ProtoTCP, port, t.owner)
 		t.claimedPort = 0
 		return err
 	}
@@ -548,30 +691,45 @@ func (t *Tunnel) Shutdown() {
 	// This is the release side of bindClaimedTcp's claim: the port becomes
 	// available to other accounts here, at teardown, and not one socket
 	// sooner -- which is the whole point of the registry. A tunnel that
-	// joined a pooling bucket never claimed a port and releases nothing.
+	// joined a pooling bucket never claimed a port and releases nothing. The
+	// claim lives in the protocol space the tunnel registered in: tcp and
+	// udp claims are independent (SPEC-CLUSTER8 §3.1).
 	if t.claimedPort != 0 {
-		portClaims.Release(t.claimedPort, t.owner)
+		portClaims.Release(t.req.Protocol, t.claimedPort, t.owner)
 		t.claimedPort = 0
 	}
 
+	// Close the public UDP socket if this is the tunnel that bound it, and
+	// take every flow down with it (SPEC-CLUSTER8 §3.1): closing the socket
+	// unblocks the reader loop, and closeAll ends the janitor and every
+	// flow's proxy conn, so neither the table nor its goroutines outlive the
+	// tunnel.
+	//
 	// Close the public listener if this is the tunnel that bound it. Pooling
 	// members share the creator's listener and must leave it open for the
-	// others; the listener dies with its creator (SPEC 3.2).
-	if t.listener != nil {
-		t.listener.Close()
+	// others; the listener dies with its creator (SPEC 3.2). A udp tunnel
+	// that joined a pooling bucket never bound a socket and takes the plain
+	// remove below.
+	if t.udpConn != nil || t.listener != nil {
+		if t.udpConn != nil {
+			t.udpConn.Close()
+			t.flows.closeAll()
+		} else {
+			t.listener.Close()
+		}
 
 		// The bucket is not this tunnel's alone: the members of the pool are
-		// registered under the same url and reach the public world only through
-		// the listener that just closed. Leaving the bucket behind would leave
-		// a pool key pointing at a port nothing listens on -- IsPooling would
-		// keep advertising it and a new pooling tunnel would join a bucket it
-		// can never serve from. Take the bucket down and shut its orphaned
-		// members down with it: their endpoint is gone, and a client that keeps
-		// listing a tunnel that no longer exists is worse than one that is told
-		// its tunnel closed.
+		// registered under the same url and reach the public world only
+		// through the listener -- or socket -- that just closed. Leaving the
+		// bucket behind would leave a pool key pointing at a port nothing
+		// listens on -- IsPooling would keep advertising it and a new pooling
+		// tunnel would join a bucket it can never serve from. Take the bucket
+		// down and shut its orphaned members down with it: their endpoint is
+		// gone, and a client that keeps listing a tunnel that no longer
+		// exists is worse than one that is told its tunnel closed.
 		for _, orphan := range tunnelRegistry.DelBucket(t.url) {
 			if orphan != t {
-				orphan.Info("Shutting down: the pooling listener for %s was closed by its owner", t.url)
+				orphan.Info("Shutting down: the pooling endpoint for %s was closed by its owner", t.url)
 				orphan.Shutdown()
 			}
 		}

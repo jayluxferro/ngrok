@@ -1,5 +1,188 @@
 # Changelog
-## 1.0.9 - 2026-10-04 - QUIC agent transport + pooled rewriter buffers
+## 1.0.10 - 2026-10-04 - UDP tunnels
+
+A new public protocol, `udp`, the first one this fork has added. It puts a
+local UDP service on a public UDP port with the semantics UDP actually has:
+datagram-preserving, lossy by design, ordering within one sender only.
+`ngrok -proto=udp 53` exposes a local DNS resolver; `ngrok -proto=udp 5353`
+exposes an mDNS-style responder; a game server or a QUIC upstream works the
+same way. Nothing in the path adds reliability -- no retransmission, no
+reordering, no reassembly -- because UDP must stay UDP: a tunnel that quietly
+retransmits is a TCP tunnel wearing a UDP address, and the application above
+it (which usually owns its own reliability, or owns its own silence) would
+have its semantics bent without being told.
+
+The harder design fact is that UDP has no connections, and everything this
+tunnel type inherits from the TCP path is per-connection: admission, rate
+limits, connection caps, the `on_tcp_connect` policy phase, one proxy conn
+per unit of traffic. The server solves this by inventing the unit -- see the
+flow model below -- rather than by per-packet decisions, which would re-run
+admission on every datagram and rate-limit the second half of every burst.
+
+### Server
+
+**The flow model.** A **flow** is one public `(ip, port)` that has sent at
+least one datagram to the tunnel. The first datagram from an unknown address
+establishes a flow, and at that moment -- once, not per datagram -- the whole
+TCP admission sequence runs: the per-IP rate limit, the per-IP connection
+cap, the endpoint's `on_tcp_connect` phase, then a proxy conn from the
+agent's pool, introduced by `StartProxy` with the flow's address as
+`ClientAddr` so the agent knows which flow it is serving. Datagrams from a
+known address extend that address's flow. The tunnel's public datagrams are
+drained by a single reader that never blocks on a flow -- establishment and
+framing happen off the read loop -- so one slow agent cannot stall the other
+flows on the port; each flow holds a bounded queue and drops past it, exactly
+as a congested UDP path would.
+
+**A refusal is silence.** A flow denied by rate limit, connection cap or
+`on_tcp_connect` is closed without a reply: UDP callers have no protocol to
+be answered in, and there is no datagram-shaped 403. This is stated rather
+than apologized for because it is the correct behavior and it is also the
+confusing one -- a refused sender sees exactly what it would see from an
+unreachable port. `on_tcp_connect` keeps its historical name and runs per
+flow, with `conn.client_ip` / `conn.remote_addr` set to the flow's address;
+the phase's `deny` is the tool for "this source may not open flows at all".
+No other policy phase applies to udp (there are no request heads to act on).
+
+**Datagram framing on the proxy leg.** The proxy conn is a byte stream
+(TCP, smux, or a QUIC stream), so each datagram travels as a 4-byte
+big-endian length prefix followed by exactly that many payload bytes, in
+both directions. The frame boundary is the datagram boundary -- nothing is
+coalesced and nothing is split, which is the one property a UDP relay must
+not compromise. A length field above 65507 (the largest UDP/IPv4 payload
+that can exist) cannot have come from a datagram anyone sent; it is a
+protocol error and closes the flow, because a stream that lost its framing
+cannot be resynchronized. A datagram larger than that arriving at the public
+socket cannot be relayed whole either; it is dropped and logged rather than
+delivered in pieces.
+
+**Idle expiry, 30 seconds, both ends.** A flow with no datagram in either
+direction for 30s is closed -- server and agent each run the same window on
+the same constant. It is deliberately not configurable: with no wire message
+to negotiate it, a server-side knob would let the two ends disagree, and the
+failure mode would be replies silently dropped by whichever half expired
+first. One constant, both binaries, is the design; if it ever needs to move,
+it moves in the protocol. Every datagram in either direction refreshes the
+deadline, so a chatty flow never expires.
+
+**Pooling assigns per flow.** A pooled udp endpoint round-robins flows
+across its members the way a pooled tcp endpoint round-robins connections --
+the first datagram's flow is served by whichever member the rotation picks.
+A single flow never spans two agents.
+
+**Port claims grew a protocol dimension.** The ownership registry keys
+claims on `(proto, port)`, because the kernel itself keeps the spaces apart:
+a TCP listener on 5000 and a UDP socket on 5000 are different sockets with
+no namespace in common, so `udp:5000` never fights `tcp:5000`. Within one
+protocol space the old rules are unchanged: one owner, refcounted holds, and
+a second token asking for the port is refused with the port and protocol
+named ("remote udp port 5000 already claimed by another auth token"). The
+registry also sees the server's own UDP listener -- the QUIC proxy listener
+from 1.0.9 -- so a udp tunnel cannot claim the port ngrokd's QUIC endpoint
+listens on; the refusal names it.
+
+### Client
+
+The agent side is one new branch in the proxy path and a small pump pair:
+
+- **The local leg is a *connected* UDP socket** (`net.DialUDP` toward the
+  configured local address). Connectedness is load-bearing in one direction:
+  the kernel only ever delivers that socket datagrams from the configured
+  local service, so a public client can never use the agent as a reflector
+  toward a third host. The same trick runs on the server's public socket
+  toward the public client. There is no `forward_to`/`.internal` for udp,
+  and a dead local service surfaces as silence (an ICMP port-unreachable on
+  a connected socket becomes a write error, which closes the flow quietly --
+  udp is not an HTTP protocol and there is no 502 to write).
+- **Replies go out through the tunnel's public socket, source port
+  preserved.** The server answers each flow from the socket it bound, so the
+  public client sees the reply come from the exact ip:port it sent to --
+  which is what lets a stateless client (a DNS resolver, most of all) accept
+  the answer. The obvious alternative -- the server dialing a fresh UDP
+  socket per flow -- was rejected precisely because it breaks this: an
+  ephemeral source port on a second socket makes the reply look like it came
+  from a stranger, and resolvers drop it.
+- **Idle is mirrored.** The agent expires its half of a silent flow at the
+  same 30s, logging the close quietly; either side's expiry tears down the
+  whole flow (the proxy conn close is the signal), so both ends agree a
+  silent flow is over and neither waits on the other to notice.
+- **`remote_port` accepts udp**, on the command line (`-proto=udp
+  -remote-port=5353`) and in the config file (`remote_port:` on the tunnel),
+  with the same rules as tcp: one protocol exactly, ports below 1024 need a
+  privileged server, and the claim is owned by the auth token.
+- `hostname`/`subdomain` are refused for udp, exactly as for tcp: the
+  endpoint is its port.
+
+### Operator exposure: this is a public reflector, state it like one
+
+A udp tunnel forwards datagrams in both directions between a public port and
+your local service, and your local service's replies go back to whoever
+asked -- from your server's address. That is a reflector by construction,
+and the amplification question deserves a straight answer: an attacker can
+send small requests and make your local service send responses to
+attacker-chosen source addresses. What bounds it:
+
+- **Reply targets are pinned per flow.** Replies go only to the address that
+  established the flow -- the server's public socket writes are
+  `WriteToUDP(..., flow.client)` and the agent's local socket is connected to
+  the configured service. Neither half will ever send to a third host because
+  a datagram told it to; the worst a spoofed source address buys an attacker
+  is a flow whose replies go into the void toward the spoofed address.
+- **Admission runs per flow, at the first datagram**: the per-IP rate limit
+  and connection cap you configure for the public listener (`-publicRate`,
+  `-maxConnPerIP`) gate flow creation the same way they gate TCP
+  connections, and `on_tcp_connect` can refuse flows by source before any
+  proxy conn is spent.
+- **The idle timeout bounds the window**: a flow lives 30s past its last
+  datagram in either direction, so a flow opened for one amplified burst
+  cannot be kept alive indefinitely without more datagrams from the claimed
+  source.
+- **One proxy conn per flow**, and the flow's queue to its agent is bounded
+  (16 datagrams, drop past it): a flow cannot make the server buffer
+  unboundedly on the agent's behalf.
+
+Treat a udp tunnel's exposure the way you would treat the same UDP service
+published on your own firewall: put source policy on it (`on_tcp_connect`
+deny by CIDR) if the service amplifies, and prefer tcp tunnels for anything
+that does not actually need UDP.
+
+### Known limitations
+
+- **Nameless port-routed tunnels no longer get their name auto-assigned as a
+  subdomain.** A tunnel whose every protocol is port-routed (tcp, udp) keeps
+  the name it was defined with and registers no subdomain: the server refuses
+  names on port-routed endpoints because their url is their bound port, and a
+  tunnel the loader had silently named could not register at all (the
+  collision was found by the udp e2e group and fixed before release -- this
+  entry records the behavior, not an open limitation). Name-routed tunnels
+  (any http/https leg) keep the long-standing assignment; a tcp leg always
+  ignored it, so nothing a tcp tunnel ever saw changes.
+- **Local testing on macOS is capped by the loopback MTU, not by the
+  protocol.** The tunnel carries datagrams up to 65507 bytes, but a datagram
+  above the interface MTU fragments, and macOS loopback tops out well below
+  the protocol maximum (~16 KiB in practice). Round-tripping a maximal
+  datagram against a local ngrokd will fail with silence; that is the wire
+  under test, not the tunnel. The e2e suite keeps its payloads small for
+  exactly this reason; test large-datagram behavior against a real network.
+- **Loss, reordering and ICMP errors are invisible by design.** A datagram
+  dropped between any two legs is dropped; an unreachable local port is
+  silence. Nothing logs "the datagram did not arrive" because nothing can
+  know.
+- **Flow establishment is one attempt.** If no proxy conn is available when
+  the first datagram arrives (the agent is reconnecting, the pool is empty),
+  the datagram is dropped and the flow closed; the sender's next datagram
+  establishes a fresh flow. There is no queueing of flows behind a reconnect,
+  because holding a flow's datagrams while waiting for an agent is exactly
+  the buffering UDP promises not to do.
+- **No inspector, no http policy phases, no health checks for udp.** There
+  are no requests to display and no probes that speak the local protocol;
+  the web interface shows nothing for a udp tunnel. A pooled udp endpoint
+  has no health checks, like its tcp counterpart: a dead member keeps
+  receiving its share of flows until its control connection drops.
+- **`on_tcp_connect` is the only policy phase a udp tunnel can carry**, and
+  a refusal is silence (see above) -- an operator debugging "why does no one
+  hear me" should check the server log for "Traffic policy refused the flow"
+  before checking anything else.
 
 Two throughput changes with the same target: the cost of moving many streams
 through one tunnel. QUIC becomes an alternative carrier for the multiplexed
