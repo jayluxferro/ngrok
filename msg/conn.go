@@ -89,17 +89,40 @@ func WriteMsg(c conn.Conn, msg interface{}) (err error) {
 const (
 	secretFieldName = `"Secret"`
 	redactedSecret  = `"<redacted>"`
+
+	// httpAuthFieldName is ReqTunnel.HttpAuth's JSON name: a base64
+	// "user:password" the httpauth feature sends in the clear of its own
+	// message. It was crossing the Debug wire log unredacted since before
+	// vaults existed -- closed here, beside the fields that joined it in
+	// needing it.
+	httpAuthFieldName = `"HttpAuth"`
 )
 
+// policyCredentialFieldNames are the JSON field names of a traffic policy's
+// credential lists -- credentials (basic-auth), tokens (bearer-auth), keys
+// (apikey-auth), policy/auth_actions.go's credentialList fields. No wire
+// message declares a field by these names: the only place they appear on the
+// wire is inside ReqTunnel's TrafficPolicy, where each is an array of strings.
+// Inline plaintext and vault-sourced credentials are indistinguishable here
+// and both must be hidden (SPEC-CLUSTER9 3.3): the redaction is by field
+// name, so it does not care which source filled the array.
+var policyCredentialFieldNames = []string{`"credentials"`, `"tokens"`, `"keys"`}
+
 // redactSecrets returns the bytes to log for a serialized message: the same
-// bytes with the value of every "Secret" field replaced by a placeholder.
+// bytes with the value of every "Secret" field replaced by a placeholder, and
+// the elements of every serialized policy credential list replaced with it too.
 //
 // The two Debug calls in this file are the only places a whole wire message is
 // written out, and a wire message carries the session secret (Auth, AuthResp,
 // RegProxy, RegMux). Logging it verbatim turns the log into a credential store:
 // the log file, the log shipper and whatever aggregates them each end up
 // holding a bearer proof that attaches to a *live* session, kept far longer
-// than the session itself and readable by everyone who can read logs.
+// than the session itself and readable by everyone who can read logs. A
+// tunnel's registration carries its traffic policy, and a policy's credential
+// lists are credentials in exactly that sense -- long-lived bearer proofs for
+// an endpoint rather than a session -- so they are hidden by the same
+// mechanism, regardless of whether they were written inline or resolved from a
+// vault.
 //
 // It works on the encoded bytes rather than on the struct because the read path
 // never has the struct, and because doing it by name means a message type added
@@ -120,19 +143,39 @@ const (
 // A message with nothing to redact is returned as-is, without copying: this
 // runs on every message, and the fast path is the common one.
 func redactSecrets(buffer []byte) []byte {
+	out, redacted := redactStringField(buffer, secretFieldName)
+	if auth, authRedacted := redactStringField(out, httpAuthFieldName); authRedacted {
+		out, redacted = auth, true
+	}
+	if creds, credRedacted := redactCredentialFields(out); credRedacted {
+		return creds
+	}
+	if redacted {
+		return out
+	}
+	return buffer
+}
+
+// redactStringField is the "Secret" scan: every occurrence of one JSON field
+// name has its string value replaced by the placeholder. It reports whether it
+// redacted anything; the buffer it returns is the caller's own bytes when it
+// redacted nothing, so the no-match fast path of redactSecrets stays
+// copy-free.
+func redactStringField(buffer []byte, field string) ([]byte, bool) {
+	name := []byte(field)
 	out := make([]byte, 0, len(buffer))
 	rest := buffer
 	redacted := false
 
 	for {
-		i := bytes.Index(rest, []byte(secretFieldName))
+		i := bytes.Index(rest, name)
 		if i < 0 {
 			break
 		}
 
 		// field name, optional space, colon, optional space, opening quote;
 		// anything else is not this field, so keep the bytes and scan on
-		j := i + len(secretFieldName)
+		j := i + len(name)
 		for j < len(rest) && rest[j] == ' ' {
 			j++
 		}
@@ -181,7 +224,149 @@ func redactSecrets(buffer []byte) []byte {
 	}
 
 	if !redacted {
-		return buffer
+		return buffer, false
 	}
-	return append(out, rest...)
+	return append(out, rest...), true
+}
+
+// redactCredentialFields redacts every element of every serialized policy
+// credential list, one field name at a time. The lists are independent, so a
+// pass that finds nothing costs a scan of bytes this function already runs on
+// only when DEBUG logging is on -- and a buffer whose arrays do not parse as
+// flat string lists is left exactly as this function found it, on the same
+// reasoning the "Secret" scan has: guessing where a malformed value ended is
+// a worse failure than leaving a line of a malformed message in a debug log.
+func redactCredentialFields(buffer []byte) ([]byte, bool) {
+	redacted := false
+	for _, name := range policyCredentialFieldNames {
+		var r bool
+		buffer, r = redactCredentialArray(buffer, name)
+		redacted = redacted || r
+	}
+	return buffer, redacted
+}
+
+// redactCredentialArray rewrites one credential list in place: each non-empty
+// string element of the named field's array is replaced by the placeholder,
+// so the log line stays a decodable message with the list's arity -- and
+// stops being a credential store.
+func redactCredentialArray(buffer []byte, field string) ([]byte, bool) {
+	name := []byte(field)
+	out := make([]byte, 0, len(buffer))
+	rest := buffer
+	redacted := false
+
+scan:
+	for {
+		i := bytes.Index(rest, name)
+		if i < 0 {
+			break
+		}
+
+		// field name, optional space, colon, optional space, opening bracket;
+		// anything else is not this field, so keep the bytes and scan on
+		j := i + len(name)
+		for j < len(rest) && rest[j] == ' ' {
+			j++
+		}
+		if j < len(rest) && rest[j] == ':' {
+			j++
+			for j < len(rest) && rest[j] == ' ' {
+				j++
+			}
+		}
+		if j >= len(rest) || rest[j] != '[' {
+			out = append(out, rest[:j]...)
+			rest = rest[j:]
+			continue
+		}
+
+		// the value is the array: copy through the opening bracket, then walk
+		// one element at a time, keeping every byte that is not a redacted
+		// value -- what remains logged must be the message, not a paraphrase
+		out = append(out, rest[:j+1]...)
+		rest = rest[j+1:]
+
+		for {
+			space, after := splitJSONSpace(rest)
+			out = append(out, space...)
+			rest = after
+			if len(rest) == 0 {
+				return buffer, false
+			}
+			if rest[0] == ']' {
+				out = append(out, ']')
+				rest = rest[1:]
+				continue scan
+			}
+			if rest[0] != '"' {
+				// not a string element: no valid policy produces this shape
+				return buffer, false
+			}
+
+			// the element string, with escapes skipped as above
+			end := 1
+			for end < len(rest) {
+				if rest[end] == '\\' {
+					end += 2
+					continue
+				}
+				if rest[end] == '"' {
+					break
+				}
+				end++
+			}
+			if end >= len(rest) {
+				return buffer, false
+			}
+			if end > 1 {
+				out = append(out, redactedSecret...)
+				redacted = true
+			} else {
+				// "" stays: an empty credential list entry is refused at
+				// load, so an empty element is diagnostics, not a secret
+				out = append(out, rest[:2]...)
+			}
+			rest = rest[end+1:]
+
+			// after an element: a comma (next element) or the closing bracket
+			space, after = splitJSONSpace(rest)
+			out = append(out, space...)
+			rest = after
+			if len(rest) == 0 {
+				return buffer, false
+			}
+			switch rest[0] {
+			case ',':
+				out = append(out, ',')
+				rest = rest[1:]
+			case ']':
+				out = append(out, ']')
+				rest = rest[1:]
+				continue scan
+			default:
+				return buffer, false
+			}
+		}
+	}
+
+	if !redacted {
+		return buffer, false
+	}
+	return append(out, rest...), true
+}
+
+// splitJSONSpace splits off the whitespace JSON allows between tokens, so the
+// scanner can keep it (the bytes around a redacted value are not the value).
+func splitJSONSpace(rest []byte) (space, after []byte) {
+	k := 0
+	for k < len(rest) {
+		switch rest[k] {
+		case ' ', '\t', '\n', '\r':
+			k++
+		default:
+			return rest[:k], rest[k:]
+		}
+	}
+	return rest, rest[len(rest):]
 }

@@ -272,6 +272,64 @@ configurable header, plain 401 — there is no standard challenge for a
 custom header) round out the set; see [docs/CHANGELOG.md](docs/CHANGELOG.md)
 for their exact config shapes and the current limitations.
 
+**Secret vaults.** Credential entries can be kept out of the policy document
+and sourced from a named vault instead — `secret("vault/key")` as the whole
+value, resolved once at configuration load, never per request and never
+inside a policy expression:
+
+```yaml
+# ngrok client config — ngrokd speaks the same vaults: block
+vaults:
+  main:
+    file: /etc/ngrok/vault.yml        # flat YAML map: api: "alice:s3cret"
+  staging:
+    env_prefix: NGROK_VAULT_STAGING_  # NGROK_VAULT_STAGING_API=... -> key "API"
+
+tunnels:
+  private:
+    hostname: app.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            credentials:
+              - 'secret("main/api")'
+```
+
+A vault file entry may be written `sha256:<hex>` — a pre-digested credential —
+so the disk never holds the plaintext at all. The reference text, not the
+value, is what crosses the wire to the server: each side resolves against its
+own `vaults:` block, so **a vault must exist on both sides** — a server
+without it refuses the registration rather than exposing an endpoint that
+only looks protected. A missing vault or key fails the load loudly, naming
+both; with pre-digested entries and the wire log's credential redaction, the
+plaintext need never appear in a file, an env var you can avoid, or a log.
+
+**Event export (server).** ngrokd's event stream (`tunnel_open`,
+`connection_open`, `connection_close`, `auth_reject`, …) can ship to external
+destinations instead of only the admin `/events` SSE endpoint:
+
+```yaml
+# ngrokd config
+event_destinations:
+  - type: http
+    url: https://collector.example/ngrok
+    auth_header: "Authorization: Bearer <token>"   # literal or secret("vault/key")
+    batch_size: 100        # flush when full...
+    flush_interval: 5s     # ...or when this elapses; failed POSTs retry with backoff
+  - type: jsonl
+    path: /var/log/ngrok/events.jsonl   # one JSON event per line, tail -f-able
+```
+
+A destination that cannot keep up never blocks the server: its queue
+overflows and the loss is counted in `/metrics` — `event_drop_count` (hub
+total, also `ngrokd_event_drop_count` on `/metrics/prometheus`) plus one
+`event_destinations` row per destination with `type`, `target`, `dropped` and
+`queue_depth`. The counters are the only record of what a stalled
+destination lost — check them before trusting the stream.
+
 **QUIC proxy transport (agent leg).** The multiplexed connection that carries
 tunnel traffic between agent and server can ride QUIC instead of TCP+smux, so
 a lost packet stalls only its own stream rather than every stream behind it

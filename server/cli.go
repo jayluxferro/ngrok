@@ -31,6 +31,14 @@ type Options struct {
 	publicRate   int
 	maxConnPerIP int
 	enablePprof  bool
+	// eventDestinations is the server-side event export list
+	// (SPEC-CLUSTER9 §4). Deliberately config-only, with no flag: each entry
+	// is a small struct (type/url/auth_header/batch_size/flush_interval/path)
+	// and the two destination types want disjoint keys, so a flag would need
+	// a bespoke lossy mini-grammar -- exactly what the YAML config file
+	// already expresses. parseArgs copies the list through untouched; all
+	// validation happened at load.
+	eventDestinations []eventDestinationConfig
 }
 
 func parseArgs() *Options {
@@ -75,10 +83,21 @@ func parseArgs() *Options {
 
 	seen := explicitFlags()
 
+	// event_destinations has no flag to compete with, so it is collected here
+	// and applied in the return below.
+	var eventDestinations []eventDestinationConfig
+
 	if *configPath != "" {
 		cfg, err := loadServerConfig(*configPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Failed to read config:", err.Error())
+			os.Exit(1)
+		}
+		// The vaults install before anything else reads them: tunnel
+		// registrations compile agent policies against this set, and the
+		// event destinations' auth_header values resolve against it below.
+		if err := loadServerVaults(cfg.Vaults); err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to load vaults:", err.Error())
 			os.Exit(1)
 		}
 		// Precedence: an explicit command-line flag beats the config file
@@ -109,6 +128,10 @@ func parseArgs() *Options {
 		if len(cfg.AuthTokens) > 0 && !seen["authToken"] {
 			*authTokensFlag = strings.Join(cfg.AuthTokens, ",")
 		}
+		// No flag competes with event_destinations (see Options), so the list
+		// is applied unconditionally: an empty list is "no export", which is
+		// also what an absent config file means.
+		eventDestinations = cfg.EventDestinations
 	}
 
 	// Parse auth tokens from comma-separated string
@@ -124,29 +147,30 @@ func parseArgs() *Options {
 	}
 
 	return &Options{
-		httpAddr:     *httpAddr,
-		httpsAddr:    *httpsAddr,
-		tunnelAddr:   *tunnelAddr,
-		quicAddr:     *quicAddr,
-		adminAddr:    *adminAddr,
-		adminAuth:    *adminAuth,
-		adminToken:   *adminToken,
-		adminRate:    *adminRate,
-		statusURL:    *statusURL,
-		statusAuth:   *statusAuth,
-		statusToken:  *statusToken,
-		domain:       *domain,
-		tlsCrt:       *tlsCrt,
-		tlsKey:       *tlsKey,
-		logto:        *logto,
-		loglevel:     *loglevel,
-		logformat:    *logformat,
-		authTokens:   authTokens,
-		maxMsgBytes:  *maxMsgBytes,
-		authRate:     *authRate,
-		publicRate:   *publicRate,
-		maxConnPerIP: *maxConnPerIP,
-		enablePprof:  *enablePprof,
+		httpAddr:          *httpAddr,
+		httpsAddr:         *httpsAddr,
+		tunnelAddr:        *tunnelAddr,
+		quicAddr:          *quicAddr,
+		adminAddr:         *adminAddr,
+		adminAuth:         *adminAuth,
+		adminToken:        *adminToken,
+		adminRate:         *adminRate,
+		statusURL:         *statusURL,
+		statusAuth:        *statusAuth,
+		statusToken:       *statusToken,
+		domain:            *domain,
+		tlsCrt:            *tlsCrt,
+		tlsKey:            *tlsKey,
+		logto:             *logto,
+		loglevel:          *loglevel,
+		logformat:         *logformat,
+		authTokens:        authTokens,
+		maxMsgBytes:       *maxMsgBytes,
+		authRate:          *authRate,
+		publicRate:        *publicRate,
+		maxConnPerIP:      *maxConnPerIP,
+		enablePprof:       *enablePprof,
+		eventDestinations: eventDestinations,
 	}
 }
 

@@ -563,7 +563,7 @@ func TestSessionSecretNeverAppearsInLogsOrEvents(t *testing.T) {
 	drained := 0
 	for {
 		select {
-		case payload := <-events:
+		case payload := <-events.ch:
 			drained++
 			if strings.Contains(string(payload), secret) {
 				t.Fatalf("the session secret reached an event: %s", maskSecret(string(payload), secret))

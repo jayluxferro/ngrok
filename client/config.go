@@ -42,8 +42,19 @@ type Configuration struct {
 	TrustHostRootCerts bool                            `yaml:"trust_host_root_certs,omitempty"`
 	AuthToken          string                          `yaml:"auth_token,omitempty"`
 	Tunnels            map[string]*TunnelConfiguration `yaml:"tunnels,omitempty"`
-	LogTo              string                          `yaml:"-"`
-	Path               string                          `yaml:"-"`
+
+	// Vaults names the secret vaults (SPEC-CLUSTER9 3) that credential values
+	// in traffic policies may reference as secret("vault/key") instead of
+	// carrying inline. The block is loaded and installed into package policy
+	// here, at configuration load, BEFORE any tunnel is validated -- policy
+	// validation resolves references through the installed set, so a policy
+	// that references a vault must have it available by then. Each side of the
+	// protocol loads its own vaults; the same document plus the same vaults
+	// resolves identically on both (the server's half is loadServerVaults).
+	Vaults map[string]policy.VaultSource `yaml:"vaults,omitempty"`
+
+	LogTo string `yaml:"-"`
+	Path  string `yaml:"-"`
 }
 
 // HeaderConfig is the "key:value" add list / header-name remove list pair used
@@ -246,6 +257,17 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 
 	if config.HttpProxy == "" {
 		config.HttpProxy = os.Getenv("http_proxy")
+	}
+
+	// The vaults block is loaded before any tunnel is validated, so that
+	// policy validation -- which resolves secret("vault/key") references
+	// through the installed set -- sees exactly this configuration's vaults.
+	// The call is unconditional: a config without vaults installs the empty
+	// set, which both resets whatever a previous load in this process
+	// installed and makes an unresolvable reference the loud load error it
+	// must be rather than a stale hit.
+	if err = config.loadVaults(); err != nil {
+		return
 	}
 
 	// validate and normalize configuration
@@ -1136,6 +1158,26 @@ func parseJSONPolicy(buf []byte) *policy.TrafficPolicy {
 	}
 
 	return tp
+}
+
+// loadVaults resolves the configuration's vaults: block into package policy's
+// process-wide vault set (SPEC-CLUSTER9 3.1). The source loading itself --
+// the vault file reads, the environment scan, the per-entry validation -- is
+// policy.LoadVaults, the same loader the server runs over its own config, so
+// one file shape and one set of load errors serve both sides.
+//
+// It is called unconditionally from LoadConfiguration: a configuration with no
+// vaults installs the empty set. That is what makes an secret("vault/key")
+// reference in a vault-less config a load error ("no vaults are configured")
+// instead of either a crash on stale state or -- worse -- the reference text
+// silently becoming a credential that matches nothing.
+func (c *Configuration) loadVaults() error {
+	vaults, err := policy.LoadVaults(c.Vaults)
+	if err != nil {
+		return err
+	}
+	policy.SetVaults(vaults)
+	return nil
 }
 
 func SaveAuthToken(configPath, authtoken string) (err error) {

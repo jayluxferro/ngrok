@@ -33,6 +33,7 @@ type metricsPoint struct {
 	PublicConnOpened   uint64    `json:"public_conn_open_total"`
 	RateDropCount      uint64    `json:"rate_drop_count"`
 	AuthRejectCount    uint64    `json:"auth_reject_count"`
+	EventDropCount     uint64    `json:"event_drop_count"`
 }
 
 // The event stream is the /events SSE endpoint's payload: one JSON object per
@@ -49,6 +50,7 @@ type metricsPoint struct {
 const (
 	eventTunnelOpen        = "tunnel_open"
 	eventTunnelClose       = "tunnel_close"
+	eventConnectionOpen    = "connection_open"
 	eventConnectionClose   = "connection_close"
 	eventAuthReject        = "auth_reject"
 	eventRateLimitDrop     = "rate_limit_drop"
@@ -113,6 +115,17 @@ type tunnelCloseEvent struct {
 	URL string `json:"url"`
 }
 
+// connectionOpenEvent is one public connection accepted, carrying who it came
+// from and which endpoint it hit. It is the opening half of connection_close
+// (which carries the byte totals): together they bracket one served
+// connection.
+type connectionOpenEvent struct {
+	eventHeader
+	ClientAddr string `json:"client_addr"`
+	URL        string `json:"url"`
+	Protocol   string `json:"protocol"`
+}
+
 // connectionCloseEvent is one public connection finishing, with the byte
 // counts in each direction.
 type connectionCloseEvent struct {
@@ -122,30 +135,73 @@ type connectionCloseEvent struct {
 	BytesOut int64  `json:"bytes_out"`
 }
 
-type eventHub struct {
-	mu        sync.RWMutex
-	listeners map[chan []byte]struct{}
+// eventSubscription is one consumer of the hub's stream. Its buffered channel
+// is where publish deposits pre-marshaled events; dropped counts the events
+// that did not fit.
+//
+// The drop counter is per subscriber, not hub-wide, because "who fell behind"
+// is the actionable half of the number: a stalled /events dashboard and a
+// stalled export destination want different responses, and a single hub-wide
+// counter cannot tell them apart. The hub also keeps a running total across
+// all subscribers (eventHub.droppedTotal) for cheap /metrics and sampler
+// reads; both are bumped together in publish's drop branch, so the total is
+// always the sum over every subscriber, current ones and long-gone ones.
+type eventSubscription struct {
+	ch      chan []byte
+	dropped atomic.Uint64
 }
+
+type eventHub struct {
+	mu           sync.RWMutex
+	listeners    map[*eventSubscription]struct{}
+	droppedTotal atomic.Uint64
+}
+
+// subscriberQueueCap is the per-subscriber buffer for interactive consumers
+// (the /events SSE endpoint). Export destinations size their own queue with
+// subscribeBuffered.
+const subscriberQueueCap = 128
 
 func newEventHub() *eventHub {
-	return &eventHub{listeners: make(map[chan []byte]struct{})}
+	return &eventHub{listeners: make(map[*eventSubscription]struct{})}
 }
 
-func (h *eventHub) subscribe() chan []byte {
-	ch := make(chan []byte, 128)
+func (h *eventHub) subscribe() *eventSubscription {
+	return h.subscribeBuffered(subscriberQueueCap)
+}
+
+// subscribeBuffered registers a consumer with an explicit queue size. The
+// export destinations use this for their 1000-slot queues (the KeenIoMetrics
+// precedent, metrics.go); the cap is fixed rather than configurable because a
+// subscriber that needs more than 1000 buffered events is not keeping up and
+// should be told so by its drop counter, not encouraged with more buffer.
+func (h *eventHub) subscribeBuffered(queueCap int) *eventSubscription {
+	s := &eventSubscription{ch: make(chan []byte, queueCap)}
 	h.mu.Lock()
-	h.listeners[ch] = struct{}{}
+	h.listeners[s] = struct{}{}
 	h.mu.Unlock()
-	return ch
+	return s
 }
 
-func (h *eventHub) unsubscribe(ch chan []byte) {
+func (h *eventHub) unsubscribe(s *eventSubscription) {
 	h.mu.Lock()
-	if _, ok := h.listeners[ch]; ok {
-		delete(h.listeners, ch)
-		close(ch)
+	if _, ok := h.listeners[s]; ok {
+		delete(h.listeners, s)
+		close(s.ch)
 	}
 	h.mu.Unlock()
+}
+
+// droppedEvents is the hub-wide count of events dropped on full subscriber
+// queues, over the life of the process.
+func (h *eventHub) droppedEvents() uint64 {
+	return h.droppedTotal.Load()
+}
+
+func (h *eventHub) subscriberCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.listeners)
 }
 
 // publish hands one event to every subscriber. A slow subscriber's buffer is
@@ -164,10 +220,12 @@ func (h *eventHub) publish(event interface{}) {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for ch := range h.listeners {
+	for sub := range h.listeners {
 		select {
-		case ch <- payload:
+		case sub.ch <- payload:
 		default:
+			sub.dropped.Add(1)
+			h.droppedTotal.Add(1)
 		}
 	}
 }
@@ -186,6 +244,18 @@ func (h *eventHub) publishTunnelClose(url string) {
 	h.publish(tunnelCloseEvent{
 		eventHeader: newEventHeader(eventTunnelClose),
 		URL:         url,
+	})
+}
+
+// publishConnectionOpen reports one public connection accepted. clientAddr is
+// the public side's remote address, the same value the agent sees in
+// StartProxy.ClientAddr.
+func (h *eventHub) publishConnectionOpen(clientAddr, url, protocol string) {
+	h.publish(connectionOpenEvent{
+		eventHeader: newEventHeader(eventConnectionOpen),
+		ClientAddr:  clientAddr,
+		URL:         url,
+		Protocol:    protocol,
 	})
 }
 
@@ -257,13 +327,19 @@ func (o *observabilityStore) onTunnelClose(t *Tunnel) {
 	o.events.publishTunnelClose(t.url)
 }
 
-func (o *observabilityStore) onConnOpen(t *Tunnel) {
+// onConnOpen accounts one public connection accepted on t and announces it as
+// a connection_open event. clientAddr is the public side's remote address;
+// the callers (HandlePublicConnection and the UDP flow path) are the only
+// places that know it, which is why it is a parameter rather than something
+// the store looks up.
+func (o *observabilityStore) onConnOpen(t *Tunnel, clientAddr string) {
 	o.mu.Lock()
 	if s := o.tunnels[t.url]; s != nil {
 		s.ActiveConnections++
 		s.TotalConnections++
 	}
 	o.mu.Unlock()
+	o.events.publishConnectionOpen(clientAddr, t.url, t.req.Protocol)
 }
 
 func (o *observabilityStore) onConnClose(t *Tunnel, bytesIn, bytesOut int64) {
@@ -305,6 +381,7 @@ func (o *observabilityStore) sampler() {
 			PublicConnOpened:   atomic.LoadUint64(&publicConnOpenTotal),
 			RateDropCount:      atomic.LoadUint64(&rateDropCount),
 			AuthRejectCount:    atomic.LoadUint64(&authRejectCount),
+			EventDropCount:     o.events.droppedEvents(),
 		}
 
 		o.mu.Lock()

@@ -2229,4 +2229,444 @@ else
   udp_probe_expect "udp 6 (control)" 127.0.0.1 "$CONTROL_PORT" "udp-e2e-control-passes"
 fi
 
+# ---------------------------------------------------------------------------
+# Secret vaults + event export (SPEC-CLUSTER9). Two features, one group,
+# one server: the fifth ngrokd carries BOTH the `vaults:` block (file- and
+# env-sourced) and the `event_destinations:` list (jsonl + http), so the
+# vault scenarios' registrations are the very events the export scenarios
+# then assert on -- the features compose by default, not by arrangement.
+#
+# Vault ground rule: `secret("vault/key")` resolves at LOAD time on whichever
+# side loads the document, and the reference text is what crosses the wire --
+# the server re-resolves against ITS OWN vaults. So the same vault must exist
+# on both sides (client for agent-side validation, server for edge
+# enforcement), and the credential VALUES below appear nowhere in this script
+# except the vault sources themselves: what authenticates is provably the
+# vault's bytes, not an inline literal.
+#
+# A vault-sourced credential that FAILS to resolve is the mirror proof, and it
+# needs a server WITHOUT vaults -- that is the first ngrokd, which this
+# scenario deliberately registers against.
+# ---------------------------------------------------------------------------
+
+# wait_for_public_at <port> <hostname>: wait_for_public against a server other
+# than the first (whose :18080 that helper hardcodes); same
+# 404-means-not-registered-yet logic, port as a parameter.
+wait_for_public_at() {
+  local port="$1" host="$2" code
+  for i in {1..40}; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $host" "http://127.0.0.1:${port}/" || true)"
+    if [[ "$code" != "404" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  echo "[e2e] the public listener on :$port never learned the hostname $host"
+  return 1
+}
+
+echo "[e2e] writing the file vault (the credential below appears nowhere else in this suite)"
+cat > "$TMPDIR/vault.yml" <<'YAML'
+# e2e vault: a flat key: value map; values may also be sha256:<hex> pre-digested
+api: "vaultuser:vw-s3cret-e2e-7f3a9c"
+YAML
+
+# The env vault's credential rides the environment into BOTH processes that
+# need it (this shell spawns the ngrokd and the ngrok client): env_prefix
+# sources are read at load, from the process environment.
+export NGROK_E2E_VAULT_API='envuser:ev-s3cret-e2e-9b2d41'
+
+echo "[e2e] starting the event collector (records every POST batch, serves GET /dump)"
+cat > "$TMPDIR/event_collector.py" <<'PY'
+import json, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+LOCK = threading.Lock()
+BATCHES = []
+
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        with LOCK:
+            BATCHES.append({
+                "path": self.path,
+                "auth": self.headers.get("Authorization", ""),
+                "events": json.loads(body) if body else [],
+            })
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def do_GET(self):
+        if self.path == "/dump":
+            with LOCK:
+                payload = json.dumps(BATCHES).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *_): pass
+
+HTTPServer(("127.0.0.1", 19013), H).serve_forever()
+PY
+python3 "$TMPDIR/event_collector.py" >/tmp/ngrok-e2e-collector.log 2>&1 &
+
+echo "[e2e] starting the vaults+events ngrokd (fifth server: -config carries vaults + event_destinations)"
+cat > "$TMPDIR/ngrokd-vaults-events.yml" <<YAML
+vaults:
+  filevault:
+    file: $TMPDIR/vault.yml
+  envvault:
+    env_prefix: NGROK_E2E_VAULT_
+event_destinations:
+  - type: jsonl
+    path: $TMPDIR/events.jsonl
+  - type: http
+    url: http://127.0.0.1:19013/collect
+    auth_header: "Authorization: Bearer e2e-collector-token"
+    batch_size: 10
+    flush_interval: 1s
+YAML
+./bin/ngrokd -config="$TMPDIR/ngrokd-vaults-events.yml" -domain=localhost \
+  -httpAddr=127.0.0.1:18082 -httpsAddr= -tunnelAddr=127.0.0.1:14447 -adminAddr=127.0.0.1:19093 \
+  >/tmp/ngrok-e2e-vaults-ngrokd.log 2>&1 &
+VAULTS_SERVER_PID=$!
+for i in {1..40}; do
+  if grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-vaults-ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-vaults-ngrokd.log 2>/dev/null; then
+  echo "[e2e] the vaults+events ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-vaults-ngrokd.log || true
+  exit 1
+fi
+# Destinations start before the listeners, so both lines are already down by now.
+for kind in jsonl http; do
+  if ! grep -q "Exporting events to $kind destination" /tmp/ngrok-e2e-vaults-ngrokd.log; then
+    echo "[e2e] the $kind event destination never started:"
+    grep -i "event" /tmp/ngrok-e2e-vaults-ngrokd.log | tail -n 5 || true
+    exit 1
+  fi
+done
+
+echo "[e2e] starting the vault client (vaultbasic=file vault, vaultenv=env vault, eventweb=plain)"
+cat > "$TMPDIR/ngrok-vaults.yml" <<YAML
+server_addr: 127.0.0.1:14447
+trust_host_root_certs: true
+vaults:
+  filevault:
+    file: $TMPDIR/vault.yml
+  envvault:
+    env_prefix: NGROK_E2E_VAULT_
+tunnels:
+  vaultbasic:
+    hostname: vaultbasic
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            realm: vault-realm
+            credentials:
+              - 'secret("filevault/api")'
+  vaultenv:
+    hostname: vaultenv
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            credentials:
+              - 'secret("envvault/API")'
+  eventweb:
+    hostname: eventweb
+    proto:
+      http: 19001
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-vaults.yml" -log=/tmp/ngrok-e2e-vaults-client.log \
+  start vaultbasic vaultenv eventweb >/tmp/ngrok-e2e-vaults-client-stdout.log 2>&1 &
+VAULT_CLIENT_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-vaults-client.log "vault group (vaultbasic+vaultenv+eventweb)"
+wait_for_public_at 18082 vaultbasic
+wait_for_public_at 18082 vaultenv
+wait_for_public_at 18082 eventweb
+
+echo "[e2e] vault 1 (file source): no credentials -> 401 with the realm challenge"
+VAULT_CODE="$(policy_curl -D "$TMPDIR/vault-basic.headers" -o /dev/null -H 'Host: vaultbasic' http://127.0.0.1:18082/)"
+if [[ "$VAULT_CODE" != "401" ]]; then
+  echo "[e2e] expected the vault-sourced basic-auth to answer 401 without credentials, got $VAULT_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Basic realm="vault-realm"' "$TMPDIR/vault-basic.headers"; then
+  echo "[e2e] the vault-sourced basic-auth challenge is missing or wrong:"
+  cat "$TMPDIR/vault-basic.headers"
+  exit 1
+fi
+
+echo "[e2e] vault 1: wrong password -> 401, the vault's exact user:pass -> 200"
+# The only place 'vw-s3cret-e2e-7f3a9c' exists is vault.yml: a 200 here means
+# the vault's bytes authenticated, since no inline credential in any config
+# in this suite spells that pair.
+VAULT_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -u vaultuser:totally-wrong -H 'Host: vaultbasic' http://127.0.0.1:18082/)"
+if [[ "$VAULT_WRONG" != "401" ]]; then
+  echo "[e2e] expected basic-auth to refuse a wrong password with 401, got $VAULT_WRONG"
+  exit 1
+fi
+VAULT_OK="$(curl -fsS -u 'vaultuser:vw-s3cret-e2e-7f3a9c' -H 'Host: vaultbasic' http://127.0.0.1:18082/)"
+if [[ "$VAULT_OK" != "e2e-ok" ]]; then
+  echo "[e2e] the file-vault credential did not authenticate: \"$VAULT_OK\""
+  exit 1
+fi
+
+echo "[e2e] vault 2 (env source): the env_prefix vault authenticates the same way"
+VAULTENV_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -u envuser:nope -H 'Host: vaultenv' http://127.0.0.1:18082/)"
+if [[ "$VAULTENV_WRONG" != "401" ]]; then
+  echo "[e2e] expected the env-vault basic-auth to refuse a wrong password with 401, got $VAULTENV_WRONG"
+  exit 1
+fi
+# Key spelling is verbatim: NGROK_E2E_VAULT_API minus the prefix is key "API".
+VAULTENV_OK="$(curl -fsS -u 'envuser:ev-s3cret-e2e-9b2d41' -H 'Host: vaultenv' http://127.0.0.1:18082/)"
+if [[ "$VAULTENV_OK" != "e2e-ok" ]]; then
+  echo "[e2e] the env-vault credential did not authenticate: \"$VAULTENV_OK\""
+  exit 1
+fi
+
+echo "[e2e] vault 3: the wire DEBUG log carries the redacted placeholder, never a credential value"
+# The client runs at DEBUG by default, and the ReqTunnel write is the one
+# place the policy (inline or vault-sourced) is spelled out on the wire. The
+# credential list must show up -- redacted -- proving the policy crossed and
+# the redaction ran; the vault VALUES must not appear anywhere in the log.
+if ! grep -qF '"credentials":["<redacted>"]' /tmp/ngrok-e2e-vaults-client.log; then
+  echo "[e2e] the wire log does not show a redacted credential list (redaction or wire log broken):"
+  grep -c "Writing message" /tmp/ngrok-e2e-vaults-client.log || true
+  exit 1
+fi
+if grep -qF 'vw-s3cret-e2e-7f3a9c' /tmp/ngrok-e2e-vaults-client.log; then
+  echo "[e2e] WIRE LEAK: the file-vault credential value appears in the client's DEBUG log"
+  grep -F 'vw-s3cret-e2e-7f3a9c' /tmp/ngrok-e2e-vaults-client.log || true
+  exit 1
+fi
+if grep -qF 'ev-s3cret-e2e-9b2d41' /tmp/ngrok-e2e-vaults-client.log; then
+  echo "[e2e] WIRE LEAK: the env-vault credential value appears in the client's DEBUG log"
+  grep -F 'ev-s3cret-e2e-9b2d41' /tmp/ngrok-e2e-vaults-client.log || true
+  exit 1
+fi
+
+echo "[e2e] vault 4: a server without the vault refuses the registration"
+# The client HAS the vault (its load succeeds and resolves the reference);
+# the reference text crosses the wire and the FIRST server (no vaults) must
+# refuse it loudly at registration instead of coming up unprotected. Same
+# deterministic shape as the port-claim refusals: the failed registration
+# ends the client, so wait on the exit and grep the stdout it left.
+cat > "$TMPDIR/ngrok-vault-nosrv.yml" <<YAML
+server_addr: 127.0.0.1:14443
+trust_host_root_certs: true
+vaults:
+  filevault:
+    file: $TMPDIR/vault.yml
+tunnels:
+  vaultnosrv:
+    hostname: vaultnosrv
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            credentials:
+              - 'secret("filevault/api")'
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-vault-nosrv.yml" -log=/tmp/ngrok-e2e-vault-nosrv.log \
+  start vaultnosrv >"$TMPDIR/vault-nosrv.out" 2>&1 &
+VAULT_NOSRV_PID=$!
+VAULT_NOSRV_EXITED=0
+for i in {1..40}; do
+  if ! kill -0 "$VAULT_NOSRV_PID" 2>/dev/null; then
+    VAULT_NOSRV_EXITED=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$VAULT_NOSRV_EXITED" != "1" ]]; then
+  echo "[e2e] the server accepted a policy referencing a vault it does not have (client still alive):"
+  cat "$TMPDIR/vault-nosrv.out" || true
+  kill "$VAULT_NOSRV_PID" 2>/dev/null || true
+  exit 1
+fi
+if ! grep -q "Server failed to allocate tunnel" "$TMPDIR/vault-nosrv.out" || \
+   ! grep -q "no vaults are configured" "$TMPDIR/vault-nosrv.out"; then
+  echo "[e2e] the refusal does not say the vault is missing:"
+  cat "$TMPDIR/vault-nosrv.out" || true
+  exit 1
+fi
+
+echo "[e2e] events 1+2: drive one request through the plain tunnel, then read the counters"
+# The registrations above already produced tunnel_open events; this request
+# adds a connection_open/close pair so both halves of the lifecycle flow
+# through BOTH destinations.
+curl -fsS -H 'Host: eventweb' http://127.0.0.1:18082/ >/dev/null
+
+curl -fsS http://127.0.0.1:19093/metrics >"$TMPDIR/events-metrics.json"
+if ! grep -q '"event_drop_count"' "$TMPDIR/events-metrics.json"; then
+  echo "[e2e] /metrics does not carry the event_drop_count key"
+  exit 1
+fi
+if ! grep -q '"event_destinations"' "$TMPDIR/events-metrics.json"; then
+  echo "[e2e] /metrics does not carry the event_destinations rows"
+  exit 1
+fi
+curl -fsS http://127.0.0.1:19093/metrics/prometheus | grep -q 'ngrokd_event_drop_count' || {
+  echo "[e2e] /metrics/prometheus does not carry ngrokd_event_drop_count"
+  exit 1
+}
+
+echo "[e2e] events 2: the http destination delivered a batch carrying the auth header and tunnel_open"
+COLLECTOR_OK=0
+for i in {1..40}; do
+  if curl -fsS http://127.0.0.1:19013/dump >"$TMPDIR/collector-dump.json" 2>/dev/null; then
+    if python3 - "$TMPDIR/collector-dump.json" <<'PY'
+import json, sys
+batches = json.load(open(sys.argv[1]))
+hit = [b for b in batches
+       if b.get("auth") == "Bearer e2e-collector-token"
+       and any(e.get("type") == "tunnel_open" for e in b.get("events", []))]
+assert hit, f"no batch carried the auth header + a tunnel_open event ({len(batches)} batches so far)"
+PY
+    then
+      COLLECTOR_OK=1
+      break
+    fi
+  fi
+  sleep 0.5
+done
+if [[ "$COLLECTOR_OK" != "1" ]]; then
+  echo "[e2e] the collector never received an authenticated batch with tunnel_open:"
+  curl -fsS http://127.0.0.1:19013/dump 2>/dev/null | head -c 600 || true
+  echo
+  tail -n 20 /tmp/ngrok-e2e-vaults-ngrokd.log || true
+  exit 1
+fi
+
+echo "[e2e] events 1: stopping the server, then auditing the jsonl destination"
+kill "$VAULTS_SERVER_PID" 2>/dev/null || true
+wait "$VAULTS_SERVER_PID" 2>/dev/null || true
+if [[ ! -s "$TMPDIR/events.jsonl" ]]; then
+  echo "[e2e] the jsonl event destination wrote nothing to $TMPDIR/events.jsonl"
+  exit 1
+fi
+python3 - "$TMPDIR/events.jsonl" <<'PY'
+import json, sys
+lines = [l for l in open(sys.argv[1]) if l.strip()]
+assert lines, "events.jsonl is empty"
+types = set()
+tunnel_open = connection_open = None
+for l in lines:
+    ev = json.loads(l)          # every line must parse as JSON
+    t = ev.get("type")
+    assert t, f"event without a type field: {l!r}"
+    types.add(t)
+    if t == "tunnel_open" and tunnel_open is None:
+        tunnel_open = ev
+    if t == "connection_open" and connection_open is None:
+        connection_open = ev
+assert tunnel_open and tunnel_open.get("url"), "no tunnel_open line with a url"
+assert connection_open and connection_open.get("url"), "no connection_open line with a url"
+print(f"    events={len(lines)} types={sorted(types)}")
+PY
+
+echo "[e2e] events 3: a jsonl destination that cannot open its file drops, and the counter says so"
+# chmod 000 dir (owned by this user, so even the owner is locked out). The
+# control open below must fail -- if the environment lets the write through
+# (root, loose sandbox), the premise is gone and the scenario skips loudly
+# instead of asserting nothing.
+mkdir -p "$TMPDIR/vault-readonly"
+chmod 000 "$TMPDIR/vault-readonly"
+if python3 -c "import os,sys; fd=os.open(sys.argv[1], os.O_APPEND|os.O_CREAT|os.O_WRONLY); os.close(fd)" \
+     "$TMPDIR/vault-readonly/events.jsonl" 2>/dev/null; then
+  echo "[e2e] events 3: SKIPPED -- the 'unwritable' path is writable in this environment"
+  echo "[e2e]   (running as root or an LSM-less sandbox: a chmod 000 dir does not refuse)"
+  chmod 755 "$TMPDIR/vault-readonly"
+  rm -f "$TMPDIR/vault-readonly/events.jsonl"
+else
+  cat > "$TMPDIR/ngrokd-drop.yml" <<YAML
+event_destinations:
+  - type: jsonl
+    path: $TMPDIR/vault-readonly/events.jsonl
+YAML
+  ./bin/ngrokd -config="$TMPDIR/ngrokd-drop.yml" -domain=localhost \
+    -httpAddr=127.0.0.1:18083 -httpsAddr= -tunnelAddr=127.0.0.1:14448 -adminAddr=127.0.0.1:19094 \
+    >/tmp/ngrok-e2e-drop-ngrokd.log 2>&1 &
+  DROP_SERVER_PID=$!
+  for i in {1..40}; do
+    if grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-drop-ngrokd.log 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if ! grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-drop-ngrokd.log 2>/dev/null; then
+    echo "[e2e] the drop-counting ngrokd never came up"
+    tail -n 40 /tmp/ngrok-e2e-drop-ngrokd.log || true
+    chmod 755 "$TMPDIR/vault-readonly"
+    exit 1
+  fi
+
+  cat > "$TMPDIR/ngrok-drop-cli.yml" <<'YAML'
+server_addr: 127.0.0.1:14448
+trust_host_root_certs: true
+YAML
+  # Its own config, not the shared ngrok-cli.yml: that one points at the udp
+  # group's server (:14446), and a client aiming at the wrong server makes
+  # this scenario's hostname unlearnable by the :18083 listener it must serve.
+  ./bin/ngrok -config="$TMPDIR/ngrok-drop-cli.yml" -log=/tmp/ngrok-e2e-drop-client.log \
+    -proto=http -hostname=eventdrop 19001 >/tmp/ngrok-e2e-drop-client-stdout.log 2>&1 &
+  DROP_CLIENT_PID=$!
+  wait_for_tunnel /tmp/ngrok-e2e-drop-client.log "eventdrop (drop counting)"
+  wait_for_public_at 18083 eventdrop
+  # Publishing must never block on the dead destination: this request is
+  # served through the normal path while every event lands in the void.
+  DROP_SERVE="$(curl -fsS -H 'Host: eventdrop' http://127.0.0.1:18083/)"
+  if [[ "$DROP_SERVE" != "e2e-ok" ]]; then
+    echo "[e2e] traffic did not flow while the jsonl destination was failing: \"$DROP_SERVE\""
+    kill "$DROP_SERVER_PID" "$DROP_CLIENT_PID" 2>/dev/null || true
+    chmod 755 "$TMPDIR/vault-readonly"
+    exit 1
+  fi
+  # Give the drain goroutine a beat to count the lost writes (each event that
+  # arrives while the open retry spacing holds is counted lost).
+  sleep 1.5
+  curl -fsS http://127.0.0.1:19094/metrics >"$TMPDIR/drop-metrics.json"
+  if ! python3 - "$TMPDIR/drop-metrics.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+dests = m.get("event_destinations") or []
+rows = [d for d in dests if d.get("type") == "jsonl"]
+assert rows, f"no jsonl row under event_destinations: {dests}"
+row = rows[0]
+assert row.get("dropped", 0) > 0, f"jsonl destination dropped counter is not > 0: {row}"
+assert "queue_depth" in row, f"queue_depth missing from the destination row: {row}"
+print(f"    jsonl destination dropped={row['dropped']} queue_depth={row['queue_depth']}")
+PY
+  then
+    echo "[e2e] the failing jsonl destination never showed up in the drop counters"
+    kill "$DROP_SERVER_PID" "$DROP_CLIENT_PID" 2>/dev/null || true
+    chmod 755 "$TMPDIR/vault-readonly"
+    exit 1
+  fi
+
+  kill "$DROP_SERVER_PID" "$DROP_CLIENT_PID" 2>/dev/null || true
+  wait "$DROP_SERVER_PID" "$DROP_CLIENT_PID" 2>/dev/null || true
+  chmod 755 "$TMPDIR/vault-readonly"
+fi
+
 echo "[e2e] PASS"

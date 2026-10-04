@@ -179,6 +179,12 @@ func Main() {
 	connLimiter = newIPConnLimiter(opts.maxConnPerIP)
 	warnSampler = newLogSampler(30 * time.Second)
 
+	// Event export (SPEC-CLUSTER9 §4): start the configured destinations
+	// before any listener, so the first tunnel_open already has somewhere to
+	// go. With no event_destinations in the config this is a no-op and the
+	// event stream behaves exactly as before.
+	startEventExport(opts.eventDestinations)
+
 	// start listeners
 	listeners = make(map[string]*conn.Listener)
 

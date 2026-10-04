@@ -856,7 +856,7 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 
 	startTime := time.Now()
 	metrics.OpenConnection(t, publicConn)
-	observe.onConnOpen(t)
+	observe.onConnOpen(t, publicConn.RemoteAddr().String())
 
 	var proxyConn conn.Conn
 	var err error

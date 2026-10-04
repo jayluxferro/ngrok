@@ -591,7 +591,7 @@ func (t *Tunnel) establishUdpFlow(f *udpFlow) {
 	proxy.SetDeadline(time.Time{})
 
 	metrics.OpenConnection(member, proxy)
-	observe.onConnOpen(member)
+	observe.onConnOpen(member, f.client.String())
 	startTime := time.Now()
 
 	f.Info("New UDP flow from %s over proxy conn %s", f.client, proxy.Id())

@@ -71,6 +71,18 @@ func decPublicConns() {
 }
 
 func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) *http.Server {
+	mux := adminHandler(enablePprof, auth, rate)
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		_ = srv.ListenAndServe()
+	}()
+	return srv
+}
+
+// adminHandler builds the admin routes. Split from startAdminServer so tests
+// can serve the identical handler stack from httptest.NewServer instead of a
+// real listener with a race on its port.
+func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 	mux := http.NewServeMux()
 	adminLimiter := newIPRateLimiter(rate, time.Minute)
 
@@ -163,6 +175,13 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 			"tunnels_active":          len(observe.snapshots()),
 			"window_seconds":          window,
 			"rates":                   rates,
+			// Event-stream health (SPEC-CLUSTER9 §4): how many events the
+			// hub has dropped on full subscriber queues (SSE clients and
+			// export destinations alike), how many consumers exist right
+			// now, and the per-destination loss/backlog rows.
+			"event_drop_count":   observe.events.droppedEvents(),
+			"event_subscribers":  observe.events.subscriberCount(),
+			"event_destinations": exportedDestinationStats(),
 		}
 		if strings.EqualFold(r.URL.Query().Get("detail"), "full") {
 			payload["series"] = series
@@ -218,6 +237,8 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_auth_reject_count counter\nngrokd_auth_reject_count %d\n", atomic.LoadUint64(&authRejectCount))
 		_, _ = fmt.Fprintf(w, "# HELP ngrokd_rate_drop_count total rate-limit drops\n")
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_rate_drop_count counter\nngrokd_rate_drop_count %d\n", atomic.LoadUint64(&rateDropCount))
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_event_drop_count events dropped on full subscriber queues\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_event_drop_count counter\nngrokd_event_drop_count %d\n", observe.events.droppedEvents())
 		_, _ = fmt.Fprintf(w, "# HELP ngrokd_tunnel_active_connections active connections by tunnel\n")
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_tunnel_active_connections gauge\n")
 		for _, t := range s {
@@ -243,14 +264,14 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 			return
 		}
 
-		ch := observe.events.subscribe()
-		defer observe.events.unsubscribe(ch)
+		sub := observe.events.subscribe()
+		defer observe.events.unsubscribe(sub)
 
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			case payload, ok := <-ch:
+			case payload, ok := <-sub.ch:
 				if !ok {
 					return
 				}
@@ -270,11 +291,7 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 		mux.HandleFunc("/debug/pprof/trace", secure(http.MethodGet, true, pprof.Trace))
 	}
 
-	srv := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		_ = srv.ListenAndServe()
-	}()
-	return srv
+	return mux
 }
 
 func authorizedAdmin(w http.ResponseWriter, r *http.Request, auth *adminAuth) bool {

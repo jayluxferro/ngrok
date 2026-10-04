@@ -23,6 +23,16 @@ package policy
 // credentials never short-circuits: it ORs every comparison's result and runs
 // to the end, so the time to a refusal is the same whether the match sat in
 // entry one or was never there.
+//
+// Credential entries may also come from a vault (SPEC-CLUSTER9 3): a
+// whole-value secret("vault/key") reference in the config is resolved inside
+// credentialList, which is the seam between "read the config's shape" and
+// "digest for comparison" -- the last point at which a credential exists as
+// plaintext. Both sides of the protocol resolve there, each against the
+// vaults its own configuration installed (vault.go): the client at load, the
+// server at registration, identically, and a vault the server lacks fails the
+// registration loudly rather than standing up an endpoint that enforces less
+// than its document says.
 
 import (
 	"crypto/sha256"
@@ -145,14 +155,14 @@ func buildBasicAuth(where string, cfg map[string]interface{}) (*basicAuthAction,
 		realm = s
 	}
 
-	raw, err := credentialList(where, "credentials", cfg, ":")
+	creds, err := credentialList(where, "credentials", cfg, ":")
 	if err != nil {
 		return nil, err
 	}
 
 	challenge := challengeHeader("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", realm))
 	return &basicAuthAction{
-		digests: digestsOf(raw),
+		digests: digestsOf(creds),
 		required: unauthorized(challenge,
 			"basic-auth: this endpoint requires credentials"),
 		malformed: unauthorized(challenge,
@@ -200,7 +210,7 @@ type bearerAuthAction struct {
 //	tokens:
 //	  - "tok_abcdef"
 func buildBearerAuth(where string, cfg map[string]interface{}) (*bearerAuthAction, error) {
-	raw, err := credentialList(where, "tokens", cfg, "")
+	creds, err := credentialList(where, "tokens", cfg, "")
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +218,7 @@ func buildBearerAuth(where string, cfg map[string]interface{}) (*bearerAuthActio
 	// The spec fixes the challenge at a bare "Bearer": no realm, no params.
 	challenge := challengeHeader("WWW-Authenticate", "Bearer")
 	return &bearerAuthAction{
-		digests: digestsOf(raw),
+		digests: digestsOf(creds),
 		required: unauthorized(challenge,
 			"bearer-auth: this endpoint requires a bearer token"),
 		invalid: unauthorized(challenge,
@@ -283,7 +293,7 @@ func buildAPIKeyAuth(where string, cfg map[string]interface{}) (*apiKeyAuthActio
 	// "x-api-key" and a wire that says "X-API-KEY" meet at "X-Api-Key".
 	canonical := textproto.CanonicalMIMEHeaderKey(header)
 
-	raw, err := credentialList(where, "keys", cfg, "")
+	creds, err := credentialList(where, "keys", cfg, "")
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +305,7 @@ func buildAPIKeyAuth(where string, cfg map[string]interface{}) (*apiKeyAuthActio
 	return &apiKeyAuthAction{
 		header:    header,
 		canonical: canonical,
-		digests:   digestsOf(raw),
+		digests:   digestsOf(creds),
 		required: unauthorized(nil,
 			fmt.Sprintf("apikey-auth: the %s header is required", header)),
 		invalid: unauthorized(nil,
@@ -319,15 +329,24 @@ func (a *apiKeyAuthAction) authenticate(req *http.Request, _ *evalState) *rewrit
 // --- shared config shapes ----------------------------------------------------
 
 // credentialList reads one action's credential list: a required, non-empty
-// list of strings, each refused when it carries a CR or LF (a credential is
-// never written to a wire by this package, but a document that hides a line
-// break inside a credential is a header-injection payload waiting for the
-// first code path that echoes it, and there is no credential an operator
-// means to write that way) and, when sep is non-empty, refused unless it
-// contains exactly the separator (basic-auth's "user:password" shape).
+// list of strings whose entries are resolved through the installed vaults
+// (vault.go) -- a whole-value secret("vault/key") reference is replaced by the
+// vault's value here, which makes this the resolution seam between "read the
+// config's shape" and the digests the callers take of what is returned.
 //
-// The returned values are the raw config strings; the callers digest them.
-func credentialList(where, field string, cfg map[string]interface{}, sep string) ([]string, error) {
+// The shape checks run on the RESOLVED value: for an inline entry that is the
+// config string itself (and these are the checks it has always gotten, in the
+// words it has always gotten them), while a vault-sourced value must obey the
+// same rules as the literal it stands for -- post-resolution is the only
+// point where both forms meet them. Each entry is refused when it carries a
+// CR or LF (a credential is never written to a wire by this package, but a
+// document that hides a line break inside a credential is a header-injection
+// payload waiting for the first code path that echoes it, and there is no
+// credential an operator means to write that way) and, when sep is non-empty,
+// refused unless it contains exactly the separator (basic-auth's
+// "user:password" shape); with no separator, an empty value is refused, since
+// no request could ever match one.
+func credentialList(where, field string, cfg map[string]interface{}, sep string) ([]resolvedCredential, error) {
 	v, ok := cfg[field]
 	if !ok {
 		return nil, fmt.Errorf("%s: config field %q is required", where, field)
@@ -339,23 +358,39 @@ func credentialList(where, field string, cfg map[string]interface{}, sep string)
 	if len(items) == 0 {
 		return nil, fmt.Errorf("%s: config field %q must have at least one entry (an empty list would refuse every request)", where, field)
 	}
-	out := make([]string, 0, len(items))
+	out := make([]resolvedCredential, 0, len(items))
 	for i, item := range items {
 		s, ok := item.(string)
 		if !ok {
 			return nil, fmt.Errorf("%s: config field %q entry %d must be a string, got %s", where, field, i, typeName(item))
 		}
-		if strings.ContainsAny(s, "\r\n") {
-			return nil, fmt.Errorf("%s: config field %q entry %d contains a CR or LF, which no credential should carry (header injection)", where, field, i)
+
+		// Vault resolution (SPEC-CLUSTER9 3.1): load-time, loud, naming the
+		// vault and key it failed on. A reference the vaults cannot satisfy
+		// stops the load (client) or the registration (server) here.
+		cred, err := resolveCredential(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s: config field %q entry %d: %v", where, field, i, err)
+		}
+
+		// provenance: entries resolved from a vault say which one, so the
+		// operator is sent to the vault file or environment, not the policy
+		prov := ""
+		if cred.vault != "" {
+			prov = fmt.Sprintf(" (vault %q key %q)", cred.vault, cred.key)
+		}
+
+		if strings.ContainsAny(cred.value, "\r\n") {
+			return nil, fmt.Errorf("%s: config field %q entry %d%s contains a CR or LF, which no credential should carry (header injection)", where, field, i, prov)
 		}
 		if sep != "" {
-			if _, _, found := strings.Cut(s, sep); !found {
-				return nil, fmt.Errorf("%s: config field %q entry %d is not \"user:password\"-shaped: a %q separator is required (an empty user or password is allowed)", where, field, i, sep)
+			if _, _, found := strings.Cut(cred.value, sep); !found {
+				return nil, fmt.Errorf("%s: config field %q entry %d%s is not \"user:password\"-shaped: a %q separator is required (an empty user or password is allowed)", where, field, i, prov, sep)
 			}
-		} else if s == "" {
-			return nil, fmt.Errorf("%s: config field %q entry %d is empty, which no request could ever match", where, field, i)
+		} else if cred.value == "" {
+			return nil, fmt.Errorf("%s: config field %q entry %d%s is empty, which no request could ever match", where, field, i, prov)
 		}
-		out = append(out, s)
+		out = append(out, cred)
 	}
 	return out, nil
 }
@@ -375,14 +410,19 @@ func checkRealm(where, field, realm string) error {
 	return nil
 }
 
-// digestsOf converts the raw credential strings to their comparison form, once
-// at load time. After this the plaintext credentials are garbage-collectable:
-// the compiled policy -- the object that lives for the tunnel's lifetime and
-// is shared across connections -- holds only digests.
-func digestsOf(credentials []string) []string {
+// digestsOf converts the resolved credential entries to their comparison form,
+// once at load time. After this the plaintext credentials are
+// garbage-collectable: the compiled policy -- the object that lives for the
+// tunnel's lifetime and is shared across connections -- holds only digests. A
+// vault entry that was stored pre-digested (sha256:<hex> in the vault file or
+// environment) passes its stored hex straight through: digesting it again
+// would compare the digest of a digest, which no request could ever produce,
+// and the pre-digested form is exactly how a deployment keeps plaintext out of
+// the credential store entirely (vault.go).
+func digestsOf(credentials []resolvedCredential) []string {
 	out := make([]string, len(credentials))
 	for i, c := range credentials {
-		out[i] = credentialDigest(c)
+		out[i] = c.digest()
 	}
 	return out
 }

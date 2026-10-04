@@ -1,4 +1,143 @@
 # Changelog
+## 1.0.11 - 2026-10-04 - Secret vaults and event export
+
+Two features for running this fork in production rather than in demos:
+credentials can live in a named vault instead of inside the policy document,
+and the server's event stream can be shipped to a collector or a file instead
+of only being reachable through the admin `/events` endpoint.
+
+### Server
+
+**Event export (`event_destinations`).** The ngrokd config gains a list of
+destinations the event hub ships to, each with its own bounded queue and its
+own drain goroutine:
+
+```yaml
+# ngrokd config
+event_destinations:
+  - type: http
+    url: https://collector.example/ngrok
+    auth_header: "Authorization: Bearer <token>"   # literal or secret("vault/key")
+    batch_size: 100          # default 100
+    flush_interval: 5s       # default 5s
+  - type: jsonl
+    path: /var/log/ngrok/events.jsonl
+```
+
+The `http` destination POSTs batches as a JSON array of events: a batch is
+flushed when it reaches `batch_size` or when `flush_interval` elapses,
+whichever comes first. A POST that fails is retried with capped exponential
+backoff **forever -- the batch is never abandoned**, because the alternative
+(giving up after N attempts) silently loses events that the drop counters
+exist to account for. The cost of a dead collector is therefore not lost
+events but a filling queue: the destination's 1000-slot queue overflows, and
+the overflow is what the counters below measure. The `jsonl` destination
+appends one pre-marshaled JSON line per event (a `tail -f`-able image of the
+`/events` stream), reopening the file on failure so rotation and a recreated
+path heal themselves.
+
+**Loss is visible, never silent -- and visible only there.** A destination
+that cannot keep up never blocks the hub (publish stays non-blocking); the
+events it cannot take are counted in `/metrics`:
+
+- `event_drop_count` -- events the hub dropped on any full subscriber queue,
+  also exported as the `ngrokd_event_drop_count` Prometheus counter on
+  `/metrics/prometheus`;
+- `event_destinations` -- one row per destination with `type`, `target`,
+  `dropped` (queue overflow, plus jsonl lines a failing file could not take)
+  and `queue_depth`, surfaced on the 1s sampler.
+
+The design consequence is worth stating plainly: with a stalled destination
+the event stream is *eventually consistent with reality only through these
+counters*. If a dropped counter is greater than zero, those events are gone.
+
+**`connection_open`.** A new event type carrying `client_addr`, `url` and
+`protocol`, published when a public connection is accepted -- the opening
+half of `connection_close` (which carries the byte totals), so the two
+together bracket one served connection.
+
+**Vaults on the server.** The strict server config speaks the same `vaults:`
+block as the client (below), and resolves event-destination `auth_header`
+values against it at construction. A tunnel registration whose policy
+references a vault the server does not have is refused there (see Both).
+
+### Client
+
+**`vaults:` block.** Credential lists in traffic policies (`basic-auth`'s
+`credentials`, `bearer-auth`'s `tokens`, `apikey-auth`'s `keys`) may carry
+`secret("vault/key")` references instead of inline values, resolved against
+vaults named in the config:
+
+```yaml
+# ngrok client config (same shapes in ngrokd's)
+vaults:
+  main:
+    file: /etc/ngrok/vault.yml      # a flat YAML key: value map
+  staging:
+    env_prefix: NGROK_VAULT_STAGING_  # NGROK_VAULT_STAGING_PROD_API=... -> key "PROD_API"
+
+tunnels:
+  private:
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            credentials:
+              - 'secret("main/api")'
+```
+
+A vault file entry may be written `sha256:<hex>` -- a pre-digested credential,
+the same dual form auth tokens use -- so a deployment can keep only digests on
+disk and never hold the plaintext at all. The env key is the variable name
+minus the prefix, verbatim: the environment cannot carry a hyphen, so file key
+`prod-api` and env key `PROD_API` are two different keys.
+
+**Wire-log redaction closed the credential gap.** The DEBUG wire log has
+always redacted session secrets; it now also redacts the `credentials`,
+`tokens` and `keys` arrays of serialized policies, so a vault-sourced and an
+inline credential are equally absent from logs -- regardless of which side
+logged the message. Resolution failures name the vault and the key (and the
+configured key names), and a malformed `secret(...)` is a load error, never a
+literal credential that silently matches nothing.
+
+### Both
+
+- **Resolution is build-time only.** `secret("vault/key")` is resolved once,
+  at configuration load (client) or registration (server), immediately before
+  the credential digests are taken. It is not a CEL function and never appears
+  mid-string: per-request resolution would put the vault on the data path and
+  credential material into `${...}` interpolation output. After resolution a
+  vault-sourced credential is indistinguishable from an inline one -- digests,
+  constant-time compare, static 401s.
+- **Both sides must have the vault.** The reference text, not the value,
+  crosses the wire: the client resolves against its own vaults (agent-side
+  phases need that), and the server re-resolves the same document against its
+  own vaults at registration. A server without the vault refuses the
+  registration -- an endpoint that looks protected and is not is not a state
+  this fork ships. Consequence: rolling out a new vault means deploying the
+  vault to the server *and* the agent's config together.
+- CR/LF checks and the `user:password` shape check apply to the *resolved*
+  value, so a vault entry obeys the same rules as the literal it stands for.
+
+### Known limitations
+
+- **Vault files hold plaintext (or digests) on disk** -- file permissions are
+  the operator's control, not the feature's. There is no encryption at rest,
+  no KMS integration, no dynamic secrets; `sha256:<hex>` entries are the one
+  way to keep plaintext off disk entirely.
+- **Env-sourced values are visible in the process environment** (`/proc`, ps
+  egress, shell history of whatever exported them).
+- **`auth_header` is a plaintext exception.** An event destination's header
+  value must be present at flush time, so `secret(...)` there resolves to
+  plaintext held in memory for the life of the process. It is never logged,
+  but it is not digested either -- the digest rule stops where a header value
+  begins.
+- **Event export has no client-side counterpart and no sampling**: the client
+  keeps its events in the local views; the server exports everything or
+  nothing, per destination.
+
 ## 1.0.10 - 2026-10-04 - UDP tunnels
 
 A new public protocol, `udp`, the first one this fork has added. It puts a
