@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/alecthomas/log4go v0.0.0-20180109082532-d146e6b86faa
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/cel-go v0.20.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/inconshreveable/go-vhost v1.0.0

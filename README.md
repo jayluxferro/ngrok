@@ -224,6 +224,53 @@ with no hostname answers `421 Misdirected Request`), and `on_http_request` /
 `on_http_response` traffic policies for such tunnels run in the agent rather
 than on the server — the server has only ciphertext.
 
+**Traffic-policy authentication.** An `on_http_request` policy can require a
+credential before a request is forwarded at all — the edge answers `401`
+itself and the upstream never sees the attempt. `basic-auth` checks RFC 7617
+credentials and answers with a `WWW-Authenticate` challenge; `jwt-validation`
+verifies a bearer JWT's signature and claims against your identity
+provider's JWKS. Both run wherever the phase runs: on the server for
+edge-terminated tunnels, in the agent for agent-terminated ones.
+
+```yaml
+tunnels:
+  private:
+    hostname: app.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            realm: restricted       # default "ngrok"
+            credentials:
+              - alice:secret
+  api:
+    hostname: api.example.com
+    proto:
+      https: 3000
+    traffic_policy:
+      on_http_request:
+        - name: jwt-validation
+          config:
+            jwks_uri: https://idp.example/.well-known/jwks.json
+            issuer: https://idp.example
+            audience: api
+            algorithms: [RS256]     # all-asymmetric allowlist; no HS*, no "none"
+            leeway_seconds: 30      # exp/nbf clock skew, default 0
+```
+
+Missing or wrong credentials get a standards-shaped `401`
+(`WWW-Authenticate: Basic realm="restricted"`, or
+`WWW-Authenticate: Bearer error="invalid_token"` for rejected JWTs).
+Credentials are held as SHA-256 digests in the compiled policy and compared
+in constant time; a JWKS that cannot be fetched fails closed — an identity
+provider outage is an outage of the protected endpoint, never an open door.
+`bearer-auth` (static bearer tokens) and `apikey-auth` (API keys in a
+configurable header, plain 401 — there is no standard challenge for a
+custom header) round out the set; see [docs/CHANGELOG.md](docs/CHANGELOG.md)
+for their exact config shapes and the current limitations.
+
 **Tunnel an IoT/TCP device.** A plain tcp tunnel forwards raw bytes to a
 local service port — e.g. a Levis IoT node listening on `127.0.0.1:5681`:
 

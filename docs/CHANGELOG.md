@@ -1,4 +1,135 @@
 # Changelog
+## 1.0.8 - 2026-10-04 - Traffic-policy authentication actions
+
+Four request-phase actions that ask who is calling before a request goes any
+further: `basic-auth`, `bearer-auth`, `apikey-auth` and `jwt-validation`.
+They join the existing action set and reuse its discipline exactly: an action
+runs in the order the policy declares it, admits a request by doing nothing,
+and terminates one with a synthetic `401` when the answer is wrong -- the
+same verdict path `deny` and `custom-response` take, so a terminated request
+never reaches the upstream and carries no request there.
+
+### Both
+
+The actions run wherever the `on_http_request` phase runs, which since 1.0.7
+means on the server for edge-terminated tunnels and in the agent for
+agent-terminated ones. Nothing in the action decides the side: the policy
+travels with the tunnel, and the phase evaluates where the plaintext is. As
+with every action, the configs are validated when the policy is loaded and a
+bad document stops the tunnel at startup with the rule named.
+
+- **`basic-auth`** checks RFC 7617 credentials from `Authorization: Basic`
+  against a list of `user:password` entries:
+
+  ```yaml
+  traffic_policy:
+    on_http_request:
+      - name: basic-auth
+        config:
+          realm: restricted          # default "ngrok"
+          credentials:               # "user:password" entries; several allowed
+            - alice:secret
+  ```
+
+  A request with no credentials, wrong ones, malformed base64, or a decoded
+  value with no colon is answered `401` with
+  `WWW-Authenticate: Basic realm="restricted"` -- the challenge is the answer
+  to every credential shape the action cannot read, never a `400`.
+
+- **`bearer-auth`** checks the token of `Authorization: Bearer <token>`
+  (exactly one space, non-empty) against a static list:
+
+  ```yaml
+  - name: bearer-auth
+    config:
+      tokens:
+        - "tok_abcdef"
+  ```
+
+  Failure answers `401` with `WWW-Authenticate: Bearer`, bare, no
+  parameters.
+
+- **`apikey-auth`** checks one request header against a static list:
+
+  ```yaml
+  - name: apikey-auth
+    config:
+      header: X-Api-Key          # this is the default; lookup is case-insensitive
+      keys:
+        - "ak-live-0001"
+  ```
+
+  Failure answers a plain `401` whose body names the configured header.
+  There is deliberately no `WWW-Authenticate` for this action: no standard
+  challenge exists for a custom API-key header, and inventing one would
+  teach clients to send credentials to whatever header the error names.
+
+- **`jwt-validation`** verifies a bearer JWT against a JWKS -- the
+  signature, the registered claims (`exp`/`nbf` with leeway, `iss`/`aud`
+  when configured), and any exact-match string claims the policy names:
+
+  ```yaml
+  - name: jwt-validation
+    config:
+      jwks_uri: https://idp.example/.well-known/jwks.json
+      issuer: https://idp.example
+      audience: my-endpoint
+      algorithms: [RS256]        # default RS256
+      leeway_seconds: 30         # exp/nbf clock skew, default 0
+      claims:                    # optional exact-match required claims
+        scope: tunnels:read
+  ```
+
+  Failure answers `401` with `WWW-Authenticate: Bearer error="invalid_token"`.
+
+- **Credentials live as SHA-256 digests in the compiled policy.** Every
+  comparison is `crypto/subtle` over two equal-length digests, the whole
+  credential list is walked with no short-circuit, and the plaintext values
+  are garbage-collectable after load: a heap dump of a running edge holds
+  digests, not passwords. Nothing credential-shaped reaches a log line or a
+  response body by construction -- the JWT library's own errors are mapped
+  to fixed labels before logging, because their text can quote claim values,
+  and a claim value is credential material.
+
+- **The JWKS is fail-closed, and the cost is stated plainly.** Keys are
+  fetched on first use and cached by `kid`, bounded, with one refetch on an
+  unknown `kid` so an IdP key rotation does not need a restart. When the
+  `jwks_uri` cannot be fetched, every request that needs a key is refused
+  with the 401 -- an IdP outage is an outage of the protected endpoint, not
+  an opportunity to pass unverified tokens -- and the fetch failure is
+  logged once per connection to say so.
+
+- **The JWT algorithm allowlist is all-asymmetric, on purpose.** A policy
+  may allow only {RS256, RS384, RS512, ES256, ES384, ES512, EdDSA} -- no
+  `none`, no HS*: an HMAC algorithm has no honest secret to verify with
+  here, and the classic confusion attack that feeds the (public) RSA key to
+  an HMAC as its secret is refused structurally, before any key is looked
+  up. The token's own `alg` must be in the policy's list, and the key the
+  JWKS names must be of the type the algorithm family implies (RSA for RS*,
+  EC for ES*, OKP for EdDSA).
+
+- **Credentials are inline config values for now.** The policy YAML carries
+  the passwords, tokens and keys itself; references into a vault or secret
+  store are planned but not built. Treat a policy file that carries auth
+  config as a credential: same handling, same disk.
+
+### Known limitations
+
+- **Auth actions compose by order, not by OR.** Two auth actions in one
+  phase mean "a request must pass both": the first failure terminates, and
+  there is no syntax for "any one of these would do". Put multiple
+  credentials inside one action instead of stacking actions.
+- **The JWT algorithm allowlist is fixed to the asymmetric set** described
+  above; a deployment whose IdP signs its tokens with an HS* algorithm
+  cannot be expressed, by design.
+- **`leeway_seconds` defaults to 0**, so a token whose `exp` is even one
+  second behind the endpoint's clock is refused; set a leeway when the IdP
+  and this endpoint do not share a clock source.
+- **`apikey-auth` has no standard challenge.** The 401 body names the
+  required header, but nothing in the response tells a generic HTTP client
+  or a browser how to authenticate: callers must send the configured header
+  themselves.
+
 ## 1.0.7 - 2026-10-04 - Zero-knowledge TLS + fixed remote TCP ports
 
 Two features about who holds the credentials of a public endpoint, plus the

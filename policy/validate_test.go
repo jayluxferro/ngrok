@@ -26,6 +26,12 @@ var minimalConfig = map[string]map[string]interface{}{
 	ActionLog:            {"metadata": map[string]interface{}{"probe": "1"}},
 	ActionSetVars:        {"vars": []interface{}{map[string]interface{}{"probe": "1"}}},
 	ActionRestrictIPs:    {"enforce": true, "allow": []interface{}{"127.0.0.0/8"}},
+	// The auth actions (SPEC-CLUSTER6): each needs the one field its validator
+	// requires. jwks_uri is only shape-checked here; nothing is fetched.
+	ActionBasicAuth:     {"credentials": []interface{}{"probe:probe"}},
+	ActionBearerAuth:    {"tokens": []interface{}{"probe"}},
+	ActionAPIKeyAuth:    {"keys": []interface{}{"probe"}},
+	ActionJWTValidation: {"jwks_uri": "https://idp.example/jwks.json"},
 }
 
 // TestPhaseActionsMatchesTheMatrix is the first half: the list the message

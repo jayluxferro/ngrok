@@ -727,6 +727,342 @@ if ! grep -q 'on_http_request\[0\] (rate-limit)' "$TMPDIR/policy-broken.out"; th
 fi
 
 # ---------------------------------------------------------------------------
+# Traffic-policy authentication actions (SPEC-CLUSTER6): four request-phase
+# actions that judge a credential head and either admit the request (a no-op
+# to later rules) or answer it themselves with a synthetic 401. The
+# challenges below are read off the wire, not out of a test fixture, so the
+# exact bytes a public client sees -- scheme, realm quoting, error code --
+# are what gets asserted. Everything here rides the same five-tunnel client,
+# which also re-proves that a policy is attached per tunnel, not per client.
+#
+# The jwt half runs against a real JWKS over real HTTP: an openssl-generated
+# RSA key is served as a JWK by a python server, and the same key signs the
+# test tokens with `openssl dgst -sha256 -sign` -- whose output IS an RS256
+# signature (RSASSA-PKCS1-v1_5 over SHA-256). No JWT library joins the
+# harness; python3 + openssl, both already in use above, are enough.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] generating the RSA key and starting the JWKS server for jwt-validation"
+openssl genrsa -out "$TMPDIR/jwt-key.pem" 2048 </dev/null >/dev/null 2>&1
+if [[ ! -s "$TMPDIR/jwt-key.pem" ]]; then
+  echo "[e2e] could not generate the RSA key for the jwt scenario"
+  exit 1
+fi
+# The JWK below hardcodes the exponent as "AQAB" (base64url of 65537), which
+# is openssl's default but not a promise: assert the assumption so a future
+# openssl default cannot silently publish a JWKS no token can verify against.
+if ! openssl rsa -in "$TMPDIR/jwt-key.pem" -noout -text 2>/dev/null | grep -q "65537"; then
+  echo "[e2e] the generated RSA key does not use the 65537 exponent the JWK hardcodes"
+  exit 1
+fi
+JWT_MOD_HEX="$(openssl rsa -in "$TMPDIR/jwt-key.pem" -noout -modulus 2>/dev/null | sed 's/^Modulus=//')"
+if [[ -z "$JWT_MOD_HEX" ]]; then
+  echo "[e2e] could not read the RSA modulus for the JWKS"
+  exit 1
+fi
+
+cat > "$TMPDIR/jwks_server.py" <<'PY'
+import base64, json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+MOD_HEX, KID, PORT = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def b64u(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+n = int(MOD_HEX, 16)
+JWKS = {"keys": [{
+    "kty": "RSA", "kid": KID, "use": "sig", "alg": "RS256",
+    # to_bytes drops any leading zero octet, which RFC 7518 requires of n.
+    "n": b64u(n.to_bytes((n.bit_length() + 7) // 8, "big")),
+    "e": "AQAB",  # 65537; asserted by the caller before this server starts.
+}]}
+BODY = json.dumps(JWKS).encode()
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/jwks.json":
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, *_): pass
+
+HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PY
+python3 "$TMPDIR/jwks_server.py" "$JWT_MOD_HEX" e2e-key-1 19010 >/tmp/ngrok-e2e-jwks.log 2>&1 &
+for i in {1..40}; do
+  if curl -fsS http://127.0.0.1:19010/jwks.json >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+if ! curl -fsS http://127.0.0.1:19010/jwks.json >/dev/null 2>&1; then
+  echo "[e2e] the JWKS server never came up"
+  tail -n 40 /tmp/ngrok-e2e-jwks.log || true
+  exit 1
+fi
+
+# b64url <file-or-stdin>: base64url without padding, JWT style.
+b64url() {
+  python3 -c 'import base64,sys; sys.stdout.write(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip("="))'
+}
+
+# mint_jwt <header-json> <payload-json>: print an RS256 JWT for the scenario
+# key. The signing input is exactly "<b64u(header)>.<b64u(payload))>" and the
+# signature is what openssl dgst -sha256 -sign writes: the input is exactly
+# "<b64u(header)>.<b64u(payload)>" and the output base64url'd is segment
+# three. No library, deterministic.
+mint_jwt() {
+  local h p s
+  h="$(printf '%s' "$1" | b64url)"
+  p="$(printf '%s' "$2" | b64url)"
+  s="$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$TMPDIR/jwt-key.pem" -binary | b64url)"
+  printf '%s.%s.%s' "$h" "$p" "$s"
+}
+
+JWT_HDR='{"alg":"RS256","typ":"JWT","kid":"e2e-key-1"}'
+VALID_JWT="$(mint_jwt "$JWT_HDR" "{\"iss\":\"https://e2e-idp.local\",\"aud\":\"e2e-endpoint\",\"sub\":\"e2e-user\",\"exp\":$(( $(date +%s) + 600 ))}")"
+EXPIRED_JWT="$(mint_jwt "$JWT_HDR" "{\"iss\":\"https://e2e-idp.local\",\"aud\":\"e2e-endpoint\",\"sub\":\"e2e-user\",\"exp\":$(( $(date +%s) - 3600 ))}")"
+
+# The tampered token keeps the valid signature and rewrites the payload: the
+# shape an attacker who can read a token (but not sign) actually sends.
+TAMPERED_JWT="$(python3 -c '
+import base64, json, sys
+h, p, s = sys.argv[1].split(".")
+claims = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+claims["sub"] = "attacker"
+p2 = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
+sys.stdout.write(h + "." + p2 + "." + s)
+' "$VALID_JWT")"
+
+if [[ -z "$VALID_JWT" || "$VALID_JWT" == *..* || -z "$TAMPERED_JWT" ]]; then
+  echo "[e2e] jwt minting produced a malformed token: $VALID_JWT"
+  exit 1
+fi
+
+cat > "$TMPDIR/ngrok-auth.yml" <<'YAML'
+server_addr: 127.0.0.1:14443
+trust_host_root_certs: true
+tunnels:
+  authbasic:
+    hostname: authbasic
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            realm: e2e-realm
+            credentials:
+              - alice:secret
+  authbearer:
+    hostname: authbearer
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: bearer-auth
+          config:
+            tokens:
+              - tok_e2e_abcdef
+  authkey:
+    hostname: authkey
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: apikey-auth
+          config:
+            header: X-Api-Key
+            keys:
+              - ak-e2e-0001
+  authjwt:
+    hostname: authjwt
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: jwt-validation
+          config:
+            jwks_uri: http://127.0.0.1:19010/jwks.json
+            issuer: https://e2e-idp.local
+            audience: e2e-endpoint
+            algorithms: [RS256]
+  authcombo:
+    hostname: authcombo
+    proto:
+      http: 19001
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            credentials:
+              - alice:secret
+        - name: deny
+          expressions:
+            - 'req.url.path == "/blocked"'
+YAML
+
+echo "[e2e] starting the auth tunnels (authbasic, authbearer, authkey, authjwt, authcombo)"
+./bin/ngrok -config="$TMPDIR/ngrok-auth.yml" -log=/tmp/ngrok-e2e-auth-client.log \
+  start authbasic authbearer authkey authjwt authcombo >/tmp/ngrok-e2e-auth-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-auth-client.log "auth group"
+wait_for_public authbasic
+wait_for_public authbearer
+wait_for_public authkey
+wait_for_public authjwt
+wait_for_public authcombo
+
+echo "[e2e] auth basic: no credentials -> 401 with the realm challenge"
+BASIC_CODE="$(policy_curl -D "$TMPDIR/auth-basic.headers" -o "$TMPDIR/auth-basic.body" -H 'Host: authbasic' http://127.0.0.1:18080/)"
+if [[ "$BASIC_CODE" != "401" ]]; then
+  echo "[e2e] expected basic-auth to answer 401 without credentials, got $BASIC_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Basic realm="e2e-realm"' "$TMPDIR/auth-basic.headers"; then
+  echo "[e2e] the basic-auth challenge is missing or not quoted as realm=\"e2e-realm\":"
+  cat "$TMPDIR/auth-basic.headers"
+  exit 1
+fi
+if ! grep -q "basic-auth" "$TMPDIR/auth-basic.body"; then
+  echo "[e2e] the basic-auth 401 body does not name the action:"
+  cat "$TMPDIR/auth-basic.body"
+  exit 1
+fi
+
+echo "[e2e] auth basic: wrong password -> 401, alice:secret -> 200 from the upstream"
+BASIC_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -u alice:nope -H 'Host: authbasic' http://127.0.0.1:18080/)"
+if [[ "$BASIC_WRONG" != "401" ]]; then
+  echo "[e2e] expected basic-auth to refuse a wrong password with 401, got $BASIC_WRONG"
+  exit 1
+fi
+BASIC_OK="$(curl -fsS -u alice:secret -H 'Host: authbasic' http://127.0.0.1:18080/)"
+if [[ "$BASIC_OK" != "e2e-ok" ]]; then
+  echo "[e2e] basic-auth did not admit its own credentials: \"$BASIC_OK\""
+  exit 1
+fi
+
+echo "[e2e] auth bearer: no token -> 401 with the bare Bearer challenge"
+BEARER_CODE="$(policy_curl -D "$TMPDIR/auth-bearer.headers" -o /dev/null -H 'Host: authbearer' http://127.0.0.1:18080/)"
+if [[ "$BEARER_CODE" != "401" ]]; then
+  echo "[e2e] expected bearer-auth to answer 401 without a token, got $BEARER_CODE"
+  exit 1
+fi
+# Bare "Bearer", no parameters: the [[:space:]]* carries the header file's CR.
+if ! grep -qi '^WWW-Authenticate: Bearer[[:space:]]*$' "$TMPDIR/auth-bearer.headers"; then
+  echo "[e2e] the bearer-auth challenge is missing or carries parameters:"
+  cat "$TMPDIR/auth-bearer.headers"
+  exit 1
+fi
+
+echo "[e2e] auth bearer: wrong token -> 401, right token -> 200 from the upstream"
+BEARER_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tok_wrong' -H 'Host: authbearer' http://127.0.0.1:18080/)"
+if [[ "$BEARER_WRONG" != "401" ]]; then
+  echo "[e2e] expected bearer-auth to refuse a wrong token with 401, got $BEARER_WRONG"
+  exit 1
+fi
+BEARER_OK="$(curl -fsS -H 'Authorization: Bearer tok_e2e_abcdef' -H 'Host: authbearer' http://127.0.0.1:18080/)"
+if [[ "$BEARER_OK" != "e2e-ok" ]]; then
+  echo "[e2e] bearer-auth did not admit its own token: \"$BEARER_OK\""
+  exit 1
+fi
+
+echo "[e2e] auth apikey: missing header -> 401 naming it, with NO WWW-Authenticate"
+KEY_CODE="$(policy_curl -D "$TMPDIR/auth-key.headers" -o "$TMPDIR/auth-key.body" -H 'Host: authkey' http://127.0.0.1:18080/)"
+if [[ "$KEY_CODE" != "401" ]]; then
+  echo "[e2e] expected apikey-auth to answer 401 without a key, got $KEY_CODE"
+  exit 1
+fi
+if grep -qi '^WWW-Authenticate:' "$TMPDIR/auth-key.headers"; then
+  echo "[e2e] apikey-auth sent a WWW-Authenticate challenge, which it must not:"
+  cat "$TMPDIR/auth-key.headers"
+  exit 1
+fi
+if ! grep -q "X-Api-Key" "$TMPDIR/auth-key.body"; then
+  echo "[e2e] the apikey-auth 401 body does not name the configured header:"
+  cat "$TMPDIR/auth-key.body"
+  exit 1
+fi
+
+echo "[e2e] auth apikey: wrong key -> 401, right key (any case) -> 200 from the upstream"
+KEY_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -H 'X-Api-Key: ak-wrong' -H 'Host: authkey' http://127.0.0.1:18080/)"
+if [[ "$KEY_WRONG" != "401" ]]; then
+  echo "[e2e] expected apikey-auth to refuse a wrong key with 401, got $KEY_WRONG"
+  exit 1
+fi
+KEY_OK="$(curl -fsS -H 'X-Api-Key: ak-e2e-0001' -H 'Host: authkey' http://127.0.0.1:18080/)"
+KEY_CASE="$(curl -fsS -H 'x-api-key: ak-e2e-0001' -H 'Host: authkey' http://127.0.0.1:18080/)"
+if [[ "$KEY_OK" != "e2e-ok" || "$KEY_CASE" != "e2e-ok" ]]; then
+  echo "[e2e] apikey-auth lookup is not admitting the configured key: \"$KEY_OK\" / \"$KEY_CASE\""
+  exit 1
+fi
+
+echo "[e2e] auth jwt: the signed token reaches the upstream"
+JWT_OK_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $VALID_JWT" -H 'Host: authjwt' http://127.0.0.1:18080/)"
+if [[ "$JWT_OK_CODE" != "200" ]]; then
+  echo "[e2e] expected the correctly signed RS256 token to be admitted, got $JWT_OK_CODE"
+  exit 1
+fi
+
+echo "[e2e] auth jwt: a tampered payload under the valid signature -> 401 + invalid_token"
+JWT_TAMPER_CODE="$(policy_curl -D "$TMPDIR/auth-jwt-tamper.headers" -o /dev/null \
+  -H "Authorization: Bearer $TAMPERED_JWT" -H 'Host: authjwt' http://127.0.0.1:18080/)"
+if [[ "$JWT_TAMPER_CODE" != "401" ]]; then
+  echo "[e2e] expected the tampered token to be refused with 401, got $JWT_TAMPER_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Bearer error="invalid_token"' "$TMPDIR/auth-jwt-tamper.headers"; then
+  echo "[e2e] the jwt-validation challenge is missing or wrong:"
+  cat "$TMPDIR/auth-jwt-tamper.headers"
+  exit 1
+fi
+
+echo "[e2e] auth jwt: an expired token -> 401"
+JWT_EXP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $EXPIRED_JWT" -H 'Host: authjwt' http://127.0.0.1:18080/)"
+if [[ "$JWT_EXP_CODE" != "401" ]]; then
+  echo "[e2e] expected the expired token to be refused with 401, got $JWT_EXP_CODE"
+  exit 1
+fi
+
+echo "[e2e] auth composition: basic-auth runs before deny in the same phase"
+# No credentials on the denied path: the 401 (not deny's 403) is the proof of
+# which action answered, i.e. that auth was consulted first.
+COMBO_NOAUTH_CODE="$(policy_curl -D "$TMPDIR/auth-combo.headers" -o /dev/null \
+  -H 'Host: authcombo' http://127.0.0.1:18080/blocked)"
+if [[ "$COMBO_NOAUTH_CODE" != "401" ]]; then
+  echo "[e2e] expected basic-auth to answer /blocked 401 before the deny rule ran, got $COMBO_NOAUTH_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Basic' "$TMPDIR/auth-combo.headers"; then
+  echo "[e2e] the 401 on the denied path carries no basic-auth challenge:"
+  cat "$TMPDIR/auth-combo.headers"
+  exit 1
+fi
+
+echo "[e2e] auth composition: with credentials the deny rule answers /blocked with 403"
+COMBO_DENIED_CODE="$(policy_curl -o "$TMPDIR/auth-combo-denied.body" -u alice:secret \
+  -H 'Host: authcombo' http://127.0.0.1:18080/blocked)"
+if [[ "$COMBO_DENIED_CODE" != "403" ]]; then
+  echo "[e2e] expected the deny rule to answer an authenticated /blocked with 403, got $COMBO_DENIED_CODE"
+  exit 1
+fi
+if [[ -s "$TMPDIR/auth-combo-denied.body" ]]; then
+  echo "[e2e] the authenticated denied request reached the upstream:"
+  cat "$TMPDIR/auth-combo-denied.body"
+  exit 1
+fi
+COMBO_OK="$(curl -fsS -u alice:secret -H 'Host: authcombo' http://127.0.0.1:18080/allowed)"
+if [[ "$COMBO_OK" != "e2e-ok" ]]; then
+  echo "[e2e] an authenticated request to a non-denied path did not reach the upstream: \"$COMBO_OK\""
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Zero-knowledge TLS and fixed TCP ports (SPEC-CLUSTER5). Every scenario above
 # runs against a server whose https listener is disabled; this group starts a
 # SECOND ngrokd with -httpsAddr enabled -- the first coverage the public https
@@ -1011,6 +1347,49 @@ REWRITE_RESP="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve rewritezk:18443
   -H 'Host: rewritezk' https://rewritezk:18443/)"
 if [[ "$REWRITE_RESP" != "ok" ]]; then
   echo "[e2e] the host_header rewrite did not reach the upstream over the agent-terminated tunnel: \"$REWRITE_RESP\""
+  exit 1
+fi
+
+# The agent-side half of the auth group. On an agent-terminated tunnel the
+# on_http_request phase runs in the AGENT -- the server holds only ciphertext
+# -- so the 401 below was produced by the client binary, and the 200 proves
+# the same policy admits its own credentials on the plaintext it terminates.
+# Same CA model as tls 2 and tls 5: curl verifies the leaf the agent minted,
+# then meets the challenge over https.
+echo "[e2e] auth agent-side: basic-auth on an agent-terminated tunnel"
+cat > "$TMPDIR/agent-auth.yml" <<'YAML'
+on_http_request:
+  - name: basic-auth
+    config:
+      realm: zk-realm
+      credentials:
+        - zker:zkpass
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-tls-auth-client.log \
+  -authtoken=alpha -proto=https -hostname=authzk \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  -traffic-policy-file="$TMPDIR/agent-auth.yml" \
+  19001 >/tmp/ngrok-e2e-tls-auth-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-tls-auth-client.log "authzk (agent-terminated + basic-auth)"
+wait_for_public_tls authzk "$TMPDIR/zk-ca.crt"
+
+AGENT_AUTH_CODE="$(policy_curl -D "$TMPDIR/agent-auth.headers" -o /dev/null \
+  --cacert "$TMPDIR/zk-ca.crt" --resolve authzk:18443:127.0.0.1 -H 'Host: authzk' \
+  https://authzk:18443/)"
+if [[ "$AGENT_AUTH_CODE" != "401" ]]; then
+  echo "[e2e] expected the agent-side basic-auth to answer 401 without credentials, got $AGENT_AUTH_CODE"
+  exit 1
+fi
+if ! grep -qi '^WWW-Authenticate: Basic realm="zk-realm"' "$TMPDIR/agent-auth.headers"; then
+  echo "[e2e] the agent-side basic-auth challenge is missing or wrong:"
+  cat "$TMPDIR/agent-auth.headers"
+  exit 1
+fi
+
+AGENT_AUTH_OK="$(curl -fsS -u zker:zkpass --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve authzk:18443:127.0.0.1 -H 'Host: authzk' https://authzk:18443/)"
+if [[ "$AGENT_AUTH_OK" != "e2e-ok" ]]; then
+  echo "[e2e] the agent-side basic-auth did not admit its own credentials: \"$AGENT_AUTH_OK\""
   exit 1
 fi
 
