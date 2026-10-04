@@ -482,7 +482,7 @@ func (c *ClientModel) control() {
 		case *msg.NewTunnel:
 			if m.Error != "" {
 				emsg := fmt.Sprintf("Server failed to allocate tunnel: %s", m.Error)
-				c.Error(emsg)
+				c.Error("%s", emsg)
 				c.ctl.Shutdown(emsg)
 				continue
 			}
@@ -503,7 +503,7 @@ func (c *ClientModel) control() {
 			// error that says what to do about it.
 			if err := terminationEchoError(m.Url, tunnelCfg, m); err != nil {
 				emsg := err.Error()
-				c.Error(emsg)
+				c.Error("%s", emsg)
 				c.ctl.Shutdown(emsg)
 				continue
 			}
@@ -518,7 +518,7 @@ func (c *ClientModel) control() {
 			// mode worse than stopping.
 			if err = c.establishTunnelRuntime(m.Url, tunnelCfg); err != nil {
 				emsg := fmt.Sprintf("Tunnel %s: %v", m.Url, err)
-				c.Error(emsg)
+				c.Error("%s", emsg)
 				c.ctl.Shutdown(emsg)
 				continue
 			}

@@ -62,7 +62,7 @@ func (v *TermView) draw() {
 
 	// quit instructions
 	quitMsg := "(Ctrl+C to quit)"
-	v.Printf(v.w-len(quitMsg), 0, quitMsg)
+	v.Printf(v.w-len(quitMsg), 0, "%s", quitMsg)
 
 	// new version message
 	updateStatus := state.GetUpdateStatus()
@@ -94,7 +94,7 @@ func (v *TermView) draw() {
 	}
 
 	if updateMsg != "" {
-		v.APrintf(termbox.ColorYellow, 30, 0, updateMsg)
+		v.APrintf(termbox.ColorYellow, 30, 0, "%s", updateMsg)
 	}
 
 	v.APrintf(termbox.ColorBlue|termbox.AttrBold, 0, 0, "ngrok")

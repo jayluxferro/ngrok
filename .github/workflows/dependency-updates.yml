@@ -22,6 +22,15 @@ jobs:
           go-version: "1.21"
 
       - name: Update dependencies (patch/minor)
+        env:
+          # Local toolchain only: with GOTOOLCHAIN=auto, a `go get` that
+          # needs a newer Go silently downloads it AND rewrites go.mod's
+          # go/toolchain lines (reproduced: gopkg.in/yaml.v3 -> go.yaml.in/
+          # yaml/v3 raised the directive to 1.23 and pulled protobuf to the
+          # exact version the skip logic refuses). Pinned local, the same
+          # `go get` fails with "requires go >=" and lands in the skip
+          # class below, where it belongs.
+          GOTOOLCHAIN: local
         run: |
           # A blanket `go get -u ./...` aborts the whole run the first time
           # some module's newest release requires a newer Go than this repo
@@ -51,6 +60,15 @@ jobs:
             fi
           done
           go mod tidy
+          # Belt and braces: nothing in this job may move the deliberate
+          # toolchain pin. If some path raised the go directive anyway, stop
+          # here -- bumping Go is a deliberate change with its own review,
+          # never a dependency-update side effect.
+          if git --no-pager diff go.mod | grep -qE '^[+-](go |toolchain )'; then
+            echo "::error::go.mod's go/toolchain lines changed; dependency updates may not move the toolchain pin"
+            git --no-pager diff go.mod
+            exit 1
+          fi
           if [ -n "$skipped" ]; then
             echo "### Skipped (cannot auto-adopt on go 1.21):${skipped}" >> "$GITHUB_STEP_SUMMARY"
           fi

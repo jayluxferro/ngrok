@@ -89,7 +89,7 @@ func (ctl *Controller) Go(fn func()) {
 		defer func() {
 			if r := recover(); r != nil {
 				err := util.MakePanicTrace(r)
-				ctl.Error(err)
+				ctl.Error("%v", err)
 				ctl.Shutdown(err)
 			}
 		}()
