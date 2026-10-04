@@ -35,8 +35,8 @@ var (
 	adminSrv  *http.Server
 
 	authLimiter   *ipRateLimiter
-	publicLimiter *ipRateLimiter
-	connLimiter   *ipConnLimiter
+	publicLimiter atomic.Pointer[ipRateLimiter]
+	connLimiter   atomic.Pointer[ipConnLimiter]
 	warnSampler   *logSampler
 )
 
@@ -175,8 +175,8 @@ func Main() {
 	tunnelRegistry = NewTunnelRegistry(registryCacheSize, registryCacheFile)
 	controlRegistry = NewControlRegistry()
 	authLimiter = newIPRateLimiter(opts.authRate, time.Minute)
-	publicLimiter = newIPRateLimiter(opts.publicRate, time.Second)
-	connLimiter = newIPConnLimiter(opts.maxConnPerIP)
+	publicLimiter.Store(newIPRateLimiter(opts.publicRate, time.Second))
+	connLimiter.Store(newIPConnLimiter(opts.maxConnPerIP))
 	warnSampler = newLogSampler(30 * time.Second)
 
 	// Event export (SPEC-CLUSTER9 §4): start the configured destinations

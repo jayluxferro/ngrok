@@ -692,10 +692,10 @@ func TestSNIRefusedBeforePeekWhenLimiterExhausted(t *testing.T) {
 	// refusal is certain to fire regardless of how many connections other
 	// tests admitted (the limiter is keyed per window, and this test's IP is
 	// 127.0.0.1 for every one of them).
-	prevPublicLimiter := publicLimiter
-	publicLimiter = newIPRateLimiter(1, time.Second)
-	t.Cleanup(func() { publicLimiter = prevPublicLimiter })
-	publicLimiter.allow("127.0.0.1")
+	prevPublicLimiter := publicLimiter.Load()
+	publicLimiter.Store(newIPRateLimiter(1, time.Second))
+	t.Cleanup(func() { publicLimiter.Store(prevPublicLimiter) })
+	publicLimiter.Load().allow("127.0.0.1")
 
 	logFile := filepath.Join(t.TempDir(), "server.log")
 	log.LogTo(logFile, "DEBUG", "text")

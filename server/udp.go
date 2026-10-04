@@ -224,7 +224,7 @@ func (tbl *udpFlowTable) getOrCreate(addr *net.UDPAddr) *udpFlow {
 	// the message; it is assigned before the reader exists.
 
 	ip := udpRemoteIP(addr)
-	if !publicLimiter.allow(ip) {
+	if !publicLimiter.Load().allow(ip) {
 		atomic.AddUint64(&rateDropCount, 1)
 		observe.events.publishRateLimitDrop(scopePublicUDP, ip)
 		if warnSampler.allow("udp-rate:" + ip) {
@@ -261,7 +261,7 @@ func (tbl *udpFlowTable) getOrCreate(addr *net.UDPAddr) *udpFlow {
 	}
 
 	// Roll back the global slot if the connection cap refuses below.
-	if !connLimiter.acquire(ip) {
+	if !connLimiter.Load().acquire(ip) {
 		liveUdpFlows.Add(-1)
 		observe.events.publishConnectionCapDrop(scopePublicUDP, ip)
 		if warnSampler.allow("udp-cap:" + ip) {
@@ -528,7 +528,7 @@ func (f *udpFlow) close() {
 		// refused verdict, a dead agent leg, tunnel shutdown). Released AFTER
 		// remove/close-signaling so nothing holds the table lock while the
 		// limiter's lock is taken (lock order: table -> limiter only).
-		connLimiter.release(udpRemoteIP(f.client))
+		connLimiter.Load().release(udpRemoteIP(f.client))
 		decPublicConns()
 		liveUdpFlows.Add(-1)
 	})

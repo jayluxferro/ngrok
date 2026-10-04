@@ -156,7 +156,7 @@ func misdirectedResponse(host string) []byte {
 // processed. On refusal it answers BadRequest, publishes the drop event and
 // returns ok=false (the caller closes/returns); on pass it returns the ip the
 // gates keyed on, which the caller OWNS: it must release the acquired slot
-// on the connection's lifetime (defer connLimiter.release(ip)).
+// on the connection's lifetime (defer connLimiter.Load().release(ip)).
 //
 // The https listener calls this BEFORE the SNI peek (a rate/cap verdict keys
 // on the source IP and needs no SNI), and its two branches -- serveAgentTLS
@@ -164,7 +164,7 @@ func misdirectedResponse(host string) []byte {
 // one connection, each gate exactly once, whichever route it takes.
 func admitPublicHTTPConn(c conn.Conn) (ip string, ok bool) {
 	ip = remoteIP(c.RemoteAddr())
-	if !publicLimiter.allow(ip) {
+	if !publicLimiter.Load().allow(ip) {
 		atomic.AddUint64(&rateDropCount, 1)
 		observe.events.publishRateLimitDrop(scopePublicHTTP, ip)
 		if warnSampler.allow("public-rate:" + ip) {
@@ -173,7 +173,7 @@ func admitPublicHTTPConn(c conn.Conn) (ip string, ok bool) {
 		c.Write([]byte(BadRequest))
 		return ip, false
 	}
-	if !connLimiter.acquire(ip) {
+	if !connLimiter.Load().acquire(ip) {
 		observe.events.publishConnectionCapDrop(scopePublicHTTP, ip)
 		if warnSampler.allow("public-cap:" + ip) {
 			log.Warn("Connection cap reached for %s", ip)
@@ -258,7 +258,7 @@ func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
 	if !admitted {
 		return
 	}
-	defer connLimiter.release(ip)
+	defer connLimiter.Load().release(ip)
 	incPublicConns()
 	defer decPublicConns()
 
@@ -586,7 +586,7 @@ func httpHandler(c conn.Conn, proto string) {
 	if !admitted {
 		return
 	}
-	defer connLimiter.release(ip)
+	defer connLimiter.Load().release(ip)
 	incPublicConns()
 	defer decPublicConns()
 

@@ -560,9 +560,9 @@ func TestUdpFlowRoundTripAmongTwoFlows(t *testing.T) {
 func TestUdpFlowIdleExpiry(t *testing.T) {
 	setUdpIdleTimeout(t, 400*time.Millisecond)
 
-	prevConnLimiter := connLimiter
-	connLimiter = newIPConnLimiter(1) // the expired flow must release its slot
-	t.Cleanup(func() { connLimiter = prevConnLimiter })
+	prevConnLimiter := connLimiter.Load()
+	connLimiter.Store(newIPConnLimiter(1)) // the expired flow must release its slot
+	t.Cleanup(func() { connLimiter.Store(prevConnLimiter) })
 
 	setupTestRegistry(t)
 	ctl := testControl(t, "")
@@ -678,10 +678,10 @@ func TestUdpFlowIdleRefreshIsInboundOnly(t *testing.T) {
 // point of the move is that a denied datagram costs nothing.
 func TestUdpDeniedDatagramCreatesNothing(t *testing.T) {
 	t.Run("rate limiter refuses before any flow exists", func(t *testing.T) {
-		prevPublicLimiter := publicLimiter
-		publicLimiter = newIPRateLimiter(1, time.Second)
-		t.Cleanup(func() { publicLimiter = prevPublicLimiter })
-		publicLimiter.allow("127.0.0.1") // burn the window's only allow BEFORE the datagram
+		prevPublicLimiter := publicLimiter.Load()
+		publicLimiter.Store(newIPRateLimiter(1, time.Second))
+		t.Cleanup(func() { publicLimiter.Store(prevPublicLimiter) })
+		publicLimiter.Load().allow("127.0.0.1") // burn the window's only allow BEFORE the datagram
 
 		setupTestRegistry(t)
 		ctl := testControl(t, "")
@@ -697,10 +697,10 @@ func TestUdpDeniedDatagramCreatesNothing(t *testing.T) {
 	})
 
 	t.Run("connection cap held externally refuses before any flow exists", func(t *testing.T) {
-		prevConnLimiter := connLimiter
-		connLimiter = newIPConnLimiter(1)
-		t.Cleanup(func() { connLimiter = prevConnLimiter })
-		if !connLimiter.acquire("127.0.0.1") { // the cap is spent by SOMEONE ELSE before we arrive
+		prevConnLimiter := connLimiter.Load()
+		connLimiter.Store(newIPConnLimiter(1))
+		t.Cleanup(func() { connLimiter.Store(prevConnLimiter) })
+		if !connLimiter.Load().acquire("127.0.0.1") { // the cap is spent by SOMEONE ELSE before we arrive
 			t.Fatal("failed to pre-hold the test cap slot")
 		}
 
@@ -910,9 +910,9 @@ func TestUdpFlowConnectVerdictDropsSilently(t *testing.T) {
 // established flow holds).
 func TestUdpFlowAdmissionGates(t *testing.T) {
 	t.Run("rate limiter", func(t *testing.T) {
-		prevPublicLimiter := publicLimiter
-		publicLimiter = newIPRateLimiter(1, time.Second)
-		t.Cleanup(func() { publicLimiter = prevPublicLimiter })
+		prevPublicLimiter := publicLimiter.Load()
+		publicLimiter.Store(newIPRateLimiter(1, time.Second))
+		t.Cleanup(func() { publicLimiter.Store(prevPublicLimiter) })
 
 		setupTestRegistry(t)
 		ctl := testControl(t, "")
@@ -934,9 +934,9 @@ func TestUdpFlowAdmissionGates(t *testing.T) {
 	})
 
 	t.Run("connection cap", func(t *testing.T) {
-		prevConnLimiter := connLimiter
-		connLimiter = newIPConnLimiter(1)
-		t.Cleanup(func() { connLimiter = prevConnLimiter })
+		prevConnLimiter := connLimiter.Load()
+		connLimiter.Store(newIPConnLimiter(1))
+		t.Cleanup(func() { connLimiter.Store(prevConnLimiter) })
 
 		setupTestRegistry(t)
 		ctl := testControl(t, "")

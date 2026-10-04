@@ -779,7 +779,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 			publicConn.AddLogPrefix(t.Id())
 			publicConn.Info("New connection from %v", publicConn.RemoteAddr())
 			ip := remoteIP(publicConn.RemoteAddr())
-			if !publicLimiter.allow(ip) {
+			if !publicLimiter.Load().allow(ip) {
 				atomic.AddUint64(&rateDropCount, 1)
 				observe.events.publishRateLimitDrop(scopePublicTCP, ip)
 				if warnSampler.allow("tcp-rate:" + ip) {
@@ -788,7 +788,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 				publicConn.Close()
 				return
 			}
-			if !connLimiter.acquire(ip) {
+			if !connLimiter.Load().acquire(ip) {
 				observe.events.publishConnectionCapDrop(scopePublicTCP, ip)
 				if warnSampler.allow("tcp-cap:" + ip) {
 					publicConn.Warn("Connection cap reached for %s", ip)
@@ -799,7 +799,7 @@ func (t *Tunnel) listenTcp(listener *net.TCPListener) {
 			incPublicConns()
 
 			go func(ip string, c conn.Conn) {
-				defer connLimiter.release(ip)
+				defer connLimiter.Load().release(ip)
 				defer decPublicConns()
 
 				// Hand the connection to a member of the bucket that shares
