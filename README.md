@@ -439,8 +439,8 @@ ngrok [OPTIONS] <local port or address>
 
 Options:
   -config=path       Configuration file path (default: ~/.ngrok)
-  -log=path          Log file path (default: stdout)
-  -log-level=level   Log level: DEBUG, INFO, WARN, ERROR
+  -log=path          Log file path (default: none, logs to nowhere)
+  -log-level=level   Log level: DEBUG, INFO, WARNING, ERROR
   -log-format=format Log format: text or json
   -subdomain=name    Request a specific subdomain
   -hostname=name     Request a specific hostname
@@ -474,7 +474,7 @@ Options:
   -quicAddr=addr     Public address listening for QUIC proxy sessions (UDP), empty
                      string to disable; the tunnel port's number works as the QUIC
                      port too (one TCP + one independent UDP binding)
-  -adminAddr=:9090   Admin address for /healthz and /metrics (empty to disable)
+  -adminAddr=addr    Admin address for /healthz and /metrics (empty by default: the admin endpoint is off unless an address is given)
   -config=path       YAML config file for ngrokd options
   -adminAuth=u:p     Basic auth for all admin endpoints
   -adminToken=token  Header token for admin endpoints (X-Ngrok-Admin-Token)
@@ -484,8 +484,8 @@ Options:
   -authToken=tokens  Comma-separated list of valid auth tokens
                      Supports plaintext tokens and sha256:<hex-digest> values
   -hashToken=token   Print sha256 token hash in format sha256:<hex> and exit
-  -log=path          Log file path (default: stdout)
-  -log-level=level   Log level: DEBUG, INFO, WARN, ERROR
+  -log=path          Log file path (default: none, logs to nowhere)
+  -log-level=level   Log level: DEBUG, INFO, WARNING, ERROR
   -log-format=format Log format: text or json
   -maxMsgBytes=n     Max control/proxy message size in bytes
   -authRate=n        Max auth attempts per minute per IP (0 disables)
@@ -541,7 +541,7 @@ ngrok uses a custom protocol over TLS for secure tunneling:
 
 1. **Control Connection**: Long-lived TCP connection for tunnel management
 2. **Proxy Connections**: Separate connections for each public request
-3. **Message Format**: Netstring-encoded JSON messages
+3. **Message Format**: 8-byte little-endian length-prefixed JSON messages
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed protocol documentation.
 For production hardening guidance, see [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md).

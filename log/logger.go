@@ -25,9 +25,41 @@ var (
 	jsonFormat bool
 )
 
-func LogTo(target string, level_name string, format string) {
+// LogTo points the process-wide root logger at target ("stdout", "none", or a
+// file path) at the named level, in the named format. It is the one place a
+// log level is set from user input, and an unrecognized level name is an
+// error, not a silent fall-back to DEBUG: a level that is not what the
+// operator asked for hides exactly the lines being debugged, and said nothing
+// when it happened. The accepted set is the one both CLIs document --
+// DEBUG, INFO, WARNING, ERROR. (It is narrower than log4go's own vocabulary:
+// the undocumented FINEST/FINE/TRACE/CRITICAL spellings used to work by
+// falling through this very switch, which is the drift being fixed here.)
+//
+// The error is returned before anything is mutated, so a refused call leaves
+// the logger -- filter and format flag alike -- exactly as it was.
+//
+// server/main.go still discards the returned error (its call predates it);
+// surfacing it there belongs to the server workstream. The client's Main
+// turns it into the startup error it should be.
+func LogTo(target string, level_name string, format string) error {
 	rootMu.Lock()
 	defer rootMu.Unlock()
+
+	// Validate the level before anything else: a refused call must not have
+	// touched the writer state or the format flag on its way out.
+	var level log.Level
+	switch level_name {
+	case "DEBUG":
+		level = log.DEBUG
+	case "INFO":
+		level = log.INFO
+	case "WARNING":
+		level = log.WARNING
+	case "ERROR":
+		level = log.ERROR
+	default:
+		return fmt.Errorf("Invalid log level %q: must be one of DEBUG, INFO, WARNING, ERROR", level_name)
+	}
 
 	var writer log.LogWriter = nil
 	jsonFormat = strings.EqualFold(format, "json")
@@ -42,31 +74,10 @@ func LogTo(target string, level_name string, format string) {
 	}
 
 	if writer != nil {
-		var level = log.DEBUG
-
-		switch level_name {
-		case "FINEST":
-			level = log.FINEST
-		case "FINE":
-			level = log.FINE
-		case "DEBUG":
-			level = log.DEBUG
-		case "TRACE":
-			level = log.TRACE
-		case "INFO":
-			level = log.INFO
-		case "WARNING":
-			level = log.WARNING
-		case "ERROR":
-			level = log.ERROR
-		case "CRITICAL":
-			level = log.CRITICAL
-		default:
-			level = log.DEBUG
-		}
-
 		root.AddFilter("log", level, writer)
 	}
+
+	return nil
 }
 
 type Logger interface {

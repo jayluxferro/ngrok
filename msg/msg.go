@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"time"
 
 	"ngrok/policy"
 )
@@ -314,6 +315,45 @@ const (
 func IsHTTP(proto string) bool {
 	return proto == ProtoHTTP || proto == ProtoHTTPS
 }
+
+// ---------------------------------------------------------------------------
+// Shared timing values
+//
+// These durations are agreement, not the policy of one end: both binaries
+// expire the same flows and keep the same carrier sessions alive, and a value
+// one end holds and the other does not share is a disagreement waiting for a
+// network partition to be noticed. Like the wire vocabulary above, they live
+// here, next to the messages whose transports they keep alive, so each end
+// derives its own (possibly private) constants from one declaration rather
+// than spelling the same duration twice.
+//
+// Not every usage site is unified yet. The client side derives from these
+// (client/model.go); the server still spells its copies as literals -- the
+// next reader finishing the unification wants msg/shared_timeouts_test.go,
+// which pins the values here and names the server's literal sites by file:line.
+// ---------------------------------------------------------------------------
+
+const (
+	// UdpIdleTimeout is how long a udp flow may sit with no traffic in either
+	// direction before either end closes it (SPEC-CLUSTER8 3.2). The two ends
+	// must agree on it because either side's expiry tears down the flow's
+	// other half through the proxy conn close, and a client that tolerates a
+	// longer silence than its server would only ever see the server's clock.
+	UdpIdleTimeout = 30 * time.Second
+
+	// CarrierKeepAlive is how often a mux carrier (smux and QUIC alike) pings
+	// an idle peer (SPEC-CLUSTER7 5). The keepalive is load-bearing: it is
+	// what turns a peer that vanished silently into a dead session -- and
+	// therefore into a reconnected one -- without waiting for the next proxy
+	// stream to be attempted.
+	CarrierKeepAlive = 10 * time.Second
+
+	// CarrierIdleTimeout is how long a carrier session may see no traffic at
+	// all -- the keepalives above included -- before it is given up on
+	// (SPEC-CLUSTER7 5). It bounds CarrierKeepAlive: a peer that stopped
+	// answering is declared dead after seeing this much silence.
+	CarrierIdleTimeout = 30 * time.Second
+)
 
 // IsHTTPOnly reports whether every leg of a protocol field is served over
 // HTTP. The field may be the "+"-joined combination the client builds, so this

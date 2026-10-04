@@ -36,6 +36,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -174,7 +175,11 @@ func buildJWTValidation(where string, cfg map[string]interface{}) (*jwtValidatio
 	// calls), and building it here is what makes "what the config said" and
 	// "what the tokens are judged against" the same object.
 	var opts []jwt.ParserOption
-	opts = append(opts, jwt.WithValidMethods(algs))
+	// exp is required: a bearer token with no expiry is a credential valid
+	// forever, and admitting one would let an IdP misconfiguration mint
+	// never-expiring access. A token that cannot say when it dies is refused,
+	// not trusted until further notice.
+	opts = append(opts, jwt.WithValidMethods(algs), jwt.WithExpirationRequired())
 	if v, ok := cfg["issuer"]; ok {
 		s, ok := v.(string)
 		if !ok {
@@ -242,21 +247,27 @@ func (v *jwtValidationAction) authenticate(req *http.Request, st *evalState) *re
 }
 
 // verifyKey is the parser's keyfunc: it resolves the token's kid to a key from
-// the JWKS cache, refetching once on a miss (rotation), and refuses the pair
-// when the token's algorithm family and the key's type disagree.
+// the JWKS cache, and on a miss earns the token one refetch attempt -- itself
+// throttled inside the cache (jwks.go) to one per minimum interval across
+// every connection, with concurrent missers sharing one fetch. It refuses the
+// pair when the token's algorithm family and the key's type disagree.
 func (v *jwtValidationAction) verifyKey(t *jwt.Token, st *evalState) (interface{}, error) {
 	kid, _ := t.Header["kid"].(string)
 
 	key, found := v.keys.byKid(kid)
 	if !found {
-		// One refetch, then this token is refused. The fetch's failure is
+		// One refetch attempt, then this token is refused. The failure is
 		// worth exactly one line per connection -- it is the "the IdP is down
 		// and the endpoint is refusing everything" signal -- and it carries
 		// the transport error, which names hosts and certificates but no
 		// request material. A kid that stays unknown after a *successful*
 		// fetch is quiet: a token with an invented kid is a routine event,
-		// not an operational problem.
-		if err := v.keys.fetch(); err != nil {
+		// not an operational problem. The kid is attacker-chosen, so the
+		// fetch itself is throttled to one per interval per cache (refetch):
+		// a spray of invented kids buys the issuer's endpoint one GET per
+		// interval, and every miss inside the interval fails closed from
+		// memory.
+		if err := v.keys.refetch(); err != nil {
 			st.warnOnceAbout(v.where, "traffic policy %s: JWKS fetch failed: %v; requests needing a key are refused", v.where, err)
 			return nil, err
 		}
@@ -311,6 +322,12 @@ func jwtFailureLabel(err error) string {
 		return "issuer does not match"
 	case errors.Is(err, jwt.ErrTokenInvalidAudience):
 		return "audience does not match"
+	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
+		// before ErrTokenInvalidClaims, on purpose: the parser wraps a
+		// missing required claim (exp, via WithExpirationRequired) in
+		// ErrTokenInvalidClaims too, and errors.Is matches BOTH -- the more
+		// specific sentinel has to be asked first or its label is shadowed.
+		return "a required claim is missing (exp is required)"
 	case errors.Is(err, jwt.ErrTokenInvalidClaims):
 		return "claims do not satisfy the config"
 	case errors.Is(err, jwt.ErrTokenUnverifiable):
@@ -319,18 +336,25 @@ func jwtFailureLabel(err error) string {
 	return "token rejected"
 }
 
-// checkJWKSURI validates the jwks_uri config field: an absolute http(s) URL
+// checkJWKSURI validates the jwks_uri config field: an absolute https URL
 // with a host, and no userinfo -- the fetch failure's log line carries the URL
 // (an operator debugging a JWKS needs it), and a URL with an embedded
 // "user:password@" would put a credential in that line. Refusing it at load
 // is what makes logging the URL safe later.
+//
+// The one transport exception is loopback: a JWKS served over http from
+// 127.0.0.0/8, ::1 or "localhost" is a local test server, and demanding a
+// certificate from it would make the action undeployable in the very setups
+// that exercise it. Everywhere else http is refused because the key document
+// IS the trust root -- fetched in the clear, it is whatever the network path
+// says it is, and every signature verified with it inherits that lie.
 func checkJWKSURI(where, raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%s: config field \"jwks_uri\": %q is not a URL: %v", where, raw, err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("%s: config field \"jwks_uri\": %q must be an http or https URL", where, raw)
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+		return nil, fmt.Errorf("%s: config field \"jwks_uri\": %q must be an https URL -- a JWKS fetched over http would trust whichever host answers the connection (only loopback hosts are exempt, so a local test server can serve one)", where, raw)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("%s: config field \"jwks_uri\": %q names no host", where, raw)
@@ -339,6 +363,18 @@ func checkJWKSURI(where, raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("%s: config field \"jwks_uri\": a userinfo component is refused (credentials do not belong in a URL)", where)
 	}
 	return u, nil
+}
+
+// isLoopbackHost reports whether a URL host (Hostname(): no port, no IPv6
+// brackets) names this machine: the loopback IPs or the "localhost" name.
+// Only the exact name counts -- "localhost.example.com" is somebody else's
+// machine, and an http URL naming it is refused like any other cleartext.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // checkExactMatchClaim refuses a `claims` entry that names a registered claim

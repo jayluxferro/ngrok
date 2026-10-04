@@ -87,7 +87,11 @@ type vaultSetModel map[string]string
 type VaultSet struct {
 	// vaults maps a vault's name to its key -> value entries. The values are
 	// as stored: plaintext, or sha256:<hex> (recognizable by the prefix, and
-	// hex-validated at load). Key names, never values, appear in errors.
+	// hex-validated at load). No value ever appears in an error, and neither
+	// does the inventory: a resolution failure names only the vault and key
+	// the failing reference itself spelled out (resolveCredential), because
+	// on the server side that error travels back to the agent that submitted
+	// the document, and a vault listing is not something the wire hands out.
 	vaults map[string]vaultSetModel
 }
 
@@ -155,10 +159,9 @@ func sortedMapNames[V any](m map[string]V) []string {
 // loadVaultFile reads one file-backed vault: a YAML document of flat
 // `key: value` pairs. An empty file (or one of only comments) defines an empty
 // vault rather than an error: the file exists, which is the affirmative act;
-// references to missing keys are the loud failures, and they name the empty
-// vault (see resolveCredential). An entry value of sha256:<hex> is checked to
-// be a real SHA-256 digest here -- a typo'd digest would otherwise be a
-// credential that silently matches nothing.
+// references to missing keys are the loud failures (see resolveCredential). An
+// entry value of sha256:<hex> is checked to be a real SHA-256 digest here -- a
+// typo'd digest would otherwise be a credential that silently matches nothing.
 func loadVaultFile(name, path string) (vaultSetModel, error) {
 	log.Info("Reading vault file %s", path)
 
@@ -189,9 +192,9 @@ func loadVaultFile(name, path string) (vaultSetModel, error) {
 // file vault, a prefix that matches no variable also defines an empty vault
 // rather than an error (the environment is allowed to provision nothing, and
 // the HttpProxy fallback set the lenient precedent); a reference into the
-// empty vault says so. Values are taken as they are: an empty value or one
-// carrying a CR/LF is refused when a policy resolves it, which has the
-// context (action, field, entry) the load here would not.
+// empty vault is the loud failure. Values are taken as they are: an empty
+// value or one carrying a CR/LF is refused when a policy resolves it, which
+// has the context (action, field, entry) the load here would not.
 func loadVaultEnv(name, prefix string) (vaultSetModel, error) {
 	entries := vaultSetModel{}
 	for _, kv := range os.Environ() {
@@ -337,11 +340,11 @@ func resolveCredential(s string) (resolvedCredential, error) {
 	}
 	entries, ok := vs.vaults[vault]
 	if !ok {
-		return resolvedCredential{}, fmt.Errorf("no vault named %q is configured (configured vaults: %s)", vault, strings.Join(sortedMapNames(vs.vaults), ", "))
+		return resolvedCredential{}, fmt.Errorf("no vault named %q is configured", vault)
 	}
 	value, ok := entries[key]
 	if !ok {
-		return resolvedCredential{}, fmt.Errorf("vault %q has no key %q%s", vault, key, missingKeyNote(entries))
+		return resolvedCredential{}, fmt.Errorf("vault %q has no key %q", vault, key)
 	}
 
 	if strings.HasPrefix(value, digestPrefix) {
@@ -385,23 +388,18 @@ func parseSecretRef(s string) (vault, key string, err error) {
 	return content[:i], content[i+1:], nil
 }
 
-// missingKeyNote is the diagnostic after "vault %q has no key %q": a missing
-// key is either a typo in the reference or an under-provisioned vault, and the
-// configured key names (never values) or the empty vault's source tell an
-// operator which.
-func missingKeyNote(entries vaultSetModel) string {
-	if len(entries) > 0 {
-		names := sortedMapNames(entries)
-		if len(names) > 8 {
-			names = append(names[:8], fmt.Sprintf("... and %d more", len(names)-8))
-		}
-		return fmt.Sprintf(" (configured keys: %s)", strings.Join(names, ", "))
-	}
-
-	// The set keeps what its sources produced, not the sources themselves, so
-	// the empty-vault note describes the two shapes generically.
-	return " (the vault is empty: check the vault file's keys or the env_prefix's variables)"
-}
+// A note on what these errors deliberately do NOT say. It would be friendlier
+// to answer "no vault named %q" with the names that ARE configured, and
+// "vault %q has no key %q" with the keys that are -- the operator with the
+// typo is one glance away from the fix. That diagnostic was here once, and it
+// was an information leak with a UI: resolution runs on the SERVER at
+// registration too, and its load error travels back to the agent that
+// submitted the document. Under the old spelling, an agent could probe vault
+// names and key names one guess at a time and read the inventory out of the
+// refusals -- the wire was a directory listing of the server's credentials
+// config. So the errors name only what the failing reference itself spelled
+// out, and the enumeration lives where it belongs: in the operator's config
+// file, which they can read without asking the endpoint.
 
 // ResolveSecretRef resolves a whole-value secret("vault/key") reference to
 // its stored plaintext, for configuration values that need the literal
@@ -425,11 +423,11 @@ func ResolveSecretRef(s string) (string, error) {
 	}
 	entries, ok := vs.vaults[vault]
 	if !ok {
-		return "", fmt.Errorf("no vault named %q is configured (configured vaults: %s)", vault, strings.Join(sortedMapNames(vs.vaults), ", "))
+		return "", fmt.Errorf("no vault named %q is configured", vault)
 	}
 	value, ok := entries[key]
 	if !ok {
-		return "", fmt.Errorf("vault %q has no key %q%s", vault, key, missingKeyNote(entries))
+		return "", fmt.Errorf("vault %q has no key %q", vault, key)
 	}
 	return value, nil
 }

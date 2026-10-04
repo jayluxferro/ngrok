@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"ngrok/msg"
+	"ngrok/policy"
 )
 
 func debugStack() string {
@@ -411,6 +412,187 @@ func TestHTTPDestinationDropsWhenCollectorSlow(t *testing.T) {
 	}
 	if got := d.queueDepth(); got != eventExportQueueCap {
 		t.Errorf("queue depth: expected the queue parked at its cap of %d, got %d", eventExportQueueCap, got)
+	}
+}
+
+// TestHTTPDestinationNeverFollowsRedirects is the redirect refusal: a
+// collector that answers with a redirect (302 -> a second origin) must not
+// become a credential exfiltration. The POST fails, nothing is delivered to
+// the redirect target -- not even a headerless request -- and the batch
+// retries against the ORIGINAL url.
+func TestHTTPDestinationNeverFollowsRedirects(t *testing.T) {
+	hub := newEventHub()
+
+	// The redirect target: every hit it ever sees is recorded, headers
+	// included, so the test can assert the strongest form -- no request AT
+	// ALL reached it.
+	hijackHits := newCollectorHarness(t, 0)
+
+	// The configured collector: it answers every POST by pointing elsewhere.
+	count := atomic.Int64{}
+	misdirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		http.Redirect(w, r, hijackHits.server.URL+"/harvested", http.StatusFound)
+	}))
+	t.Cleanup(misdirect.Close)
+
+	d, err := newHTTPDestination(eventDestinationConfig{
+		Type:          "http",
+		URL:           misdirect.URL,
+		AuthHeader:    "Authorization: Bearer collector-token",
+		BatchSize:     1,
+		FlushInterval: (20 * time.Millisecond).String(),
+	}, hub)
+	if err != nil {
+		t.Fatalf("destination refused a valid config: %v", err)
+	}
+	d.retryStart = 2 * time.Millisecond
+	d.retryMax = 10 * time.Millisecond
+	go d.run()
+	defer d.stop()
+
+	hub.publishTunnelOpen("https://redirected.ngrok.io", "https")
+
+	// The refusal is a failed POST, so the drain loop retries: several
+	// attempts against the misdirecting collector prove the destination did
+	// not give up (and that each attempt was refused rather than followed).
+	waitFor(t, "the retried, refused POSTs", func() bool {
+		return count.Load() >= 3
+	})
+
+	if got := hijackHits.count.Load(); got != 0 {
+		t.Fatalf("the redirect target received %d request(s): the client followed the redirect", got)
+	}
+	if got := d.droppedCount(); got != 0 {
+		t.Errorf("a retrying destination drops nothing, got %d dropped", got)
+	}
+}
+
+// TestHTTPDestinationRefusesCRLFInResolvedSecret pins the post-resolution
+// CR/LF check: validateAuthHeader saw the raw secret() reference at config
+// load (no vaults installed yet), so a vault VALUE with an embedded newline
+// would reach the header write path unchallenged. The constructor refuses it
+// loudly, naming the destination -- mirroring policy's credentialList
+// discipline -- and a clean value from the same vault constructs fine.
+func TestHTTPDestinationRefusesCRLFInResolvedSecret(t *testing.T) {
+	prev := policy.Vaults()
+	t.Cleanup(func() { policy.SetVaults(prev) })
+
+	vaultPath := filepath.Join(t.TempDir(), "vault.yml")
+	if err := os.WriteFile(vaultPath, []byte("broken: \"pasted\\r\\nX-Evil: yes\"\nclean: bearer-vault-token\n"), 0600); err != nil {
+		t.Fatalf("failed to write the vault file: %v", err)
+	}
+	if err := loadServerVaults(map[string]policy.VaultSource{"main": {File: vaultPath}}); err != nil {
+		t.Fatalf("loadServerVaults: %v", err)
+	}
+
+	d, err := newHTTPDestination(eventDestinationConfig{
+		Type:       "http",
+		URL:        "https://collector.example/ngrok",
+		AuthHeader: `Authorization: secret("main/broken")`,
+	}, newEventHub())
+	if err == nil {
+		d.stop()
+		t.Fatal("a vault value carrying CR/LF must fail the destination's construction")
+	}
+	if !strings.Contains(err.Error(), "CR or LF") || !strings.Contains(err.Error(), "header injection") {
+		t.Errorf("the refusal must name the injection, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://collector.example/ngrok") {
+		t.Errorf("the refusal must name the destination, got: %v", err)
+	}
+
+	// The same vault's clean value resolves and is held as the header value.
+	ok, err := newHTTPDestination(eventDestinationConfig{
+		Type:       "http",
+		URL:        "https://collector.example/ngrok",
+		AuthHeader: `Authorization: secret("main/clean")`,
+	}, newEventHub())
+	if err != nil {
+		t.Fatalf("a clean vault value was refused: %v", err)
+	}
+	defer ok.stop()
+	if ok.headerValue != "bearer-vault-token" {
+		t.Errorf("resolved header value = %q, want the vault's plaintext", ok.headerValue)
+	}
+}
+
+// TestHTTPDestinationVaultAuthHeaderReachesTheCollector is the resolution-
+// success pin the CR/LF test's clean-value half only implies: the RESOLVED
+// value must be what the destination actually puts on the wire. The header
+// value is pinned at the collector -- the one place a wrong spelling (the
+// secret("...") reference sent literally, a digest where the plaintext was
+// meant, another vault entry entirely) would ship credentials-shaped bytes to
+// a third party -- not on the destination's internal field alone.
+func TestHTTPDestinationVaultAuthHeaderReachesTheCollector(t *testing.T) {
+	prev := policy.Vaults()
+	t.Cleanup(func() { policy.SetVaults(prev) })
+
+	vaultPath := filepath.Join(t.TempDir(), "vault.yml")
+	if err := os.WriteFile(vaultPath, []byte("collector: super-secret-collector-token\nother: unrelated-value\n"), 0600); err != nil {
+		t.Fatalf("failed to write the vault file: %v", err)
+	}
+	if err := loadServerVaults(map[string]policy.VaultSource{"main": {File: vaultPath}}); err != nil {
+		t.Fatalf("loadServerVaults: %v", err)
+	}
+
+	hub := newEventHub()
+	h := newCollectorHarness(t, 0)
+	d, err := newHTTPDestination(eventDestinationConfig{
+		Type:          "http",
+		URL:           h.server.URL,
+		AuthHeader:    `Authorization: secret("main/collector")`,
+		BatchSize:     1,
+		FlushInterval: time.Second.String(),
+	}, hub)
+	if err != nil {
+		t.Fatalf("a destination over a resolvable reference was refused: %v", err)
+	}
+	go d.run()
+	defer d.stop()
+
+	hub.publishTunnelOpen("https://vaulted.ngrok.io", "https")
+
+	select {
+	case hdr := <-h.headers:
+		if got := hdr.Get("Authorization"); got != "super-secret-collector-token" {
+			t.Errorf("the collector saw Authorization %q, want the resolved vault value", got)
+		}
+	case <-time.After(publicTimeout):
+		t.Fatal("the collector never received the batch")
+	}
+}
+
+// TestHTTPDestinationRefusesDanglingVaultKey pins the loud-dangling branch of
+// the auth_header resolution: a reference whose key the named vault does not
+// hold fails the destination's construction, naming BOTH the vault and the key
+// the failing reference spelled out. The refusal must also stay an inventory-
+// free one: what it names is what the reference itself said, never what the
+// vault contains (vault.go's enumeration note, applied to the wire-facing
+// construction error).
+func TestHTTPDestinationRefusesDanglingVaultKey(t *testing.T) {
+	prev := policy.Vaults()
+	t.Cleanup(func() { policy.SetVaults(prev) })
+
+	vaultPath := filepath.Join(t.TempDir(), "vault.yml")
+	if err := os.WriteFile(vaultPath, []byte("present: value\n"), 0600); err != nil {
+		t.Fatalf("failed to write the vault file: %v", err)
+	}
+	if err := loadServerVaults(map[string]policy.VaultSource{"main": {File: vaultPath}}); err != nil {
+		t.Fatalf("loadServerVaults: %v", err)
+	}
+
+	d, err := newHTTPDestination(eventDestinationConfig{
+		Type:       "http",
+		URL:        "https://collector.example/ngrok",
+		AuthHeader: `Authorization: secret("main/absent")`,
+	}, newEventHub())
+	if err == nil {
+		d.stop()
+		t.Fatal("a reference to a key the vault does not hold must fail the destination's construction")
+	}
+	if !strings.Contains(err.Error(), `vault "main" has no key "absent"`) {
+		t.Errorf("the refusal must name the vault AND the key, got: %v", err)
 	}
 }
 

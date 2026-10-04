@@ -1177,7 +1177,7 @@ if [[ "$EDGE_RESP" != "e2e-ok" ]]; then
   echo "[e2e] the edge-terminated https tunnel did not serve the upstream: $EDGE_RESP"
   exit 1
 fi
-if ! grep -q "SNI edgetest routes to edge-terminated endpoint" /tmp/ngrok-e2e-tls-ngrokd.log; then
+if ! grep -q 'SNI "edgetest" routes to edge-terminated endpoint' /tmp/ngrok-e2e-tls-ngrokd.log; then
   echo "[e2e] the edge-terminated request did not take the SNI route:"
   grep "edgetest" /tmp/ngrok-e2e-tls-ngrokd.log | tail -n 5 || true
   exit 1
@@ -1212,7 +1212,7 @@ fi
 
 # The routing half of the proof: the server saw the SNI, found the
 # agent-terminated endpoint, and passed the connection through as raw bytes.
-if ! grep -q "SNI zk routes to agent-terminated endpoint" /tmp/ngrok-e2e-tls-ngrokd.log; then
+if ! grep -q 'SNI "zk" routes to agent-terminated endpoint' /tmp/ngrok-e2e-tls-ngrokd.log; then
   echo "[e2e] the agent-terminated request did not take the SNI route:"
   grep "zk" /tmp/ngrok-e2e-tls-ngrokd.log | tail -n 5 || true
   exit 1
@@ -1240,7 +1240,7 @@ fi
 # Scoped to the one connection that carried the request: read its id off the
 # passthrough line and confirm nothing on that connection ever went through a
 # plaintext head parse or a termination failure.
-ZK_CONN="$(grep 'SNI zk routes to agent-terminated endpoint' /tmp/ngrok-e2e-tls-ngrokd.log | grep -o 'pub:[0-9a-f]*' | head -n 1)"
+ZK_CONN="$(grep 'SNI "zk" routes to agent-terminated endpoint' /tmp/ngrok-e2e-tls-ngrokd.log | grep -o 'pub:[0-9a-f]*' | head -n 1)"
 if [[ -z "$ZK_CONN" ]]; then
   echo "[e2e] could not read the passthrough connection id from the server log"
   exit 1

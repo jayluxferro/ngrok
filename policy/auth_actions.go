@@ -344,7 +344,10 @@ func (a *apiKeyAuthAction) authenticate(req *http.Request, _ *evalState) *rewrit
 // payload waiting for the first code path that echoes it, and there is no
 // credential an operator means to write that way) and, when sep is non-empty,
 // refused unless it contains exactly the separator (basic-auth's
-// "user:password" shape); with no separator, an empty value is refused, since
+// "user:password" shape) -- with one carve-out: a vault entry stored
+// pre-digested (sha256:<hex>) skips the separator check, because a bare
+// digest cannot carry a colon and the plaintext whose shape it is was
+// discarded on purpose. With no separator, an empty value is refused, since
 // no request could ever match one.
 func credentialList(where, field string, cfg map[string]interface{}, sep string) ([]resolvedCredential, error) {
 	v, ok := cfg[field]
@@ -383,7 +386,18 @@ func credentialList(where, field string, cfg map[string]interface{}, sep string)
 		if strings.ContainsAny(cred.value, "\r\n") {
 			return nil, fmt.Errorf("%s: config field %q entry %d%s contains a CR or LF, which no credential should carry (header injection)", where, field, i, prov)
 		}
-		if sep != "" {
+		// The separator check runs on the resolved value -- except when that
+		// value came pre-digested from a vault. A sha256: entry's value is a
+		// bare hex digest, which cannot carry a colon by construction: the
+		// operator digested a well-formed "user:password", and the digest no
+		// longer contains the plaintext whose shape this check asks about.
+		// Blaming the digest for a missing separator would refuse exactly the
+		// digests-only-on-disk setup the vault file format advertises. The
+		// skip is licensed by the VAULT provenance, not by the sha256:
+		// prefix: an inline "sha256:<hex>" string is a literal credential
+		// with no vault behind it, and it is shape-checked like any other
+		// literal (a colon-less one is refused below, as it always was).
+		if sep != "" && !cred.digested {
 			if _, _, found := strings.Cut(cred.value, sep); !found {
 				return nil, fmt.Errorf("%s: config field %q entry %d%s is not \"user:password\"-shaped: a %q separator is required (an empty user or password is allowed)", where, field, i, prov, sep)
 			}

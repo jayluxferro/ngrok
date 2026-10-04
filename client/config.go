@@ -305,9 +305,11 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			err = fmt.Errorf("Tunnel %s does not specify any protocols to tunnel.", name)
 			return
 		}
-		// Before the protocol loop: the endpoint rules are more specific than
-		// "hostname/subdomain are only valid for http/https", so a bad
-		// internal-plus-tcp combination should say that instead.
+		// Before the protocol loop, and for the CLI-synthesized tunnel further
+		// down: the endpoint rules -- binding, the internal namespace, forward_to,
+		// and hostname/subdomain versus port-routed protocols -- live in exactly
+		// one function, validateEndpointPolicy, so a config key and a command-line
+		// flag are refused for the same reasons in the same words.
 		if err = validateEndpointPolicy(name, t); err != nil {
 			return
 		}
@@ -319,18 +321,6 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			}
 
 			if err = validateProtocol(k, tunnelName); err != nil {
-				return
-			}
-
-			// Port-routed protocols (tcp, and udp since SPEC-CLUSTER8) are
-			// addressed by their public port, not by a name, so a name on one
-			// is a control that could never mean anything. The check is per
-			// protocol key, before the loader's default-subdomain assignment
-			// below -- which deliberately escapes it for tcp and now udp, as
-			// it always has: the server decides what a named port-routed
-			// registration means, exactly as it has for tcp.
-			if (t.Hostname != "" || t.Subdomain != "") && (k == msg.ProtoTCP || k == msg.ProtoUDP) {
-				err = fmt.Errorf("Tunnel %s hostname/subdomain are only valid for http/https protocols", name)
 				return
 			}
 		}
@@ -657,9 +647,10 @@ func validateHeaderPolicy(tunnelName string, t *TunnelConfiguration) error {
 }
 
 // validateEndpointPolicy validates the cluster-2 endpoint settings of one
-// tunnel: the binding, the internal-namespace rules, and forward_to. Like
-// validateHeaderPolicy it is called for config-file tunnels and for the
-// CLI-synthesized "default" tunnel, so the rules live in exactly one place.
+// tunnel: the binding, the internal-namespace rules, forward_to, and
+// hostname/subdomain versus port-routed protocols. Like validateHeaderPolicy
+// it is called for config-file tunnels and for the CLI-synthesized "default"
+// tunnel, so the rules live in exactly one place.
 //
 // It also normalizes: a binding of "public" (the spelling users will reach for,
 // since that is what the flag documents) becomes the empty string that
@@ -703,6 +694,23 @@ func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 				return fmt.Errorf("Tunnel %s: binding internal is only supported for http and https tunnels, not %s", tunnelName, proto)
 			}
 		}
+	}
+
+	// hostname/subdomain name a name-routed endpoint (http, https). The
+	// port-routed protocols -- tcp, and udp since SPEC-CLUSTER8 -- are
+	// addressed by their public port, so a name on a tunnel whose every
+	// protocol is port-routed is a control that could never mean anything:
+	// refuse it here rather than silently discard it and register a tunnel
+	// under a url nobody asked for. The check lives here, not beside the
+	// config-file protocol loop it used to sit in, precisely so that the
+	// CLI-synthesized tunnel below is policed by the same rule: "-proto=tcp
+	// -hostname=foo" used to drop the hostname without a word.
+	//
+	// A mixed tunnel keeps its name: an http+tcp tunnel's http leg is
+	// name-routed and uses it (the tcp leg ignores it, as it always has), so
+	// only the every-leg-port-routed shape is refused.
+	if (t.Hostname != "" || t.Subdomain != "") && tunnelAllPortRouted(t) {
+		return fmt.Errorf("Tunnel %s: hostname/subdomain are only valid for http/https protocols, got %s", tunnelName, protoNames(t.Protocols))
 	}
 
 	return validateForwardTo(tunnelName, t)
@@ -1211,15 +1219,52 @@ func SaveAuthToken(configPath, authtoken string) (err error) {
 	return
 }
 
+// nameRoutedLegs reports whether any leg of one protocol key is routed by name
+// (http, https). A proto section key may be the "+"-joined combination the
+// client spells for one endpoint with several legs ("http+https") -- a single
+// map key, so an exact match against "http" or "https" misses it -- and it is
+// split the same way the server splits ReqTunnel.Protocol (see
+// msg.IsHTTPOnly) before asking each leg.
+func nameRoutedLegs(k string) bool {
+	for _, leg := range strings.Split(k, "+") {
+		if msg.IsHTTP(leg) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // tunnelHasNameRoutedProto reports whether any of the tunnel's protocols is
 // routed by name (http, https) rather than by a bound port (tcp, udp). The
 // auto-subdomain step consults it: a name a port-routed endpoint cannot
-// register with must not be assigned to one.
+// register with must not be assigned to one. A combined key takes part with
+// its legs, so "http+https" counts as name-routed (its legs are), while a key
+// made only of port-routed legs never could.
 func tunnelHasNameRoutedProto(t *TunnelConfiguration) bool {
 	for k := range t.Protocols {
-		if k == msg.ProtoHTTP || k == msg.ProtoHTTPS {
+		if nameRoutedLegs(k) {
 			return true
 		}
 	}
 	return false
+}
+
+// tunnelAllPortRouted is tunnelHasNameRoutedProto's complement over the whole
+// tunnel: every leg of every protocol key is port-routed (tcp, udp), so there
+// is no leg a hostname or subdomain could attach to. validateEndpointPolicy
+// refuses that shape when the tunnel also carries a name.
+func tunnelAllPortRouted(t *TunnelConfiguration) bool {
+	if len(t.Protocols) == 0 {
+		return false
+	}
+	for k := range t.Protocols {
+		for _, leg := range strings.Split(k, "+") {
+			if leg != msg.ProtoTCP && leg != msg.ProtoUDP {
+				return false
+			}
+		}
+	}
+
+	return true
 }

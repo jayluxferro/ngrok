@@ -24,6 +24,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -378,16 +379,41 @@ func TestJWTValidationAcceptsAndRejects(t *testing.T) {
 	})
 }
 
+// shortRefetchInterval shrinks the compiled action's JWKS refetch throttle to
+// something a test can sleep past, and returns how long to sleep to be past
+// it. Production runs at jwksMinRefetchInterval (30s); the interval is a
+// field on the cache precisely so tests can do this instead of sleeping.
+func shortRefetchInterval(t *testing.T, c *Compiled) time.Duration {
+	t.Helper()
+	if len(c.request) != 1 {
+		t.Fatalf("the compiled policy has %d request rules, want 1", len(c.request))
+	}
+	a, ok := c.request[0].auth.(*jwtValidationAction)
+	if !ok {
+		t.Fatalf("the rule is %T, want *jwtValidationAction", c.request[0].auth)
+	}
+	a.keys.minRefetchInterval = 40 * time.Millisecond
+	return 3 * a.keys.minRefetchInterval
+}
+
 // TestJWTValidationRotatesKeysOnUnknownKid covers the refetch policy: an
-// unknown kid earns exactly one refetch, a refreshed document that names the
-// kid admits the token, and the refreshed set *replaces* the old one -- a key
-// the IdP withdrew stops verifying.
+// unknown kid earns at most one refetch per minimum interval, a refreshed
+// document that names the kid admits the token, and the refreshed set
+// *replaces* the old one -- a key the IdP withdrew stops verifying. The
+// interval itself is the amplification bound (a kid is attacker-chosen
+// bytes): inside it, a miss is refused from memory, without a fetch.
 func TestJWTValidationRotatesKeysOnUnknownKid(t *testing.T) {
 	keys := genTestKeys(t)
 	idp := newTestIdP(t)
 	idp.publish(t, keys.rsaJWK)
 
-	hook := jwtHook(t, idp.srv.URL, nil)
+	c, lg := compileRequest(t, reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{
+		"jwks_uri": idp.srv.URL,
+		"issuer":   "https://idp.example",
+		"audience": "my-endpoint",
+	})))
+	pastInterval := shortRefetchInterval(t, c)
+	hook := c.RequestHook(lg, "1.2.3.4:1")
 
 	// The first token populates the cache (fetch one).
 	old := signToken(t, jwt.SigningMethodRS256, keys.rsaKey, "rsa-1", standardClaims())
@@ -396,26 +422,236 @@ func TestJWTValidationRotatesKeysOnUnknownKid(t *testing.T) {
 		t.Fatalf("after the first request the IdP was fetched %d times, want 1", got)
 	}
 
-	// A token under the new kid misses the cache, earns one refetch, and now
-	// verifies (fetch two -- and only two).
+	// A token under a just-rotated kid misses -- and, inside the interval,
+	// is refused WITHOUT a fetch. This is the throttle's fail-closed face:
+	// rotation propagates within one interval, and until it does the miss is
+	// a 401, never a network round trip the token's kid asked for.
 	idp.publish(t, keys.rotatedJWK)
 	replacement := signToken(t, jwt.SigningMethodRS256, keys.otherRSA, "rsa-2", standardClaims())
-	admitted(t, hook(bearerRequest(replacement)))
-	if got := idp.fetches(); got != 2 {
-		t.Fatalf("the rotation cost %d fetches, want exactly one refetch (2 total)", got)
+	jwtRefused(t, hook(bearerRequest(replacement)), replacement)
+	if got := idp.fetches(); got != 1 {
+		t.Fatalf("a miss inside the refetch interval cost %d fetches, want 0 (refused from memory)", got)
 	}
 
-	// The old kid is gone from the served document, so the old token is now
-	// refused -- one more refetch (fetch three), then the verdict.
+	// Past the interval, the same token earns the refetch (fetch two) and
+	// verifies.
+	time.Sleep(pastInterval)
+	admitted(t, hook(bearerRequest(replacement)))
+	if got := idp.fetches(); got != 2 {
+		t.Fatalf("the post-interval rotation cost %d fetches, want exactly one refetch (2 total)", got)
+	}
+
+	// The old kid is gone from the served document, so the old token is
+	// refused: inside the new interval, without a fetch (still 2)...
+	jwtRefused(t, hook(bearerRequest(old)), old)
+	if got := idp.fetches(); got != 2 {
+		t.Fatalf("a refusal inside the interval cost %d fetches, want 0 more", got)
+	}
+
+	// ...and past it, one more refetch (fetch three) confirms the withdrawal,
+	// then the verdict again.
+	time.Sleep(pastInterval)
 	jwtRefused(t, hook(bearerRequest(old)), old)
 	if got := idp.fetches(); got != 3 {
-		t.Fatalf("a token the refreshed JWKS still does not know cost %d fetches, want exactly one more (3 total)", got)
+		t.Fatalf("the post-interval confirmation cost %d fetches, want exactly one more (3 total)", got)
 	}
 
 	// A cached kid does not re-fetch: this request is answered from the cache.
 	admitted(t, hook(bearerRequest(replacement)))
 	if got := idp.fetches(); got != 3 {
 		t.Fatalf("a cached kid re-fetched (%d fetches), want the cache to answer", got)
+	}
+}
+
+// TestJWTValidationUnknownKidSprayFetchesOnce is the amplification bound,
+// from the request side: the kid in a token is attacker-chosen, so the spray
+// of invented kids an attacker can afford must not be answered with a fetch
+// per request. A burst of fifty concurrent misses buys the IdP ONE fetch --
+// the singleflight shares it and the interval refuses the rest -- and every
+// token fails closed; a sequential spray over invented kids likewise costs
+// one fetch total, because the interval is per-cache, global across
+// connections; and past the interval exactly one refetch happens, which is
+// the honest-rotation path.
+func TestJWTValidationUnknownKidSprayFetchesOnce(t *testing.T) {
+	keys := genTestKeys(t)
+
+	newHookOver := func(t *testing.T, idp *testIdP) func(*http.Request) *rewriter.RequestVerdict {
+		c, lg := compileRequest(t, reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{
+			"jwks_uri": idp.srv.URL,
+			"issuer":   "https://idp.example",
+			"audience": "my-endpoint",
+		})))
+		return c.RequestHook(lg, "1.2.3.4:1")
+	}
+
+	// hooksOverOnePolicy compiles the policy ONCE -- one compiled action, one
+	// jwks cache, the shape production shares across connections -- and hands
+	// back a distinct hook per connection. (Compiling per hook, as a first
+	// draft of this test did, silently gives every connection its own cache,
+	// and the burst fetches once per cache -- which is exactly the bug the
+	// test exists to catch, so the compile happens here, where it cannot.)
+	hooksOverOnePolicy := func(t *testing.T, idp *testIdP, n int) []func(*http.Request) *rewriter.RequestVerdict {
+		c, lg := compileRequest(t, reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{
+			"jwks_uri": idp.srv.URL,
+			"issuer":   "https://idp.example",
+			"audience": "my-endpoint",
+		})))
+		hooks := make([]func(*http.Request) *rewriter.RequestVerdict, n)
+		for i := range hooks {
+			hooks[i] = c.RequestHook(lg, "1.2.3.4:1")
+		}
+		return hooks
+	}
+
+	t.Run("a burst of fifty concurrent unknown kids fetches once", func(t *testing.T) {
+		idp := newTestIdP(t)
+		idp.publish(t, keys.rsaJWK) // served set: does NOT name the sprayed kids
+
+		const n = 50
+		// one hook per goroutine over ONE compiled policy: a hook is one
+		// connection (its eval state is per-connection), and the shared cache
+		// across the connections is what the bound is on.
+		hooks := hooksOverOnePolicy(t, idp, n)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		verdicts := make([]*rewriter.RequestVerdict, n)
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				tok := signToken(t, jwt.SigningMethodRS256, keys.rsaKey, fmt.Sprintf("invented-%d", i), standardClaims())
+				verdicts[i] = hooks[i](bearerRequest(tok))
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		if got := idp.fetches(); got != 1 {
+			t.Fatalf("%d concurrent misses cost %d fetches, want exactly 1", n, got)
+		}
+		for i, v := range verdicts {
+			if v == nil || v.Terminate == nil {
+				t.Fatalf("invented kid %d was admitted: a miss must fail closed", i)
+			}
+		}
+	})
+
+	t.Run("a sequential spray over unknown kids fetches once", func(t *testing.T) {
+		idp := newTestIdP(t)
+		idp.publish(t, keys.rsaJWK)
+		hook := newHookOver(t, idp)
+
+		for i := 0; i < 50; i++ {
+			tok := signToken(t, jwt.SigningMethodRS256, keys.rsaKey, fmt.Sprintf("invented-%d", i), standardClaims())
+			jwtRefused(t, hook(bearerRequest(tok)), tok)
+		}
+		if got := idp.fetches(); got != 1 {
+			t.Fatalf("50 sequential misses cost %d fetches, want exactly 1 (the interval is global per cache)", got)
+		}
+	})
+
+	t.Run("past the interval a refetch happens", func(t *testing.T) {
+		idp := newTestIdP(t)
+		idp.publish(t, keys.rsaJWK)
+
+		c, lg := compileRequest(t, reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{
+			"jwks_uri": idp.srv.URL,
+			"issuer":   "https://idp.example",
+			"audience": "my-endpoint",
+		})))
+		pastInterval := shortRefetchInterval(t, c)
+		hook := c.RequestHook(lg, "1.2.3.4:1")
+
+		miss := signToken(t, jwt.SigningMethodRS256, keys.rsaKey, "invented", standardClaims())
+		jwtRefused(t, hook(bearerRequest(miss)), miss)
+		if got := idp.fetches(); got != 1 {
+			t.Fatalf("the first miss cost %d fetches, want 1", got)
+		}
+
+		jwtRefused(t, hook(bearerRequest(miss)), miss)
+		if got := idp.fetches(); got != 1 {
+			t.Fatalf("a miss inside the interval cost %d fetches, want still 1", got)
+		}
+
+		time.Sleep(pastInterval)
+		jwtRefused(t, hook(bearerRequest(miss)), miss)
+		if got := idp.fetches(); got != 2 {
+			t.Fatalf("the post-interval miss cost %d fetches, want exactly one refetch (2 total)", got)
+		}
+	})
+}
+
+// TestJWTValidationJWKSURIRequiresHTTPSOffLoopback pins the transport rule:
+// a JWKS is fetched over https, because the key document is the trust root
+// and cleartext delivery makes it whatever the network path says. The one
+// exception is loopback -- 127.0.0.0/8, ::1, "localhost" -- where a local
+// test server may serve one over http. Anything that only looks local
+// ("localhost.example.com") is refused like any other cleartext.
+func TestJWTValidationJWKSURIRequiresHTTPSOffLoopback(t *testing.T) {
+	cases := []struct {
+		name    string
+		uri     string
+		wantErr string // empty: the config must be accepted
+	}{
+		{"https anywhere", "https://idp.example/jwks.json", ""},
+		{"http off-loopback is refused", "http://idp.example/jwks.json", "must be an https URL"},
+		{"http to a public IP is refused", "http://93.184.216.34/jwks.json", "must be an https URL"},
+		{"http to a lookalike name is refused", "http://localhost.example.com/jwks.json", "must be an https URL"},
+		{"http to a loopback IP is allowed", "http://127.0.0.1:9000/jwks.json", ""},
+		{"http to another loopback IP is allowed", "http://127.5.6.7/jwks.json", ""},
+		{"http to ::1 is allowed", "http://[::1]:9000/jwks.json", ""},
+		{"http to localhost is allowed", "http://localhost/jwks.json", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{"jwks_uri": tc.uri}))
+			err := doc.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("the config was refused:\n%v", err)
+				}
+				// compiling must stay network-free; this proves it
+				if _, err := doc.Compile(); err != nil {
+					t.Fatalf("compile:\n%v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error does not name the requirement.\n got: %v\nwant substring: %s", err, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), "loopback") {
+				t.Fatalf("the error does not say loopback is the exception:\n%v", err)
+			}
+		})
+	}
+}
+
+// TestJWTValidationRequiresExp pins the exp requirement: a token that cannot
+// say when it dies is refused, under the fixed label -- an unexpirying bearer
+// credential is exactly what this action exists to make impossible to admit
+// by misconfiguration.
+func TestJWTValidationRequiresExp(t *testing.T) {
+	keys := genTestKeys(t)
+	idp := newTestIdP(t)
+	idp.publish(t, keys.rsaJWK)
+
+	c, lg := compileRequest(t, reqPolicy(rule(ActionJWTValidation, nil, map[string]interface{}{
+		"jwks_uri": idp.srv.URL,
+		"issuer":   "https://idp.example",
+		"audience": "my-endpoint",
+	})))
+	hook := c.RequestHook(lg, "1.2.3.4:1")
+
+	claims := standardClaims()
+	delete(claims, "exp")
+	token := signToken(t, jwt.SigningMethodRS256, keys.rsaKey, "rsa-1", claims)
+	jwtRefused(t, hook(bearerRequest(token)), token)
+
+	logged := lg.lines(lg.info)
+	if !strings.Contains(logged, "a required claim is missing") {
+		t.Fatalf("the missing-exp refusal was not logged under its label:\n%s", logged)
 	}
 }
 

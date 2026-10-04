@@ -9,37 +9,13 @@ package server
 // policy/credentialList; what each side may resolve with is what its own
 // configuration declared.
 //
-// COORDINATION (SPEC-CLUSTER9 5, workstream ownership): server/config.go and
-// cli.go belong to workstream B this cluster. B's event-destination work has
-// landed in those files, but without a vaults: key -- so the wiring below is
-// still pending, and it is two one-liners for whoever lands it:
+// The wiring this file anticipated landed at cluster 9's review and is
+// live: serverConfig carries the vaults: block (server/config.go) and cli.go
+// installs it via loadServerVaults immediately after loadServerConfig --
+// before any tunnel can register and before event destinations construct,
+// which is what lets auth_header secret() references resolve against the
+// same set at construction time.
 //
-//  1. on serverConfig (server/config.go), the strict-decoded block:
-//
-//	Vaults map[string]policy.VaultSource `yaml:"vaults"`
-//
-//     policy.VaultSource is deliberately the client's own type
-//     (policy/vault.go: file | env_prefix), so both configurations speak one
-//     shape and strict decode polices its keys (a typo'd env_prefix fails the
-//     load, KnownFields(true)).
-//
-//  2. in cli.go's parseArgs, inside the `if *configPath != ""` block, right
-//     after loadServerConfig succeeds (before eventDestinations is collected,
-//     and before any tunnel can register):
-//
-//	if err := loadServerVaults(cfg.Vaults); err != nil {
-//		fmt.Fprintln(os.Stderr, "Failed to load vaults:", err.Error())
-//		os.Exit(1)
-//	}
-//
-// That call is also the composition point B's validateAuthHeader comment in
-// config.go anticipates: a future auth_header secret() resolution would run
-// against the set loadServerVaults installs.
-//
-// Until the wiring lands, a policy referencing secret(...) fails server-side
-// registration with "no vaults are configured" -- the correct loud state
-// (SPEC-CLUSTER9 6 gate 3: no silent fallback), and no change for any config
-// that does not use vaults.
 
 import (
 	"ngrok/policy"

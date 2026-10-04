@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -225,22 +227,46 @@ func TestPairPerConnectionAllocsDrop(t *testing.T) {
 	defer func() { readBufPool = saved }()
 
 	readBufPool = nil
-	unpooled := testing.AllocsPerRun(runs, func() { pairCycle(reqIn, respIn) })
+	unpooled := minAllocs(runs, func() { pairCycle(reqIn, respIn) })
 
 	readBufPool = testPool()
-	for i := 0; i < 10; i++ {
-		pairCycle(reqIn, respIn)
-	}
-	pooled := testing.AllocsPerRun(runs, func() { pairCycle(reqIn, respIn) })
+	pooled := minAllocs(runs, func() { pairCycle(reqIn, respIn) })
 
-	t.Logf("allocs per connection: unpooled %.0f, pooled %.0f (drop %.0f)", unpooled, pooled, unpooled-pooled)
-	// Only the direction is pinned: the two pooled arrays are 2 of the ~53
-	// allocs a cycle makes, and under -race the race runtime's own allocations
-	// add noise of the same magnitude, so an exact-count floor would flake
-	// without saying anything the recycle tests don't already prove.
+	t.Logf("allocs per connection (floor): unpooled %d, pooled %d (drop %d)", unpooled, pooled, unpooled-pooled)
+	// The floor comparison, not an average: allocation counts are
+	// noise-additive (GC scheduling and the race runtime can only ADD
+	// allocations to an invocation, never remove the deterministic ones), so
+	// min-of-N estimates the deterministic floor and the floor is what
+	// pooling lowers -- by exactly the two pooled arrays. An average, which
+	// is what AllocsPerRun returns, ties whenever the delta (2) is the size
+	// of the noise: -count=2 reproduced exactly that tie.
 	if pooled >= unpooled {
-		t.Fatalf("pooling did not reduce allocations per connection: unpooled %.0f, pooled %.0f", unpooled, pooled)
+		t.Fatalf("pooling did not reduce allocations per connection: unpooled %d, pooled %d", unpooled, pooled)
 	}
+}
+
+// minAllocs reports the smallest single-invocation allocation count observed
+// over runs invocations (each preceded by a GC and a warm-up call). See the
+// test above for why the minimum is the stable statistic here.
+func minAllocs(runs int, f func()) uint64 {
+	var best uint64 = math.MaxUint64
+	var before, after runtime.MemStats
+	for i := 0; i < runs; i++ {
+		// No forced GC between invocations: a GC empties sync.Pool, and the
+		// saving being measured only exists in the warm-pool regime -- with
+		// the pool cleared every call pays cold allocation and the pooled
+		// floor lands ABOVE the unpooled one (measured, not theorized). The
+		// warm-up call before each measured one keeps the pool warm; noise
+		// stays additive, so the minimum still estimates the floor.
+		f()
+		runtime.ReadMemStats(&before)
+		f()
+		runtime.ReadMemStats(&after)
+		if n := after.Mallocs - before.Mallocs; n < best {
+			best = n
+		}
+	}
+	return best
 }
 
 // TestCloseReleasesBufferExactlyOnce drives the release site the way

@@ -487,6 +487,58 @@ func TestStreamSessionCarriersHandIdenticalProxyConns(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the pre-auth session cap
+
+// TestQuicSessionCapRefusesOverCapAndAdmitsUnder covers the accept-loop
+// throttle: a session accepted with every pre-auth slot taken is closed
+// immediately (it never reaches the mux protocol), while a session under the
+// cap binds normally. The production cap is 256 real sessions -- the live
+// semaphore is a package var, so the test swaps in a one-slot one and fills
+// it by hand.
+func TestQuicSessionCapRefusesOverCapAndAdmitsUnder(t *testing.T) {
+	prevSlots := quicSessionSlots
+	t.Cleanup(func() { quicSessionSlots = prevSlots })
+
+	t.Run("over cap: accepted session is closed at the door", func(t *testing.T) {
+		quicSessionSlots = make(chan struct{}, 1)
+		quicSessionSlots <- struct{}{} // the cap is already spent before the dial
+
+		qconn := quicTestDial(t, quicTestListener(t).Addr().String())
+
+		// The handshake completes (that is how far an anonymous peer gets)
+		// and then the accept loop must close the session.
+		waitForQuicClosed(t, qconn)
+
+		// And the refusal is sampled, not silent -- but a nil warnSampler
+		// (what tests run with) allows everything, so there is nothing to
+		// assert about the log here beyond the close itself.
+	})
+
+	t.Run("under cap: the session binds normally", func(t *testing.T) {
+		quicSessionSlots = make(chan struct{}, 2)
+
+		reg := setupTestControlRegistry(t)
+		ctl := muxTestControl(t, reg, "client-cap")
+
+		qconn := quicTestPair(t)
+		quicTestBind(t, qconn, ctl, "client-cap", testSessionSecret("client-cap"))
+		waitForBoundSession(t, ctl, anyBound)
+
+		// The slot is returned when handleQuicSession returns, a scheduling
+		// breath after the bind the poll above observed. Wait for the
+		// release: a bound session must not hold pre-auth slots for its
+		// whole life, or one long-lived client would pin the cap forever.
+		deadline := time.Now().Add(5 * time.Second)
+		for inUse := len(quicSessionSlots); inUse != 0; inUse = len(quicSessionSlots) {
+			if time.Now().After(deadline) {
+				t.Fatalf("pre-auth slots held after bind: %d of 2 in use, want 0", inUse)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // capability advertisement and configuration
 
 // TestQuicCapabilityAdvertisedOnlyWhenListenerUp covers the gate on

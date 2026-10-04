@@ -139,10 +139,15 @@ func (cfg *serverConfig) validateEventDestinations() error {
 // reach net/http's header write path unchanged, and a crafted value there is a
 // response-splitting primitive, not a typo.
 //
-// COMPOSITION POINT (SPEC-CLUSTER9 §4.2): auth_header is a literal value in
-// this cluster. The vaults work resolves secret("vault/key") to plaintext at
-// config load -- before this validation runs on the resolved string -- so no
-// vault handling lives here by design.
+// COMPOSITION POINT (SPEC-CLUSTER9 §4.2): auth_header's value may be a
+// whole-value secret("vault/key") reference. Validation here sees the RAW
+// value -- the vault set is not installed yet at config load -- so this check
+// effectively refuses CR/LF in literal values and in reference SPELLINGS.
+// Vault RESOLUTION happens later, at destination construction
+// (events_export.go newHTTPDestination), which re-checks the RESOLVED
+// plaintext for CR/LF with the same loudness; that post-resolution check is
+// what covers a credential that only exists inside the vault. No vault
+// handling lives here by design.
 func validateAuthHeader(header string) error {
 	if header == "" {
 		return nil

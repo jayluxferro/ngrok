@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // rsaKey2048 is generated once for the package's JWKS tests; the keys these
@@ -147,6 +148,7 @@ func TestJWKSCacheRefusesMalformedDocuments(t *testing.T) {
 		{"symmetric key", `{"keys":[{"kty":"oct","kid":"s","k":"a2V5"}]}`, "symmetric key"},
 		{"unknown kty", `{"keys":[{"kty":"fancy","kid":"f"}]}`, "unsupported key type"},
 		{"tiny RSA", `{"keys":[{"kty":"RSA","kid":"r","n":"` + b64(n1024()) + `","e":"AQAB"}]}`, "fewer than"},
+		{"huge RSA", `{"keys":[{"kty":"RSA","kid":"r","n":"` + b64(n16384()) + `","e":"AQAB"}]}`, "more than"},
 		{"RSA without an exponent", `{"keys":[{"kty":"RSA","kid":"r","n":"` + b64(n2048()) + `"}]}`, "bad RSA exponent"},
 		{"EC point off the curve", `{"keys":[{"kty":"EC","kid":"e","crv":"P-256","x":"` + b64([]byte{1}) + `","y":"` + b64([]byte{2}) + `"}]}`, "not on P-256"},
 		{"unsupported curve", `{"keys":[{"kty":"EC","kid":"e","crv":"secp256k1","x":"` + b64([]byte{1}) + `","y":"` + b64([]byte{2}) + `"}]}`, "unsupported EC curve"},
@@ -277,7 +279,102 @@ func TestJWKSCacheDoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
-// --- small fixtures -----------------------------------------------------------
+// TestJWKSRefetchConcurrentMissesShareOneFetch pins the singleflight: fifty
+// goroutines arriving while one fetch is in flight produce ONE request, and
+// every one of them shares its result. The handler holds the response until
+// the test releases it, which makes the in-flight window cover the whole
+// burst: no goroutine can arrive after completion unless the scheduler starves
+// it for the entire hold, and even then it would be refused by the interval
+// (the other bound) rather than fetch again -- the count below stays 1.
+func TestJWKSRefetchConcurrentMissesShareOneFetch(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	gets := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gets++
+		mu.Unlock()
+		<-release
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newJWKSCache(mustURL(t, srv))
+
+	const n = 50
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = c.refetch()
+		}(i)
+	}
+	close(start)
+	time.Sleep(200 * time.Millisecond) // let the burst reach refetch and park on the in-flight fetch
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	got := gets
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("%d concurrent refetches made %d requests, want exactly 1", n, got)
+	}
+	for i, err := range errs {
+		if err == nil || !strings.Contains(err.Error(), "503") {
+			t.Fatalf("misser %d did not share the in-flight fetch's result: %v", i, err)
+		}
+	}
+}
+
+// TestJWKSRefetchHonorsTheMinimumInterval pins the interval bound on its own:
+// a refetch right after a completed one is refused without a request (the
+// error names the bound, so an operator reading the warn line can tell this
+// apart from a transport failure), and past the interval the refetch happens.
+func TestJWKSRefetchHonorsTheMinimumInterval(t *testing.T) {
+	good := []byte(`{"keys":[{"kty":"RSA","kid":"k","n":"` + b64(n2048()) + `","e":"AQAB"}]}`)
+	srv := serveJWKS(t, http.StatusOK, good)
+	c := newJWKSCache(mustURL(t, srv))
+	c.minRefetchInterval = 50 * time.Millisecond
+
+	if err := c.refetch(); err != nil {
+		t.Fatalf("first refetch: %v", err)
+	}
+	err := c.refetch()
+	if err == nil || !strings.Contains(err.Error(), "minimum between fetches") {
+		t.Fatalf("an immediate refetch was not refused by the interval: %v", err)
+	}
+
+	// sleeping 3x the interval guarantees the clock has passed it
+	time.Sleep(3 * c.minRefetchInterval)
+	if err := c.refetch(); err != nil {
+		t.Fatalf("a refetch past the interval was refused: %v", err)
+	}
+}
+
+// TestJWKSRefetchThrottleCountsFailedAttempts pins WHY the interval is
+// measured from the last attempt, not the last success: a fetch that failed
+// (an IdP answering 500, on demand or on fire) still starts the clock. A
+// client that only recorded successes would leave the clock untouched on
+// every failure -- and failures are the cheap case for an attacker forcing
+// them -- so one bounded GET per request would be for sale again precisely
+// when the attacker can most afford it.
+func TestJWKSRefetchThrottleCountsFailedAttempts(t *testing.T) {
+	srv := serveJWKS(t, http.StatusServiceUnavailable, []byte(`{}`))
+	c := newJWKSCache(mustURL(t, srv))
+
+	if err := c.refetch(); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("the first refetch did not report the fetch failure: %v", err)
+	}
+	err := c.refetch()
+	if err == nil || !strings.Contains(err.Error(), "minimum between fetches") {
+		t.Fatalf("a refetch after a FAILED attempt fetched again (%v); the throttle must count attempts, not successes", err)
+	}
+}
 
 var mustECKey = func() *ecdsa.PrivateKey {
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -313,11 +410,14 @@ func overCapKeys() string {
 	return `{"keys":[` + strings.Join(keys, ",") + `]}`
 }
 
-// n2048/n1024 are fixed RSA-shaped moduli (random bytes with the top bit set,
-// 2048/1024 bits): the parser only reads the bit length here, and generating
-// two more real keys for that would spend seconds of test time.
-func n2048() []byte { return modulusWithTopBit(256) }
-func n1024() []byte { return modulusWithTopBit(128) }
+// n2048/n1024/n16384 are fixed RSA-shaped moduli (random bytes with the top
+// bit set, 2048/1024/16384 bits): the parser only reads the bit length here,
+// and generating real keys for that would spend seconds of test time -- the
+// 16384-bit case in particular exists to hit the size ceiling and would take
+// genuinely long to generate for real.
+func n2048() []byte  { return modulusWithTopBit(256) }
+func n1024() []byte  { return modulusWithTopBit(128) }
+func n16384() []byte { return modulusWithTopBit(2048) }
 
 func modulusWithTopBit(n int) []byte {
 	b := make([]byte, n)

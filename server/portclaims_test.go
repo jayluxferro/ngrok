@@ -10,11 +10,13 @@ package server
 
 import (
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"ngrok/conn"
+	"ngrok/log"
 	"ngrok/msg"
 )
 
@@ -62,6 +64,37 @@ func TestPortClaimRefusesAnotherOwner(t *testing.T) {
 	}
 	if got := reg.HeldBy(msg.ProtoTCP, port); got != "alice" {
 		t.Fatalf("the refused claim must not disturb the holder, got %q", got)
+	}
+}
+
+// TestPortClaimWarnsOnPrivilegedPort pins the warn side of the privileged
+// range: a claim below 1024 is ALLOWED (this registry owns claims, not
+// binds) but warns, naming the port -- the operator's one clue before the
+// bind fails with EACCES at registration time. An unprivileged port warns
+// nothing.
+func TestPortClaimWarnsOnPrivilegedPort(t *testing.T) {
+	reg := setupPortClaims(t)
+
+	logFile := filepath.Join(t.TempDir(), "server.log")
+	log.LogTo(logFile, "DEBUG", "text")
+
+	if err := reg.Claim(msg.ProtoTCP, 443, "alice"); err != nil {
+		t.Fatalf("a privileged claim must still be allowed: %v", err)
+	}
+	if err := reg.Claim(msg.ProtoTCP, 8443, "alice"); err != nil {
+		t.Fatalf("an unprivileged claim must be allowed: %v", err)
+	}
+
+	// Flush the log, then check both directions: the privileged port's warn
+	// names the port, the unprivileged port's silence is total.
+	const marker = "portclaim-warn-marker"
+	log.Info(marker)
+	content := waitForFileMarker(t, logFile, marker)
+	if !strings.Contains(content, "privileged") || !strings.Contains(content, "port 443") {
+		t.Fatalf("the privileged-port warn is missing or does not name the port:\n%s", content)
+	}
+	if strings.Contains(content, "8443") {
+		t.Fatalf("an unprivileged port must not be warned about:\n%s", content)
 	}
 }
 

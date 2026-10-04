@@ -62,7 +62,6 @@ Content-Length: %d
 
 %s`
 
-
 	BadGateway = `HTTP/1.0 502 Bad Gateway
 Content-Type: text/plain; charset=utf-8
 Content-Length: %d
@@ -151,6 +150,40 @@ func misdirectedResponse(host string) []byte {
 	return []byte(fmt.Sprintf(MisdirectedRequest, len(body), body))
 }
 
+// admitPublicHTTPConn applies the two per-IP admission gates -- rate limit,
+// then concurrent-connection cap, in that order (the order every public path
+// runs: http, tcp, udp) -- to a public connection BEFORE any bytes of it are
+// processed. On refusal it answers BadRequest, publishes the drop event and
+// returns ok=false (the caller closes/returns); on pass it returns the ip the
+// gates keyed on, which the caller OWNS: it must release the acquired slot
+// on the connection's lifetime (defer connLimiter.release(ip)).
+//
+// The https listener calls this BEFORE the SNI peek (a rate/cap verdict keys
+// on the source IP and needs no SNI), and its two branches -- serveAgentTLS
+// and terminateWithServerCert -> routeHTTP -- deliberately do NOT gate again:
+// one connection, each gate exactly once, whichever route it takes.
+func admitPublicHTTPConn(c conn.Conn) (ip string, ok bool) {
+	ip = remoteIP(c.RemoteAddr())
+	if !publicLimiter.allow(ip) {
+		atomic.AddUint64(&rateDropCount, 1)
+		observe.events.publishRateLimitDrop(scopePublicHTTP, ip)
+		if warnSampler.allow("public-rate:" + ip) {
+			log.Warn("Rate-limited public request from %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return ip, false
+	}
+	if !connLimiter.acquire(ip) {
+		observe.events.publishConnectionCapDrop(scopePublicHTTP, ip)
+		if warnSampler.allow("public-cap:" + ip) {
+			log.Warn("Connection cap reached for %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return ip, false
+	}
+	return ip, true
+}
+
 // Listens for new http(s) connections from the public internet
 func startHttpListener(addr string, tlsCfg *tls.Config) (listener *conn.Listener) {
 	// The listener accepts raw connections on both variants: the plain-http
@@ -211,9 +244,24 @@ func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
 		}
 	}()
 
-	// Make sure a connection that never finishes its ClientHello does not
-	// hold a slot forever; httpHandler re-arms its own deadline for the head.
+	// The read deadline bounds whatever this connection does next (peek, or
+	// nothing, if the gates below refuse it); the admission gates run BEFORE
+	// the peek: the rate/cap keys are the source IP and need no SNI, so a
+	// refused connection is turned away without the server reading one byte
+	// of its ClientHello -- an attacker cannot spend peek work (or log SNI
+	// lines) once its IP is over budget. Both branches below (serveAgentTLS
+	// and terminateWithServerCert -> routeHTTP) deliberately skip the gates:
+	// this is the one pass per connection. The slot lives for the whole
+	// handler -- the conn's lifetime.
 	c.SetDeadline(time.Now().Add(connReadTimeout))
+	ip, admitted := admitPublicHTTPConn(c)
+	if !admitted {
+		return
+	}
+	defer connLimiter.release(ip)
+	incPublicConns()
+	defer decPublicConns()
+
 	sni, peeked, err := readClientHelloSNI(c, maxHeadBytes)
 
 	switch {
@@ -230,20 +278,23 @@ func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
 	if sni != "" {
 		// Registry keys are lower-cased (hostFromHead's rule); SNI hostnames
 		// are binary-safe octets on the wire, and the lowercase of the name
-		// is the name the tunnel was registered under.
+		// is the name the tunnel was registered under. The %q spellings
+		// below are deliberate: the name is peer-controlled bytes (it can
+		// carry \n, control chars, ANSI escapes) and %q escapes them, so no
+		// log line can be forged by a crafted ClientHello.
 		host := strings.ToLower(sni)
-		c.Debug("Found SNI %s in ClientHello", host)
+		c.Debug("Found SNI %q in ClientHello", host)
 
 		tunnel := tunnelRegistry.Get(fmt.Sprintf("%s://%s", msg.ProtoHTTPS, host))
 		switch {
 		case tunnel == nil:
-			c.Info("No tunnel found for SNI %s; terminating with the server certificate", host)
+			c.Info("No tunnel found for SNI %q; terminating with the server certificate", host)
 		case tunnel.agentTLS():
-			c.Info("SNI %s routes to agent-terminated endpoint %s; passing the connection through as raw TLS bytes", host, tunnel.Id())
+			c.Info("SNI %q routes to agent-terminated endpoint %s; passing the connection through as raw TLS bytes", host, tunnel.Id())
 			serveAgentTLS(c, tunnel, peeked)
 			return
 		default:
-			c.Info("SNI %s routes to edge-terminated endpoint %s; terminating with the server certificate", host, tunnel.Id())
+			c.Info("SNI %q routes to edge-terminated endpoint %s; terminating with the server certificate", host, tunnel.Id())
 		}
 	}
 
@@ -256,34 +307,11 @@ func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
 // address, the endpoint's on_tcp_connect policy, the forward_to chain --
 // is decided here, on the outside of the TLS; inside there is only ciphertext
 // this server has no key for.
+//
+// The admission gates are NOT here: they ran once in httpsConnHandler, before
+// the peek (this function is only reachable from there, and a connection
+// must pass each gate exactly once whichever branch takes it).
 func serveAgentTLS(c conn.Conn, tunnel *Tunnel, peeked []byte) {
-	// The admission gates the http path applies in httpHandler apply here
-	// too: a passthrough connection is a public connection like any other.
-	// They live in this branch rather than in httpsConnHandler because the
-	// terminated branch re-enters httpHandler, which applies them itself --
-	// a conn must be counted exactly once, whichever route it takes.
-	ip := remoteIP(c.RemoteAddr())
-	if !publicLimiter.allow(ip) {
-		atomic.AddUint64(&rateDropCount, 1)
-		observe.events.publishRateLimitDrop(scopePublicHTTP, ip)
-		if warnSampler.allow("public-rate:" + ip) {
-			log.Warn("Rate-limited public request from %s", ip)
-		}
-		c.Write([]byte(BadRequest))
-		return
-	}
-	if !connLimiter.acquire(ip) {
-		observe.events.publishConnectionCapDrop(scopePublicHTTP, ip)
-		if warnSampler.allow("public-cap:" + ip) {
-			log.Warn("Connection cap reached for %s", ip)
-		}
-		c.Write([]byte(BadRequest))
-		return
-	}
-	defer connLimiter.release(ip)
-	incPublicConns()
-	defer decPublicConns()
-
 	// The forward_to chain decides which endpoint actually serves this
 	// connection, exactly as it does on the Host path: an agent-terminated
 	// entry endpoint with a forward_to terminates at the internal endpoint
@@ -327,12 +355,26 @@ func serveAgentTLS(c conn.Conn, tunnel *Tunnel, peeked []byte) {
 // terminateWithServerCert hands a peeked connection to the server's TLS
 // terminator and the Host router: the bytes the SNI peek consumed are put back
 // on the front of the stream, so the handshake sees the ClientHello exactly as
-// the client sent it, and httpHandler takes over as if it had accepted the
-// connection itself. This is the pre-SNI behavior, preserved byte for byte for
-// every connection the SNI does not claim for an agent.
+// the client sent it, and the routing half of the http handler takes over as
+// if it had accepted the connection itself. This is the pre-SNI behavior,
+// preserved byte for byte for every connection the SNI does not claim for an
+// agent. The gates already ran in httpsConnHandler (pre-peek), so the
+// routing half is entered directly -- no second count.
 func terminateWithServerCert(c conn.Conn, peeked []byte, tlsCfg *tls.Config) {
 	tlsConn := tls.Server(newReplayConn(c, peeked, c), tlsCfg)
-	httpHandler(&terminatedConn{Conn: c, tlsConn: tlsConn}, msg.ProtoHTTPS)
+	tc := &terminatedConn{Conn: c, tlsConn: tlsConn}
+	// routeHTTP does not close ("the caller owns Close"), and the caller of
+	// THIS function -- httpsConnHandler -- holds only the raw conn, whose
+	// Close cannot speak TLS: closing the raw socket after the last response
+	// ends the session without close_notify, which well-behaved TLS clients
+	// (openssl s_client among them) report as an unexpected EOF. Before the
+	// gates/handler split this path entered httpHandler, which owned and
+	// closed the terminated conn; the split moved ownership here without
+	// moving the close. This defer is that close: terminatedConn.Close
+	// delegates to tlsConn.Close, which sends the close_notify the raw conn's
+	// own deferred Close (httpsConnHandler) then merely double-reports.
+	defer tc.Close()
+	routeHTTP(tc, msg.ProtoHTTPS)
 }
 
 // terminatedConn is a public connection whose payload flows through a TLS
@@ -520,11 +562,19 @@ func hostFromHead(head []byte) string {
 	return strings.ToLower(headField(head, "Host"))
 }
 
-// Handles a new http connection from the public internet
+// Handles a new http connection from the public internet: the admission
+// gates and the connection's lifetime, then the routing half below.
+//
+// This entry point is the PLAIN listener's (startHttpListener). Connections
+// arriving through the https listener do NOT come through here -- their gates
+// ran once in httpsConnHandler before the SNI peek, and after the peek they
+// enter routeHTTP directly (serveAgentTLS or terminateWithServerCert) so each
+// connection passes each gate exactly once.
 func httpHandler(c conn.Conn, proto string) {
 	defer c.Close()
 	defer func() {
-		// recover from failures
+		// recover from failures (covers the gates; routeHTTP recovers its
+		// own body first, so this fires only for a panic above it)
 		if r := recover(); r != nil {
 			c.Warn("httpHandler failed with error %v", r)
 		}
@@ -532,27 +582,28 @@ func httpHandler(c conn.Conn, proto string) {
 
 	// Make sure we detect dead connections while we decide how to multiplex
 	c.SetDeadline(time.Now().Add(connReadTimeout))
-	ip := remoteIP(c.RemoteAddr())
-	if !publicLimiter.allow(ip) {
-		atomic.AddUint64(&rateDropCount, 1)
-		observe.events.publishRateLimitDrop(scopePublicHTTP, ip)
-		if warnSampler.allow("public-rate:" + ip) {
-			log.Warn("Rate-limited public request from %s", ip)
-		}
-		c.Write([]byte(BadRequest))
-		return
-	}
-	if !connLimiter.acquire(ip) {
-		observe.events.publishConnectionCapDrop(scopePublicHTTP, ip)
-		if warnSampler.allow("public-cap:" + ip) {
-			log.Warn("Connection cap reached for %s", ip)
-		}
-		c.Write([]byte(BadRequest))
+	ip, admitted := admitPublicHTTPConn(c)
+	if !admitted {
 		return
 	}
 	defer connLimiter.release(ip)
 	incPublicConns()
 	defer decPublicConns()
+
+	routeHTTP(c, proto)
+}
+
+// routeHTTP is the routing half of the http handler: everything after
+// admission, from the head read to the tunnel handoff. It runs on the plain
+// listener's connections (via httpHandler) and on the https listener's
+// terminated connections (via terminateWithServerCert, already admitted).
+func routeHTTP(c conn.Conn, proto string) {
+	defer func() {
+		// recover from failures (the caller owns Close)
+		if r := recover(); r != nil {
+			c.Warn("httpHandler failed with error %v", r)
+		}
+	}()
 
 	// Multiplex by the Host field of the head, which is read here with a
 	// bounded parser (readRequestHead) rather than the go-vhost library's

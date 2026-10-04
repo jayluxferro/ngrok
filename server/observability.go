@@ -57,9 +57,13 @@ const (
 	eventConnectionCapDrop = "connection_cap_drop"
 
 	// scope names the limiter a drop came from: the public HTTP handler, the
-	// public TCP listener, or the control-channel auth path.
+	// public TCP listener, the public UDP flow path, or the control-channel
+	// auth path. One vocabulary, one home: every publish site spells its
+	// scope from here so a consumer can switch on the values without
+	// grepping call sites.
 	scopePublicHTTP = "public_http"
 	scopePublicTCP  = "public_tcp"
+	scopePublicUDP  = "public_udp"
 	scopeAuth       = "auth"
 
 	// reason says what an auth_reject refused: a bad auth token, or a valid id

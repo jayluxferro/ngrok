@@ -64,6 +64,18 @@ const (
 	// which, where a non-zero error code would ask the client to distinguish
 	// recoveries it treats identically anyway.
 	quicSessionError quic.ApplicationErrorCode = 0
+
+	// quicMaxPreAuthSessions bounds the sessions the accept loop serves
+	// concurrently BEFORE authentication: the slot is taken the moment a
+	// session is accepted and returned when the bind outcome is decided
+	// (handleQuicSession returns right after SetMuxSession on success, after
+	// the close on every refusal). An anonymous UDP peer can complete TLS
+	// handshakes all day -- each one is CPU + a goroutine + a session object
+	// -- so without a ceiling, handshake floods grow unbounded; with it, the
+	// flood is capped and each extra session is closed immediately. Legit
+	// re-dials retry (the client's watchdog), and authenticated sessions do
+	// not hold slots at all.
+	quicMaxPreAuthSessions = 256
 )
 
 // quicServing records that the QUIC proxy listener is up. It is what the
@@ -91,6 +103,13 @@ func quicListenerAddr() *net.UDPAddr {
 	}
 	return nil
 }
+
+// quicSessionSlots is the slot semaphore for unauthenticated sessions: a
+// buffered channel of quicMaxPreAuthSessions slots, held for the duration of
+// the bind handshake (see quicMaxPreAuthSessions). A package var -- not
+// embedded in the listener -- because tests swap a tiny one in to exercise
+// the cap without 256 real sessions; Main never touches it.
+var quicSessionSlots = make(chan struct{}, quicMaxPreAuthSessions)
 
 // quicConfig is the QUIC configuration for the server side of a session.
 func quicConfig() *quic.Config {
@@ -141,7 +160,9 @@ func startQuicListener(addr string, tlsConfig *tls.Config) (*quic.Listener, erro
 // quicAcceptLoop accepts QUIC sessions until the listener closes. The TLS
 // handshake -- including the ALPN check -- has already completed for
 // everything Accept returns, so nothing that reaches handleQuicSession speaks
-// anything but this protocol.
+// anything but this protocol. Each accepted session must take a pre-auth slot
+// first (quicSessionSlots); an over-cap session is closed immediately -- it
+// never reaches the mux protocol, never opens the bind stream, holds nothing.
 func quicAcceptLoop(ql *quic.Listener) {
 	for {
 		qconn, err := ql.Accept(context.Background())
@@ -149,7 +170,26 @@ func quicAcceptLoop(ql *quic.Listener) {
 			// the listener was closed for shutdown
 			return
 		}
-		go handleQuicSession(qconn)
+		go func() {
+			// Capture the semaphore once: the deferred receive must return
+			// the slot to the SAME pool that granted it, even if the package
+			// var is swapped underneath this goroutine (tests swap it; Main
+			// never does).
+			slots := quicSessionSlots
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+				handleQuicSession(qconn)
+			default:
+				// Cap exhausted: refuse at the door. Sampled warn (the
+				// sampler discipline of every other rejection path; a nil
+				// sampler allows everything in tests).
+				if warnSampler.allow("quic-preauth-sessions") {
+					log.Warn("Refusing QUIC session from %s: %d sessions already in pre-auth", qconn.RemoteAddr(), quicMaxPreAuthSessions)
+				}
+				qconn.CloseWithError(quicSessionError, "too many sessions")
+			}
+		}()
 	}
 }
 

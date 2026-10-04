@@ -12,11 +12,14 @@ package policy
 //     park the request that needed the key), and a 1 MiB body cap (a JWKS for
 //     one issuer is a few KiB; a body growing past 1 MiB is an attack on the
 //     memory of the process serving policy, not a key set).
-//   - Keys are cached by kid, and an unknown kid earns exactly one refetch --
-//     that is key rotation (the IdP published a new key after we cached), and
-//     after the refetch an unknown kid is a refused token, not another fetch.
-//     Each request refetches at most once, so an attacker spraying invented
-//     kids buys one bounded HTTPS GET per request, never a loop.
+//   - Keys are cached by kid, and an unknown kid earns at most one refetch
+//     per minimum interval, shared across every connection using the client
+//     (refetch, below). The kid in a token is attacker-chosen bytes, so
+//     without these bounds an invented kid would buy one bounded HTTPS GET
+//     per request -- a fetch amplification aimed at the jwks_uri's host, paid
+//     for by this process. With them, a spray of invented kids costs the
+//     issuer one fetch per interval total, and every refused token is
+//     answered from memory, fail-closed.
 //   - The refetched set replaces the cached one wholesale, on purpose: a
 //     rotation that removes a kid should stop trusting that kid the moment the
 //     IdP's document does. A merged cache would keep verifying with a key the
@@ -35,11 +38,11 @@ package policy
 //
 // Concurrency: one compiled policy is shared by every connection using it, so
 // one cache is hit from several rewriter goroutines. The mutex covers the map
-// only; the network fetch runs outside it, so a slow IdP does not serialize
-// every request through this action. The cost of that choice: concurrent
-// requests missing the same just-rotated kid may each fetch once. Each still
-// fetches at most once, the fetches are bounded, and the last complete parse
-// wins the cache -- correctness does not depend on who wins.
+// and the small refetch bookkeeping; the network fetch runs outside it, so a
+// slow IdP does not block a byKid lookup -- cache hits never serialize behind
+// the one request that missed. Concurrent requests missing the same kid do
+// not each fetch: the first becomes the single in-flight fetch and the rest
+// wait on it and share its result (refetch, below).
 
 import (
 	"crypto"
@@ -76,6 +79,23 @@ const (
 	// either way the honest answer is to refuse it loudly at parse instead of
 	// verifying against a key everyone can factor.
 	minRSABits = 2048
+
+	// maxRSABits is the ceiling above which an RSA key in a fetched JWKS is
+	// refused. Verification cost is a modexp whose work grows with the
+	// modulus, and the 1 MiB body cap is room for a modulus tens of times
+	// larger than any real issuer signs with -- so without a ceiling, one
+	// JWKS entry turns every token check into a CPU burn no honest key
+	// justifies. 8192 is far above every modulus a real IdP publishes.
+	maxRSABits = 8192
+
+	// jwksMinRefetchInterval is the minimum time between two JWKS fetches,
+	// shared by every connection using one client. It is the negative cache
+	// for the unknown-kid refetch: within the interval, a kid the cache does
+	// not know is refused from memory, not chased to the network. Rotation
+	// therefore propagates within a minute of the IdP publishing it, and an
+	// attacker spraying invented kids cannot buy more than one fetch per
+	// interval no matter how many requests they send.
+	jwksMinRefetchInterval = 30 * time.Second
 )
 
 // cachedKey is one JWK in the form verification needs: the public key, plus
@@ -89,13 +109,30 @@ type cachedKey struct {
 }
 
 // jwksCache is the key set of one jwks_uri: fetched, parsed, and cached by
-// kid. Build one with newJWKSCache; jwt-validation owns the refetch policy.
+// kid. Build one with newJWKSCache; the request path refetches only through
+// refetch, which owns the fetch throttling. fetch is the raw primitive
+// underneath it.
 type jwksCache struct {
 	uri    *url.URL
 	client *http.Client
 
 	mu   sync.Mutex
 	keys map[string]cachedKey
+
+	// The refetch bookkeeping, guarded by mu. fetching/fetchDone are the
+	// singleflight: at most one fetch runs at a time, and a caller arriving
+	// during it waits on fetchDone instead of starting a second fetch.
+	// lastFetch is when the last fetch ATTEMPT finished (successful or not --
+	// the comment on refetch says why attempts, not successes, count).
+	// lastErr is that attempt's error, the result the waiters share.
+	//
+	// minRefetchInterval is jwksMinRefetchInterval in production; it is a
+	// field only so the tests can shrink it instead of sleeping 30s.
+	minRefetchInterval time.Duration
+	fetching           bool
+	fetchDone          chan struct{}
+	lastFetch          time.Time
+	lastErr            error
 }
 
 func newJWKSCache(uri *url.URL) *jwksCache {
@@ -111,7 +148,8 @@ func newJWKSCache(uri *url.URL) *jwksCache {
 				return http.ErrUseLastResponse
 			},
 		},
-		keys: map[string]cachedKey{},
+		keys:               map[string]cachedKey{},
+		minRefetchInterval: jwksMinRefetchInterval,
 	}
 }
 
@@ -134,10 +172,81 @@ func (c *jwksCache) byKid(kid string) (cachedKey, bool) {
 	return cachedKey{}, false
 }
 
+// refetch is the only fetch entry point the request path may use: it is what
+// runs when a token names a kid the cache does not know, and it exists
+// because that kid is attacker-chosen. An unguarded fetch here would let one
+// invented kid per request buy one network round trip to the jwks_uri's host
+// -- an amplification the issuer's infrastructure pays for, aimed by whoever
+// can reach the protected endpoint. Two bounds close it:
+//
+//   - singleflight: while one fetch is in flight, every other misser waits on
+//     it and shares its result, so a burst of misses costs one fetch, not one
+//     fetch per request;
+//   - the minimum interval: a refetch arriving less than minRefetchInterval
+//     after the last attempt is refused without touching the network. The
+//     interval is per-cache, and one policy has one cache, so the bound is
+//     global across every connection: unknown-kid refetches happen at most
+//     once per interval, no matter how the misses are spread over requests.
+//
+// The interval is measured from the last ATTEMPT, not the last success,
+// deliberately: a client that only recorded successes would hand the
+// attacker the case where the fetch fails (an IdP outage, or their own
+// hostile endpoint failing on demand) -- failures would leave the clock
+// untouched, and one bounded GET per request would be for sale again.
+// Recording attempts shifts the cost to honest rotation: a key published
+// seconds after a failed fetch waits out the interval like everything else.
+// That is the fail-closed direction, and the same one the request itself
+// takes: a kid that cannot be confirmed is a 401, never a wait.
+//
+// The mutex is held for the bookkeeping, never for the network: byKid shares
+// this lock, and cache hits must not queue behind the one request that
+// missed.
+func (c *jwksCache) refetch() error {
+	c.mu.Lock()
+	if c.fetching {
+		done := c.fetchDone
+		c.mu.Unlock()
+		<-done
+
+		// Share the result. The attempt that just finished recorded lastErr
+		// under the mutex before closing done, and no new fetch can start
+		// within the interval of it, so what is read here is the fetch this
+		// goroutine waited on. (A waiter starved long enough to read a newer
+		// attempt's result has still only shared a real result of this
+		// client -- no fetch was spent.)
+		c.mu.Lock()
+		err := c.lastErr
+		c.mu.Unlock()
+		return err
+	}
+	if !c.lastFetch.IsZero() && time.Since(c.lastFetch) < c.minRefetchInterval {
+		ago := time.Since(c.lastFetch).Round(time.Second)
+		c.mu.Unlock()
+		return fmt.Errorf("the JWKS was fetched %s ago; a key it does not name is refused without another fetch (the minimum between fetches is %s)", ago, c.minRefetchInterval)
+	}
+
+	c.fetching = true
+	done := make(chan struct{})
+	c.fetchDone = done
+	c.mu.Unlock()
+
+	err := c.fetch()
+
+	c.mu.Lock()
+	c.lastFetch = time.Now()
+	c.lastErr = err
+	c.fetching = false
+	c.mu.Unlock()
+	close(done)
+	return err
+}
+
 // fetch gets the document, parses it, and -- only if every key in it parsed --
 // replaces the cache with it. A failed fetch leaves the old cache standing:
 // the request that triggered it is refused by its caller, but the keys the
 // issuer published yesterday keep verifying the requests that still use them.
+// This is the raw primitive: unbounded by any refetch policy, so callers on
+// the request path must go through refetch instead.
 func (c *jwksCache) fetch() error {
 	resp, err := c.client.Get(c.uri.String())
 	if err != nil {
@@ -232,6 +341,9 @@ func (j jwk) publicKey() (crypto.PublicKey, error) {
 		}
 		if n.BitLen() < minRSABits {
 			return nil, fmt.Errorf("the RSA key is %d bits; fewer than %d is refused", n.BitLen(), minRSABits)
+		}
+		if n.BitLen() > maxRSABits {
+			return nil, fmt.Errorf("the RSA key is %d bits; more than %d is refused (verification cost grows with the modulus, and no real issuer signs with a key this large)", n.BitLen(), maxRSABits)
 		}
 		return &rsa.PublicKey{N: n, E: int(e.Int64())}, nil
 

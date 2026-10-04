@@ -4,12 +4,12 @@ package server
 //
 // Two of the three phases are reachable from the server and each has its own
 // entry point, so both are driven end to end over real loopback TCP:
-// on_tcp_connect runs in httpHandler and in listenTcp, before the endpoint is
-// handed a proxy connection at all, and on_http_request / on_http_response run
-// inside the rewriter pair Tunnel.join installs. The agent's end of every
-// connection is a TCP pair the test drives itself, so "the request never
-// reached the agent" is an assertion about bytes rather than about a mock
-// call.
+// on_tcp_connect runs in the http handler's routing half (routeHTTP, behind
+// httpHandler) and in listenTcp, before the endpoint is handed a proxy
+// connection at all, and on_http_request / on_http_response run inside the
+// rewriter pair Tunnel.join installs. The agent's end of every connection is
+// a TCP pair the test drives itself, so "the request never reached the
+// agent" is an assertion about bytes rather than about a mock call.
 //
 // The fixtures (setupTestRegistry, testControl, registerTestTunnel, tcpPair,
 // armProxyPool, dispatch) come from registry_v2_test.go: real loopback

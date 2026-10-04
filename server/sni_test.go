@@ -27,11 +27,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"ngrok/conn"
+	"ngrok/log"
 	"ngrok/msg"
 	"ngrok/policy"
 )
@@ -675,6 +678,137 @@ func TestSNIAgentTerminatedWithPolicyStaysRaw(t *testing.T) {
 	}
 	if !bytes.Equal(got, hello) {
 		t.Fatal("a policy-carrying agent tunnel must still pass the stream through untouched")
+	}
+}
+
+// TestSNIRefusedBeforePeekWhenLimiterExhausted pins the gate-before-peek
+// order on the https listener: a source IP that is over its rate budget is
+// turned away BEFORE the server reads one byte of its ClientHello. The
+// assertions are about what the server did NOT do: no "Found SNI" line, the
+// client's SNI name appears nowhere in the log, and the only answer is the
+// admission BadRequest -- no TLS handshake, no routing, no agent.
+func TestSNIRefusedBeforePeekWhenLimiterExhausted(t *testing.T) {
+	// The window's one allow is spent BEFORE the connection arrives, so the
+	// refusal is certain to fire regardless of how many connections other
+	// tests admitted (the limiter is keyed per window, and this test's IP is
+	// 127.0.0.1 for every one of them).
+	prevPublicLimiter := publicLimiter
+	publicLimiter = newIPRateLimiter(1, time.Second)
+	t.Cleanup(func() { publicLimiter = prevPublicLimiter })
+	publicLimiter.allow("127.0.0.1")
+
+	logFile := filepath.Join(t.TempDir(), "server.log")
+	log.LogTo(logFile, "DEBUG", "text")
+
+	setupTestRegistry(t)
+	ctl := testControl(t, "")
+	registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoHTTPS, Hostname: "agent.test"})
+	agentConn := armHTTPAgent(t, ctl)
+
+	hello := captureClientHello(t, tlsClientConfig("peeked.test"))
+	publicClient := startHTTPSHandler(t, testTLSConfig(t))
+	if _, err := publicClient.Write(hello); err != nil {
+		t.Fatalf("failed to write the ClientHello: %v", err)
+	}
+
+	if err := publicClient.SetReadDeadline(time.Now().Add(publicTimeout)); err != nil {
+		t.Fatalf("failed to set a read deadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(publicClient), nil)
+	if err != nil {
+		t.Fatalf("no response from the admission gate: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status %d, want the admission gate's 400", resp.StatusCode)
+	}
+
+	// Flush the log, then check what the server did NOT do: the SNI was
+	// never peeked, never parsed, never routed -- no line names it. The
+	// handler logs on its own goroutine, so absence is only believable
+	// after a window in which a guilty ordering (gate fires, peek runs
+	// anyway, logs "Found SNI" microseconds behind the 400) would have
+	// written its evidence.
+	const marker = "pre-peek-refusal-marker"
+	log.Info(marker)
+	content := waitForFileMarker(t, logFile, marker)
+	absenceDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(absenceDeadline) {
+		if strings.Contains(content, "peeked.test") {
+			break // guilty: stop waiting, the assertions below name it
+		}
+		time.Sleep(25 * time.Millisecond)
+		if b, err := os.ReadFile(logFile); err == nil {
+			content = string(b)
+		}
+	}
+	if strings.Contains(content, "Found SNI") {
+		t.Fatalf("the SNI peek ran on a rate-refused connection:\n%s", content)
+	}
+	if strings.Contains(content, "peeked.test") {
+		t.Fatalf("the refused connection's SNI reached the log:\n%s", content)
+	}
+
+	// And nothing was dispatched: the agent never saw a StartProxy.
+	if err := agentConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("failed to set a read deadline: %v", err)
+	}
+	one := make([]byte, 1)
+	if n, err := agentConn.Read(one); n > 0 || err == nil {
+		t.Fatal("a rate-refused https connection must not reach an agent")
+	}
+}
+
+// TestSNILogDoesNotForgeLines is the %q discipline: the SNI hostname is
+// peer-controlled bytes and may carry newlines, control characters and ANSI
+// escapes, so every log line that names it must render it escaped (%q), not
+// raw (%s) -- a raw %s lets a crafted ClientHello write log lines nobody
+// sent, e.g. a fake "X-Forged: 1" on its own line.
+func TestSNILogDoesNotForgeLines(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "server.log")
+	log.LogTo(logFile, "DEBUG", "text")
+
+	setupTestRegistry(t) // no tunnels: the SNI must 404 by SNI-miss
+
+	forged := "evil.test\nX-Forged: 1"
+	hello := buildClientHello(t, forged, 0, nil)
+	publicClient := startHTTPSHandler(t, testTLSConfig(t))
+	if _, err := publicClient.Write(hello); err != nil {
+		t.Fatalf("failed to write the ClientHello: %v", err)
+	}
+
+	const marker = "sni-escape-marker"
+	log.Info(marker)
+
+	// The handler logs on its own goroutine, and the file writer is async,
+	// so poll until the name has landed in the file -- whichever spelling.
+	// Once it is there, everything in its line is there with it; the second
+	// half of the write-then-marker trick is folded into the poll.
+	content := ""
+	deadline := time.Now().Add(publicTimeout)
+	for {
+		content = waitForFileMarker(t, logFile, marker)
+		if strings.Contains(content, "evil.test") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the SNI was never logged:\n%s", content)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The name was logged, escaped (and lower-cased, as the registry spells
+	// hostnames): the two-byte sequence backslash-n, not a newline byte.
+	if !strings.Contains(content, `evil.test\nx-forged: 1`) {
+		t.Fatalf("the SNI was not logged in its escaped (%%q) form:\n%s", content)
+	}
+	// And no line was forged: no real line in the log starts with the
+	// injected header (the name is lower-cased in the log, so check both
+	// spellings).
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "X-Forged:") || strings.HasPrefix(line, "x-forged:") {
+			t.Fatalf("a crafted ClientHello forged the log line %q:\n%s", line, content)
+		}
 	}
 }
 

@@ -207,12 +207,26 @@ func newHTTPDestination(c eventDestinationConfig, hub *eventHub) (*httpDestinati
 	}
 
 	d := &httpDestination{
-		url:         c.URL,
-		batchSize:   batchSize,
-		flushEvery:  flushEvery,
-		retryStart:  eventRetryBackoffStart,
-		retryMax:    eventRetryBackoffMax,
-		client:      &http.Client{Timeout: defaultEventHTTPTimeout},
+		url:        c.URL,
+		batchSize:  batchSize,
+		flushEvery: flushEvery,
+		retryStart: eventRetryBackoffStart,
+		retryMax:   eventRetryBackoffMax,
+		client: &http.Client{
+			Timeout: defaultEventHTTPTimeout,
+			// Redirects are REFUSED, not just ignored: the auth header may
+			// carry a vault-sourced credential, and http.Client's default
+			// (follow up to 10 hops, replaying the request headers) would
+			// deliver that credential to whatever origin the collector (or
+			// an attacker who took it over) redirects to -- a second origin
+			// this configuration never chose. Returning an error (not
+			// http.ErrUseLastResponse) makes the POST itself fail, so the
+			// batch retries against the ORIGINAL url and the misdirection
+			// shows up as delivery failures instead of a silent leak.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return fmt.Errorf("event destination refuses redirects: its auth credential must not leave for %s", req.URL)
+			},
+		},
 		sub:         hub.subscribeBuffered(eventExportQueueCap),
 		hub:         hub,
 		failSampler: newLogSampler(30 * time.Second),
@@ -232,6 +246,16 @@ func newHTTPDestination(c eventDestinationConfig, hub *eventHub) (*httpDestinati
 		if err != nil {
 			d.stop()
 			return nil, fmt.Errorf("event destination %s: auth_header: %v", c.Type, err)
+		}
+		// Post-resolution CR/LF check, mirroring policy's credentialList
+		// discipline: validateAuthHeader saw the RAW reference (the vault
+		// set is not installed at config-load time), so a vault value with
+		// embedded CR/LF would reach the header write path unchallenged --
+		// header injection through a credential nobody hand-wrote. Refused
+		// loudly at construction, naming the destination.
+		if strings.ContainsAny(resolved, "\r\n") {
+			d.stop()
+			return nil, fmt.Errorf("event destination %s: auth_header: the resolved value contains a CR or LF, which no credential should carry (header injection)", d.url)
 		}
 		d.headerValue = resolved
 	}

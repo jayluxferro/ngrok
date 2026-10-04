@@ -54,6 +54,25 @@ type portClaim struct {
 	refs  int
 }
 
+// privilegedPortMax is the kernel's privileged range boundary: a remote port
+// below it only binds for a process with the privilege to bind it. A claim on
+// one is ALLOWED (this registry owns claims, not binds) but warned: the bind
+// at the end of the registration will fail with EACCES for an unprivileged
+// ngrokd, and without the warn that failure class surfaces as a mystery
+// "cannot bind" at tunnel-registration time instead of a named cause here.
+const privilegedPortMax = 1024
+
+// warnPrivilegedPort logs the warn for a claim the registry is about to
+// allow. It runs on every allowed claim path (fresh and reclaim) so a
+// reconnect onto a privileged port re-states the problem instead of hiding
+// behind the first warn from hours ago. Claims are rare (once per tunnel
+// registration), so the volume is irrelevant.
+func warnPrivilegedPort(proto string, port int) {
+	if port > 0 && port < privilegedPortMax {
+		log.Warn("Remote %s port %d is privileged (< %d): the public bind will fail with EACCES unless ngrokd runs with the privilege to bind it", proto, port, privilegedPortMax)
+	}
+}
+
 // portClaimRegistry maps a (protocol, port) pair to its claim. One mutex
 // guards the whole map: the operations are single map lookups (claim,
 // release), so a per-port lock would buy nothing and the registry lock keeps
@@ -113,10 +132,12 @@ func (p *portClaimRegistry) Claim(proto string, port int, owner string) error {
 		// dropped and re-created, so there is no instant at which the port
 		// looks free.
 		held.refs++
+		warnPrivilegedPort(proto, port)
 		return nil
 	}
 
 	p.claims[key] = &portClaim{owner: owner, refs: 1}
+	warnPrivilegedPort(proto, port)
 	return nil
 }
 

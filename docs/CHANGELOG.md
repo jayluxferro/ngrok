@@ -1,4 +1,97 @@
 # Changelog
+## 1.0.12 - 2026-10-04 - Adversarial audit round: hardening
+
+A four-stream adversarial audit (code correctness, security, QA coverage,
+wire/API consistency) over everything 1.0.7-1.0.11 shipped, run the way the
+1.0.6 round was: fresh eyes, concrete failure scenarios, every finding fixed
+down to MINOR. Zero criticals, ten majors, ~25 minors; this release is the
+fixes.
+
+### Server
+
+- **UDP admission moved before allocation.** Rate limit, per-IP cap, a new
+  per-tunnel flow cap (256) and a global flow cap (65536) now run before a
+  flow, goroutine, or proxy connection exists; a refused datagram creates
+  nothing. Idle refresh is inbound-and-accepted-only: only public-client
+  datagrams that actually enter the (16-deep) queue sustain a flow, so a
+  spoofed-source flow gets its one query and dies, and a client shouting
+  into a stalled agent's full queue pins nothing. Flow-cap drops publish
+  connection_cap_drop events and a counter.
+- **The https listener gates before the SNI peek.** Over-budget IPs are
+  turned away without the server reading one byte of ClientHello or logging
+  an SNI line, and each connection passes each gate exactly once across the
+  edge/passthrough routes.
+- **A regression the audit's own e2e caught, fixed before release: the
+  terminated-https path lost its TLS close_notify** when the gates/handler
+  split moved connection ownership -- the raw socket closed under the TLS
+  layer and careful clients (openssl among them) read an unexpected EOF
+  after the last response. terminateWithServerCert now closes the TLS layer
+  it owns; a test pins clean EOF.
+- QUIC pre-auth sessions are capped (256) with a sampled refusal;
+  event-export HTTP destinations refuse redirects (a credential must never
+  leave for a second origin) and refuse CR/LF in vault-resolved header
+  values; privileged-port claims warn by name; SNI bytes log as %q so a
+  crafted ClientHello cannot forge log lines.
+
+### Policy
+
+- **JWKS fetches are throttled.** An unknown kid costs at most one fetch per
+  30s window per cache, shared across concurrent requests (singleflight);
+  spraying invented kids no longer turns the edge into a TLS-handshake
+  client aimed at the IdP. jwks_uri must be https (loopback exempt); RSA
+  moduli are capped at 8192 bits; tokens must carry exp.
+- **Vault errors no longer enumerate inventory.** Registration failures say
+  exactly `no vault named X is configured` / `vault X has no key Y` -- never
+  the list of configured vaults or keys, which was a directory listing aimed
+  at any authenticated agent. Pre-digested vault entries now work in
+  basic-auth (the separator check cannot apply to a digest and no longer
+  pretends to).
+
+### Client
+
+- `proto: {http+https: ...}` tunnels get their name-derived subdomain back
+  (a 1.0.10 regression the wire audit caught: the guard exact-matched the
+  combined key).
+- `-proto=tcp/-proto=udp -hostname=.../-subdomain=...` is now refused at
+  startup on the flags path exactly as the config path always did, instead
+  of silently discarding the name.
+- An unrecognized `-log-level` is a startup error naming the accepted set
+  {DEBUG, INFO, WARNING, ERROR}; it used to fall back to DEBUG in silence.
+  The previously-undocumented TRACE/FINEST/FINE/CRITICAL spellings now
+  error too.
+
+### Both / tests
+
+- The QA stream's coverage gaps are closed with tests that pin mechanism:
+  on_tcp_connect deny on the passthrough path never reaches the agent; the
+  QUIC dial clones (never aliases) the model's TLS config and rejects
+  untrusted certificates; a stalled UDP flow does not starve a healthy one;
+  a vault-resolved auth_header reaches the collector and a dangling
+  reference fails naming vault and key; SNI routing is case-insensitive;
+  the ClientHello length parser's bit-2 precedence, digest storage in
+  compiled actions, and the allocs-per-connection floor comparison (the
+  flaky -count=2 measurement is now a min-of-N floor estimate -- the
+  deterministic saving exists only in the warm-pool regime, which a forced
+  GC between measurements destroys rather than controls).
+- Docs: the 1.0.9 changelog header is restored; the stale vault-wiring
+  comment is gone; README's -log default, -log-level spelling, framing
+  description and -adminAddr default now match the code.
+
+### Known limitations
+
+- Vault scoping is server-wide: any authenticated token may reference any
+  vault entry, and an operator who binds a vault secret into an endpoint
+  they control can probe it at that endpoint's request rate. Multi-tenant
+  deployments should treat vaults as single-trust. Per-tenant vault ACLs
+  are future work.
+- The UDP flow caps and JWKS refetch interval are constants, not
+  configuration; if deployment reality needs them tunable, the changelog
+  will say so when it happens.
+- The reflector posture of a public UDP forwarder is unchanged and
+  documented in 1.0.10; this release bounds the amplification economics
+  (gates before allocation, accepted-only refresh) without changing what a
+  cooperating backend can answer.
+
 ## 1.0.11 - 2026-10-04 - Secret vaults and event export
 
 Two features for running this fork in production rather than in demos:
@@ -322,6 +415,8 @@ that does not actually need UDP.
   a refusal is silence (see above) -- an operator debugging "why does no one
   hear me" should check the server log for "Traffic policy refused the flow"
   before checking anything else.
+
+## 1.0.9 - 2026-10-04 - QUIC agent transport + pooled rewriter buffers
 
 Two throughput changes with the same target: the cost of moving many streams
 through one tunnel. QUIC becomes an alternative carrier for the multiplexed

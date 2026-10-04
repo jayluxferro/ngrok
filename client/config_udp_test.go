@@ -254,6 +254,10 @@ func TestPortRoutedTunnelsGetNoAutoSubdomain(t *testing.T) {
 		{"tcp only", map[string]string{"tcp": "127.0.0.1:12222"}, "sshtunnel", false},
 		{"http only", map[string]string{"http": "127.0.0.1:18080"}, "webapp", true},
 		{"mixed http tcp", map[string]string{"http": "127.0.0.1:18081", "tcp": "127.0.0.1:12223"}, "mixed", true},
+		// "http+https" is a single map key, not two: the name-routing check
+		// must split it (the exact-match version missed it and silently
+		// skipped the assignment for this exact config shape).
+		{"combined http+https key", map[string]string{"http+https": "127.0.0.1:18082"}, "combo", true},
 	}
 
 	for _, tc := range cases {

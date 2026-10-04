@@ -598,67 +598,246 @@ func TestUdpFlowIdleExpiry(t *testing.T) {
 	waitFlowCount(t, tun, 1, "the replacement flow was never established")
 }
 
-// TestUdpFlowIdleDeadlineRefreshesOnBothDirections covers the other half of
-// the idle contract: activity in EITHER direction pushes the deadline out, so
-// a flow carrying a long-lived exchange is not reaped mid-conversation.
-func TestUdpFlowIdleDeadlineRefreshesOnBothDirections(t *testing.T) {
+// TestUdpFlowIdleRefreshIsInboundOnly covers the idle contract AFTER the
+// hardening: ONLY datagrams from the public client refresh the deadline.
+// Client traffic sustains a flow indefinitely; agent (reply) traffic does not
+// -- a flow whose "client" is a spoofed source gets its one query answered
+// and then idles out with no way to keep it alive through replies.
+func TestUdpFlowIdleRefreshIsInboundOnly(t *testing.T) {
 	setUdpIdleTimeout(t, 400*time.Millisecond)
 
-	for _, tc := range []struct {
-		name    string
-		refresh func(t *testing.T, tun *Tunnel, client *net.UDPConn, agent conn.Conn)
-	}{
-		{
-			name: "public to agent",
-			refresh: func(t *testing.T, tun *Tunnel, client *net.UDPConn, agent conn.Conn) {
-				deadline := time.Now().Add(2 * udpIdleTimeout())
-				for time.Now().Before(deadline) {
-					sendTo(t, client, tun, []byte("keepalive"))
-					time.Sleep(udpIdleTimeout() / 4)
-				}
-			},
-		},
-		{
-			name: "agent to public",
-			refresh: func(t *testing.T, tun *Tunnel, client *net.UDPConn, agent conn.Conn) {
-				deadline := time.Now().Add(2 * udpIdleTimeout())
-				scratch := make([]byte, udpFrameLenBytes+16)
-				for time.Now().Before(deadline) {
-					if err := writeFramedDatagram(agent, []byte("keepalive"), scratch); err != nil {
-						t.Fatalf("failed to write to the agent conn: %v", err)
-					}
-					time.Sleep(udpIdleTimeout() / 4)
-				}
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			setupTestRegistry(t)
-			ctl := testControl(t, "")
-			agent := armProxyPool(t, ctl)
-			tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
-			client := udpClient(t)
+	t.Run("client datagrams sustain the flow", func(t *testing.T) {
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		agent := armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+		client := udpClient(t)
 
-			sendTo(t, client, tun, []byte("start"))
-			readStartProxy(t, agent, "the agent")
-			waitFlowCount(t, tun, 1, "the flow was never established")
+		sendTo(t, client, tun, []byte("start"))
+		readStartProxy(t, agent, "the agent")
+		waitFlowCount(t, tun, 1, "the flow was never established")
 
-			// Keep exactly one direction busy for twice the idle timeout: a
-			// deadline that only one direction refreshed would have reaped
-			// this flow long ago.
-			tc.refresh(t, tun, client, agent)
+		// Keep the INBOUND direction busy for twice the idle timeout: each
+		// datagram enters the queue and pushes the deadline out, so the flow
+		// survives far past what one deadline window would allow.
+		deadline := time.Now().Add(2 * udpIdleTimeout())
+		for time.Now().Before(deadline) {
+			sendTo(t, client, tun, []byte("keepalive"))
+			time.Sleep(udpIdleTimeout() / 4)
+		}
 
-			if got := flowCount(tun); got != 1 {
-				t.Fatalf("an actively refreshed flow was reaped: %d flows remain", got)
+		if got := flowCount(tun); got != 1 {
+			t.Fatalf("a client-refreshed flow was reaped: %d flows remain", got)
+		}
+
+		// And the flow still works after all that activity. Earlier
+		// datagrams of the same flow may still be queued on the agent
+		// conn, so read until the marker arrives.
+		sendTo(t, client, tun, []byte("still-here"))
+		readFramedUntil(t, agent, []byte("still-here"), "the refreshed flow")
+	})
+
+	t.Run("agent datagrams do not sustain the flow", func(t *testing.T) {
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		agent := armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+		client := udpClient(t)
+
+		sendTo(t, client, tun, []byte("start"))
+		readStartProxy(t, agent, "the agent")
+		waitFlowCount(t, tun, 1, "the flow was never established")
+
+		// Keep the OUTBOUND direction busy for well past the idle timeout,
+		// with the public client completely silent. The writes tolerate
+		// errors on purpose: once the flow expires (which is the assertion),
+		// its close kills the proxy conn and the keepalive writes fail --
+		// that failure is the flow's death observed from the agent side, not
+		// a test failure. In the old both-directions behavior this loop kept
+		// the flow alive forever; now the flow must die underneath it.
+		deadline := time.Now().Add(2 * udpIdleTimeout())
+		scratch := make([]byte, udpFrameLenBytes+16)
+		for time.Now().Before(deadline) {
+			if err := writeFramedDatagram(agent, []byte("keepalive"), scratch); err != nil {
+				break // the flow's conn closed: it expired as it must
 			}
+			time.Sleep(udpIdleTimeout() / 4)
+		}
 
-			// And the flow still works after all that activity. Earlier
-			// datagrams of the same flow may still be queued on the agent
-			// conn, so read until the marker arrives.
-			sendTo(t, client, tun, []byte("still-here"))
-			readFramedUntil(t, agent, []byte("still-here"), "the refreshed flow")
+		if got := flowCount(tun); got != 0 {
+			t.Fatalf("a flow with only agent activity was kept alive: %d flow(s) remain -- outbound traffic must not refresh", got)
+		}
+	})
+}
+
+// TestUdpDeniedDatagramCreatesNothing pins the gate-before-flow order: a
+// datagram whose source fails an admission gate (rate limit or connection
+// cap) is dropped with NO flow entry, NO establishment (nothing reaches the
+// agent -- no StartProxy, so no proxy conn was taken) and NO reply. The old
+// order created the flow + goroutine first and admitted it after; the whole
+// point of the move is that a denied datagram costs nothing.
+func TestUdpDeniedDatagramCreatesNothing(t *testing.T) {
+	t.Run("rate limiter refuses before any flow exists", func(t *testing.T) {
+		prevPublicLimiter := publicLimiter
+		publicLimiter = newIPRateLimiter(1, time.Second)
+		t.Cleanup(func() { publicLimiter = prevPublicLimiter })
+		publicLimiter.allow("127.0.0.1") // burn the window's only allow BEFORE the datagram
+
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		armed := armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+
+		client := udpClient(t)
+		sendTo(t, client, tun, []byte("denied"))
+
+		expectNoBytes(t, armed, "the armed agent") // no StartProxy: no proxy conn taken
+		expectSilence(t, client, "the refused caller")
+		waitFlowCount(t, tun, 0, "a denied datagram must not create a flow entry")
+	})
+
+	t.Run("connection cap held externally refuses before any flow exists", func(t *testing.T) {
+		prevConnLimiter := connLimiter
+		connLimiter = newIPConnLimiter(1)
+		t.Cleanup(func() { connLimiter = prevConnLimiter })
+		if !connLimiter.acquire("127.0.0.1") { // the cap is spent by SOMEONE ELSE before we arrive
+			t.Fatal("failed to pre-hold the test cap slot")
+		}
+
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		armed := armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+
+		client := udpClient(t)
+		sendTo(t, client, tun, []byte("denied"))
+
+		expectNoBytes(t, armed, "the armed agent")
+		expectSilence(t, client, "the capped caller")
+		waitFlowCount(t, tun, 0, "a capped datagram must not create a flow entry")
+	})
+}
+
+// TestUdpFlowCaps covers the two flow caps added with gate-before-flow: the
+// per-tunnel cap and the process-wide cap. Both refuse to CREATE a flow
+// (existing flows keep relaying), publish the connection-cap event, count the
+// drop, and recover the moment capacity frees up. The caps' live values are
+// atomics seeded from their constants (same test precedent as the idle
+// timeout): 1024/16384 real flows would need thousands of real sockets.
+func TestUdpFlowCaps(t *testing.T) {
+	setCap := func(t *testing.T, perTunnel, global int64) {
+		t.Helper()
+		prevTunnel, prevGlobal := udpMaxTunnelFlows.Load(), maxUdpFlows.Load()
+		t.Cleanup(func() {
+			udpMaxTunnelFlows.Store(prevTunnel)
+			maxUdpFlows.Store(prevGlobal)
 		})
+		udpMaxTunnelFlows.Store(perTunnel)
+		maxUdpFlows.Store(global)
 	}
+
+	t.Run("per-tunnel cap: over-cap drops, under-cap works", func(t *testing.T) {
+		setCap(t, 2, defaultMaxUdpFlows)
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		agentA, agentB, agentC := armProxyPool(t, ctl), armProxyPool(t, ctl), armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+
+		a, b, c := udpClient(t), udpClient(t), udpClient(t)
+		sendTo(t, a, tun, []byte("one"))
+		sendTo(t, b, tun, []byte("two"))
+		readStartProxy(t, agentA, "agent A")
+		readStartProxy(t, agentB, "agent B")
+		waitFlowCount(t, tun, 2, "the two admitted flows were never established")
+
+		// The third client is over the cap: dropped at the gate -- no third
+		// StartProxy, no third flow -- and the drop is counted. The drop
+		// happens on the reader goroutine, asynchronously to the send, so
+		// the assertions poll until the counter moves and then check the
+		// table never grew.
+		before := udpFlowCapDrops.Load()
+		sendTo(t, c, tun, []byte("three"))
+		waitFor(t, "the over-cap drop to be counted", func() bool {
+			return udpFlowCapDrops.Load() >= before+1
+		})
+		expectNoBytes(t, agentC, "the third agent")
+		waitFlowCount(t, tun, 2, "the over-cap flow must not be created")
+
+		// Capacity frees: closing flow A's conn ends that flow; a fresh
+		// datagram from c is admitted again.
+		if err := agentA.Close(); err != nil {
+			t.Fatalf("failed to close agent A's conn: %v", err)
+		}
+		waitFlowCount(t, tun, 1, "flow A was never reaped after its conn died")
+		sendTo(t, c, tun, []byte("three-again"))
+		readStartProxy(t, agentC, "agent C")
+		waitFlowCount(t, tun, 2, "an under-cap flow must be admitted after the cap freed")
+	})
+
+	t.Run("global cap: over-cap drops, under-cap works", func(t *testing.T) {
+		// The global counter is process-wide (other tests' live flows count
+		// too), so allow exactly ONE MORE flow from here: deterministic
+		// regardless of leftovers.
+		setCap(t, maxFlowsPerUdpTunnel, liveUdpFlows.Load()+1)
+		setupTestRegistry(t)
+		ctl := testControl(t, "")
+		armed := armProxyPool(t, ctl)
+		tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+
+		first, second := udpClient(t), udpClient(t)
+		sendTo(t, first, tun, []byte("in"))
+		readStartProxy(t, armed, "the agent")
+		waitFlowCount(t, tun, 1, "the last globally-admitted flow was never established")
+
+		before := udpFlowCapDrops.Load()
+		sendTo(t, second, tun, []byte("out"))
+		waitFor(t, "the global over-cap drop to be counted", func() bool {
+			return udpFlowCapDrops.Load() >= before+1
+		})
+		waitFlowCount(t, tun, 1, "the over-cap (global) flow must not be created")
+
+		// The live flow is undisturbed by the refusal...
+		sendTo(t, first, tun, []byte("still-relaying"))
+		readFramedUntil(t, armed, []byte("still-relaying"), "the live flow")
+	})
+}
+
+// TestUdpFullQueueDoesNotSustainFlow is the accepted-ONLY refresh rule: a
+// client that keeps shouting into a flow whose agent leg is stalled (queue
+// full, every datagram dropped) must NOT keep that flow alive. The flow still
+// expires at the idle timeout -- its limiter slot, goroutines and proxy conn
+// with it -- despite the flood of inbound attempts.
+func TestUdpFullQueueDoesNotSustainFlow(t *testing.T) {
+	setUdpIdleTimeout(t, 400*time.Millisecond)
+
+	setupTestRegistry(t)
+	ctl := testControl(t, "")
+	agent := armProxyPool(t, ctl)
+	tun := registerTestTunnel(t, ctl, msg.ReqTunnel{Protocol: msg.ProtoUDP})
+	client := udpClient(t)
+
+	sendTo(t, client, tun, []byte("start"))
+	readStartProxy(t, agent, "the agent")
+	waitFlowCount(t, tun, 1, "the flow was never established")
+
+	// Stall the agent leg by never reading its conn, then flood: 1 KiB
+	// datagrams fill the kernel buffers and the 16-slot queue within the
+	// first moments, after which every send takes the drop branch and refreshes
+	// nothing. The flood runs well past one idle window so the flow's death
+	// cannot be explained by "the client simply stopped".
+	floodDeadline := time.Now().Add(3 * udpIdleTimeout())
+	payload := make([]byte, 1024)
+	sent := 0
+	for time.Now().Before(floodDeadline) {
+		sendTo(t, client, tun, payload)
+		sent++
+		time.Sleep(time.Millisecond)
+	}
+	if sent < 500 {
+		t.Fatalf("flood only sent %d datagrams; the scenario never saturated the queue", sent)
+	}
+
+	waitFlowCount(t, tun, 0, "a flow shouted at through a full queue must still expire")
 }
 
 // TestUdpShutdownTearsDownFlows pins the no-leaks gate (SPEC §5-4): a tunnel

@@ -29,8 +29,13 @@ func Main() {
 		os.Exit(1)
 	}
 
-	// set up logging
-	log.LogTo(opts.logto, opts.loglevel, opts.logformat)
+	// set up logging. An unrecognized -log-level is a startup error, not a
+	// silent fall-back to DEBUG (see log.LogTo): a level the operator did not
+	// ask for must stop the process here, where it can be read.
+	if err := log.LogTo(opts.logto, opts.loglevel, opts.logformat); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 
 	// read configuration file
 	config, err := LoadConfiguration(opts)

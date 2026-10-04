@@ -67,8 +67,13 @@ const (
 	// keepalive is load-bearing: it is what turns a server that vanished
 	// silently into a dead session -- and therefore into a reconnected one --
 	// without waiting for the next proxy stream to be attempted.
-	carrierKeepAlivePeriod = 10 * time.Second
-	carrierMaxIdleTimeout  = 30 * time.Second
+	//
+	// Both are spellings of the shared timing vocabulary (msg.CarrierKeepAlive,
+	// msg.CarrierIdleTimeout), not local policy: the server side keeps its half
+	// of the agreement on the same clock. The values are pinned against that
+	// vocabulary by TestCarrierTimeoutsUseSharedVocabulary.
+	carrierKeepAlivePeriod = msg.CarrierKeepAlive
+	carrierMaxIdleTimeout  = msg.CarrierIdleTimeout
 
 	// The names the two carriers go by in logs and tests. They are not wire
 	// values -- the server sees which transport dialed it, never this string.
@@ -114,11 +119,13 @@ var quicHandshakeTimeout = 5 * time.Second
 
 // udpIdleTimeout is how long a udp flow may sit with no traffic in either
 // direction before this end closes it (SPEC-CLUSTER8 3.2). It mirrors the
-// server's per-flow expiry (30s there) so both ends agree that a silent flow
-// has ended -- either side's expiry tears down its half, and the proxy conn
-// close propagates the same way a dropped tcp tunnel's does. Like
-// quicHandshakeTimeout it is a var only so the tests can shrink it.
-var udpIdleTimeout = 30 * time.Second
+// server's per-flow expiry so both ends agree that a silent flow has ended --
+// either side's expiry tears down its half, and the proxy conn close
+// propagates the same way a dropped tcp tunnel's does. Like
+// quicHandshakeTimeout it is a var only so the tests can shrink it; the
+// default it starts from is the shared value (msg.UdpIdleTimeout), not this
+// package's own idea of one.
+var udpIdleTimeout = msg.UdpIdleTimeout
 
 // proxyTransport is the resolved form of the config's proxy_transport key
 // (client/config.go owns the string vocabulary and its validation): which

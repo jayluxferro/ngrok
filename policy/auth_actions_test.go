@@ -325,6 +325,62 @@ func TestBasicAuthExecutes(t *testing.T) {
 	})
 }
 
+// TestCompiledBasicAuthStoresDigests pins what a compiled basic-auth rule
+// holds in place of its credentials: exactly one 64-character lowercase-hex
+// SHA-256 digest per configured credential, in config order, each equal to
+// credentialDigest of the plaintext -- and never the plaintext itself,
+// anywhere in the compiled rule. The compiled policy is the object that lives
+// for the tunnel's lifetime and is shared across connections, so this is the
+// property the file comment promises ("a heap dump of a running edge does not
+// contain the credentials"); the synthetic 401s are pinned too, because they
+// are the one other thing the compiled rule carries to the wire. Tests live in
+// package policy precisely so the unexported compiled form is assertable.
+func TestCompiledBasicAuthStoresDigests(t *testing.T) {
+	doc := reqPolicy(rule(ActionBasicAuth, nil, map[string]interface{}{
+		"credentials": []interface{}{"alice:secret", "bob:hunter2"},
+	}))
+	c, _ := compileRequest(t, doc)
+
+	if len(c.request) != 1 {
+		t.Fatalf("the policy compiled to %d request rules, want 1", len(c.request))
+	}
+	a, ok := c.request[0].auth.(*basicAuthAction)
+	if !ok {
+		t.Fatalf("the compiled rule is %T, want *basicAuthAction", c.request[0].auth)
+	}
+
+	want := []string{credentialDigest("alice:secret"), credentialDigest("bob:hunter2")}
+	if len(a.digests) != len(want) || a.digests[0] != want[0] || a.digests[1] != want[1] {
+		t.Fatalf("compiled digests = %v, want %v", a.digests, want)
+	}
+	for i, d := range a.digests {
+		if len(d) != 64 {
+			t.Errorf("digest %d is %d characters, want the 64 of a hex SHA-256", i, len(d))
+		}
+		for _, r := range d {
+			if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+				t.Errorf("digest %d carries %q, which is not lowercase hex", i, r)
+			}
+		}
+	}
+
+	// The plaintexts -- whole credentials and their halves -- appear nowhere
+	// in the digests, and nothing that goes back on the wire carries them:
+	// every synthetic response is rendered and scanned as bytes.
+	for _, secret := range []string{"alice:secret", "bob:hunter2", "alice", "bob", "secret", "hunter2"} {
+		for i, d := range a.digests {
+			if strings.Contains(d, secret) {
+				t.Errorf("digest %d contains the plaintext %q", i, secret)
+			}
+		}
+		for _, resp := range []*rewriter.SyntheticResponse{a.required, a.malformed, a.invalid} {
+			if wire := string(resp.Render()); strings.Contains(wire, secret) {
+				t.Errorf("the compiled challenge %q carries the plaintext %q", wire, secret)
+			}
+		}
+	}
+}
+
 func TestBearerAuthExecutes(t *testing.T) {
 	doc := reqPolicy(rule(ActionBearerAuth, nil, map[string]interface{}{
 		"tokens": []interface{}{"tok_abcdef", "tok_2"},

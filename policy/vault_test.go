@@ -177,13 +177,13 @@ func TestVaultResolutionErrors(t *testing.T) {
 			name:    "missing vault",
 			ref:     `secret("nowhere/k")`,
 			sources: func(t *testing.T) map[string]VaultSource { return mainVaultSources(t, nil) },
-			want:    `no vault named "nowhere" is configured (configured vaults: main)`,
+			want:    `no vault named "nowhere" is configured`,
 		},
 		{
 			name:    "missing key names vault and key",
 			ref:     `secret("main/prod-api")`,
 			sources: func(t *testing.T) map[string]VaultSource { return mainVaultSources(t, nil) },
-			want:    `vault "main" has no key "prod-api" (configured keys: alpha, digested, literal)`,
+			want:    `vault "main" has no key "prod-api"`,
 		},
 		{
 			name: "no vaults installed at all",
@@ -199,7 +199,7 @@ func TestVaultResolutionErrors(t *testing.T) {
 			sources: func(t *testing.T) map[string]VaultSource {
 				return map[string]VaultSource{"empty": {File: writeVaultFile(t, nil)}}
 			},
-			want: `vault "empty" has no key "k" (the vault is empty`,
+			want: `vault "empty" has no key "k"`,
 		},
 		{
 			name: "vault name without a key",
@@ -275,6 +275,130 @@ func TestVaultResolutionErrors(t *testing.T) {
 		}
 		if presentedAsToken(hook, "tok-alpha") {
 			t.Fatal("the value the mid-string spelling names was admitted")
+		}
+	})
+}
+
+// TestVaultErrorsDoNotEnumerateInventory pins the security property of the
+// resolution errors: they name only the vault and key the failing reference
+// itself spelled out, and nothing else about the installed set -- no vault
+// name list, no key name list, no empty-vault hint. The enumeration used to
+// be in these errors, and it was a leak: resolution also runs server-side at
+// registration, the load error travels back to the agent that submitted the
+// document, and an agent probing guesses could read the server's whole vault
+// inventory out of the refusals. So the test runs on a MANY-vault, MANY-key
+// set and asserts the uninvoled names are absent -- a single-vault setup
+// could not tell "not enumerated" from "nothing to enumerate".
+func TestVaultErrorsDoNotEnumerateInventory(t *testing.T) {
+	sources := map[string]VaultSource{
+		"alpha": {File: writeVaultFile(t, map[string]string{"alpha-k1": "v1", "alpha-k2": "v2"})},
+		"omega": {File: writeVaultFile(t, map[string]string{"omega-k1": "v3"})},
+		"empty": {File: writeVaultFile(t, nil)},
+	}
+	installVaults(t, sources)
+
+	// One reference per error shape, each paired with the inventory names the
+	// reference does NOT spell out itself. The reference's own vault and key
+	// are its words and belong in the error; everything else about the set
+	// must be absent. (This is why the banned lists differ per case: banning
+	// "alpha" on the alpha reference would outlaw the reference's own words.)
+	for _, tc := range []struct {
+		ref    string
+		banned []string
+	}{
+		{`secret("nowhere/k")`, []string{"alpha", "omega", "empty", "alpha-k1", "alpha-k2", "omega-k1", "v1", "v2", "v3"}},
+		{`secret("alpha/none")`, []string{"omega", "empty", "omega-k1", "alpha-k1", "alpha-k2", "v1", "v2", "v3"}},
+		{`secret("empty/k")`, []string{"alpha", "omega", "alpha-k1", "alpha-k2", "omega-k1", "v1", "v2", "v3"}},
+	} {
+		err := bearerDoc(tc.ref).Validate()
+		if err == nil {
+			t.Fatalf("%s resolved when it must not", tc.ref)
+		}
+		msg := err.Error()
+		for _, banned := range append([]string{
+			`configured vaults`,  // the old vault-name list
+			`configured keys`,    // the old key-name list
+			`the vault is empty`, // the old empty-vault note
+		}, tc.banned...) {
+			if strings.Contains(msg, banned) {
+				t.Fatalf("%s: the error leaks %q:\n%s", tc.ref, banned, msg)
+			}
+		}
+	}
+
+	// ResolveSecretRef shares the credential path's errors and so must share
+	// its bareness -- it is the event-export path's entry into the vaults.
+	for _, ref := range []string{`secret("nowhere/k")`, `secret("alpha/none")`} {
+		_, err := ResolveSecretRef(ref)
+		if err == nil {
+			t.Fatalf("ResolveSecretRef accepted %s", ref)
+		}
+		msg := err.Error()
+		for _, banned := range []string{`configured vaults`, `configured keys`, "omega", "empty", "alpha-k1", "alpha-k2", "omega-k1", "v1", "v2", "v3"} {
+			if strings.Contains(msg, banned) {
+				t.Fatalf("ResolveSecretRef(%s): the error leaks %q:\n%s", ref, banned, msg)
+			}
+		}
+	}
+
+	// And the errors still say the useful part -- which reference failed.
+	if err := bearerDoc(`secret("alpha/none")`).Validate(); err == nil ||
+		!strings.Contains(err.Error(), `vault "alpha" has no key "none"`) {
+		t.Fatalf("the unknown-key error lost vault and key:\n%v", err)
+	}
+	if err := bearerDoc(`secret("nowhere/k")`).Validate(); err == nil ||
+		!strings.Contains(err.Error(), `no vault named "nowhere" is configured`) {
+		t.Fatalf("the unknown-vault error lost the name:\n%v", err)
+	}
+}
+
+// TestVaultDigestedBasicAuthEntryNeedsNoSeparator pins the digested carve-out
+// in credentialList's shape checks: a vault entry stored sha256:<hex> holds a
+// bare digest, which cannot carry the "user:password" colon by construction
+// -- the operator digested a well-formed credential, and the digest must not
+// be refused for the shape of the plaintext it was never given. The skip is
+// licensed by the vault provenance, not the sha256: prefix: inline, the same
+// bytes are a literal credential and are shape-checked like one.
+func TestVaultDigestedBasicAuthEntryNeedsNoSeparator(t *testing.T) {
+	digested := "sha256:" + credentialDigest("alice:pw")
+	installVaults(t, map[string]VaultSource{"main": {File: writeVaultFile(t, map[string]string{"d": digested})}})
+
+	t.Run("a digested vault entry compiles and authenticates", func(t *testing.T) {
+		doc := reqPolicy(rule(ActionBasicAuth, nil, map[string]interface{}{
+			"credentials": []interface{}{`secret("main/d")`},
+		}))
+		if err := doc.Validate(); err != nil {
+			t.Fatalf("the digested vault entry was refused for its shape:\n%v", err)
+		}
+		hook := bearerHook(t, doc)
+		admitted(t, hook(get("/", map[string]string{
+			"Authorization": "Basic " + basicCreds("alice", "pw"),
+		})))
+		terminated(t, hook(get("/", map[string]string{
+			"Authorization": "Basic " + basicCreds("alice", "wrong"),
+		})))
+
+		// and what compiled is the stored digest, not the digest of it
+		c, _ := compileRequest(t, doc)
+		if want := credentialDigest("alice:pw"); !reflect.DeepEqual(authDigestsOf(t, c), []string{want}) {
+			t.Fatalf("digests = %v, want the stored digest %s", authDigestsOf(t, c), want)
+		}
+	})
+
+	t.Run("the inline path still runs the separator check", func(t *testing.T) {
+		// An inline colon-less literal is refused, exactly as before the
+		// carve-out: the skip is licensed by the vault provenance, never by
+		// the config string's shape. (A note on why the probe is not itself
+		// "sha256:<hex>": that literal DOES pass, because its prefix carries
+		// the very colon the check asks for -- unchanged behavior, and the
+		// reason the discriminator between flag-licensed and prefix-licensed
+		// is the provenance, not the spelling.)
+		doc := reqPolicy(rule(ActionBasicAuth, nil, map[string]interface{}{
+			"credentials": []interface{}{"no-colon-anywhere-here"},
+		}))
+		err := doc.Validate()
+		if err == nil || !strings.Contains(err.Error(), `is not "user:password"-shaped`) {
+			t.Fatalf("an inline colon-less literal was not refused for its shape:\n%v", err)
 		}
 	})
 }
