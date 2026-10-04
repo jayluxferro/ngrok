@@ -14,6 +14,7 @@ import (
 	"os/user"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -40,12 +41,39 @@ type HeaderConfig struct {
 	Remove []string `yaml:"remove,omitempty"`
 }
 
+// TLSConfig is a tunnel's `tls:` block (SPEC-CLUSTER5 5.1): the certificate
+// material the agent terminates the public https TLS with when
+// agent_tls_termination is set. The two pairs are alternative cert models, not
+// layers -- an explicit leaf, or a CA the agent mints per-hostname leaves from
+// -- and naming both is refused at load (validateAgentTLS), because which one
+// would run is otherwise a coin flip decided by code order.
+type TLSConfig struct {
+	Crt   string `yaml:"crt,omitempty"`
+	Key   string `yaml:"key,omitempty"`
+	CaCrt string `yaml:"ca_crt,omitempty"`
+	CaKey string `yaml:"ca_key,omitempty"`
+}
+
 type TunnelConfiguration struct {
 	Subdomain  string            `yaml:"subdomain,omitempty"`
 	Hostname   string            `yaml:"hostname,omitempty"`
 	Protocols  map[string]string `yaml:"proto,omitempty"`
 	HttpAuth   string            `yaml:"auth,omitempty"`
 	RemotePort uint16            `yaml:"remote_port,omitempty"`
+
+	// AgentTLSTermination switches the tunnel's https leg from edge termination
+	// (the server decrypts, today's default) to agent termination (SPEC-CLUSTER5
+	// 5.3): the server routes by SNI and relays the TLS bytes unread, and this
+	// client terminates and speaks plaintext to the local address. The wire
+	// carries it as ReqTunnel.TLSTermination; see reqTunnelFromConfig.
+	AgentTLSTermination bool `yaml:"agent_tls_termination,omitempty"`
+
+	// TLS is the certificate material for agent termination. Nil is the common
+	// case (ephemeral self-signed, or edge termination entirely). Validated and
+	// loaded by validateAgentTLS at configuration load; the files are re-read
+	// when the tunnel is established, so a cert rotated on disk between load and
+	// registration is picked up at the next reconnect.
+	TLS *TLSConfig `yaml:"tls,omitempty"`
 
 	// HTTP header manipulation. Validated for every tunnel regardless of
 	// protocol, but only applied to http tunnels.
@@ -214,11 +242,6 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			err = fmt.Errorf("Tunnel %s does not specify any protocols to tunnel.", name)
 			return
 		}
-		if t.RemotePort != 0 && len(t.Protocols) != 1 {
-			err = fmt.Errorf("Tunnel %s remote_port requires exactly one protocol (tcp)", name)
-			return
-		}
-
 		// Before the protocol loop: the endpoint rules are more specific than
 		// "hostname/subdomain are only valid for http/https", so a bad
 		// internal-plus-tcp combination should say that instead.
@@ -236,14 +259,18 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 				return
 			}
 
-			if t.RemotePort != 0 && k != msg.ProtoTCP {
-				err = fmt.Errorf("Tunnel %s remote_port is only valid for tcp protocol", name)
-				return
-			}
 			if (t.Hostname != "" || t.Subdomain != "") && k == msg.ProtoTCP {
 				err = fmt.Errorf("Tunnel %s hostname/subdomain are only valid for http/https protocols", name)
 				return
 			}
+		}
+
+		if err = validateRemotePort(name, t); err != nil {
+			return
+		}
+
+		if err = validateAgentTLS(name, t); err != nil {
+			return
 		}
 
 		if err = validateHeaderPolicy(name, t); err != nil {
@@ -273,6 +300,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		config.AuthToken = opts.authtoken
 	}
 
+	// -remote-port is a uint64 flag feeding a uint16 wire field: reject an
+	// out-of-range value here, with the flag named, rather than let the
+	// conversion wrap a big number into a small port.
+	if opts.remotePort > 65535 {
+		err = fmt.Errorf("-remote-port must be between 1 and 65535, got %d", opts.remotePort)
+		return
+	}
+
 	switch opts.command {
 	// start a single tunnel, the default, simple ngrok behavior
 	case "default":
@@ -300,6 +335,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			// the user asked for -- there is no "unset" for a flag.
 			Compression:   &opts.compression,
 			TrafficPolicy: filePolicy,
+
+			// Fixed remote port and agent TLS termination (SPEC-CLUSTER5),
+			// wired exactly like the proto options above: the flags feed the
+			// synthesized tunnel, and the same validators that police a
+			// config-file tunnel police what the flags produced.
+			RemotePort:          uint16(opts.remotePort),
+			AgentTLSTermination: opts.agentTLSTermination,
+			TLS:                 newTLSConfig(opts.tlsCrt, opts.tlsKey, opts.tlsCaCrt, opts.tlsCaKey),
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -316,6 +359,12 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		// loop above, so validate what the endpoint and header flags produced
 		// here
 		if err = validateEndpointPolicy("default", config.Tunnels["default"]); err != nil {
+			return
+		}
+		if err = validateRemotePort("default", config.Tunnels["default"]); err != nil {
+			return
+		}
+		if err = validateAgentTLS("default", config.Tunnels["default"]); err != nil {
 			return
 		}
 		if err = validateHeaderPolicy("default", config.Tunnels["default"]); err != nil {
@@ -440,6 +489,18 @@ func newHeaderConfig(add, remove []string) *HeaderConfig {
 	}
 
 	return &HeaderConfig{Add: add, Remove: remove}
+}
+
+// newTLSConfig turns the -tls-* flags into a tunnel's tls block, mirroring
+// newHeaderConfig: an all-empty set of flags produces a nil block, so the
+// synthesized "default" tunnel of an invocation that said nothing about TLS is
+// byte-for-byte the tunnel it used to be.
+func newTLSConfig(crt, key, caCrt, caKey string) *TLSConfig {
+	if crt == "" && key == "" && caCrt == "" && caKey == "" {
+		return nil
+	}
+
+	return &TLSConfig{Crt: crt, Key: key, CaCrt: caCrt, CaKey: caKey}
 }
 
 // validateHeaderPolicy validates the header settings of one tunnel. It is
@@ -616,6 +677,146 @@ func validateForwardTo(tunnelName string, t *TunnelConfiguration) error {
 	}
 
 	return nil
+}
+
+// validateRemotePort checks a tunnel's remote_port claim (SPEC-CLUSTER5 4.1).
+// It is the single home of the client-side rules -- the two the loader has
+// always applied (tcp only, exactly one protocol) plus the two this feature
+// adds -- and it runs for config-file tunnels and for the CLI-synthesized
+// "default" tunnel alike, so a flag and a config key are refused for the same
+// reasons in the same words.
+//
+// Ownership of a claimed port is the server's business (its port-claim
+// registry); what the client can know without a server is the shape of a claim
+// that could never work.
+func validateRemotePort(tunnelName string, t *TunnelConfiguration) error {
+	if t.RemotePort == 0 {
+		return nil
+	}
+
+	if len(t.Protocols) != 1 {
+		return fmt.Errorf("Tunnel %s remote_port requires exactly one protocol (tcp)", tunnelName)
+	}
+	for proto := range t.Protocols {
+		if proto != msg.ProtoTCP {
+			return fmt.Errorf("Tunnel %s remote_port is only valid for tcp protocol", tunnelName)
+		}
+	}
+
+	// Ports below 1024 are the kernel's privileged range: ngrokd can only bind
+	// one if its own process is privileged. Without this note a claim that
+	// always fails at registration ("bind: permission denied") looks like a
+	// server bug rather than a property of the port the config asked for.
+	if t.RemotePort < 1024 {
+		return fmt.Errorf("Tunnel %s remote_port %d is below 1024: the ngrok server process must run with the privileges to bind privileged ports for such a claim to work (use a port >= 1024 unless you control the server's privileges)", tunnelName, t.RemotePort)
+	}
+
+	return nil
+}
+
+// validateAgentTLS checks a tunnel's agent TLS termination settings
+// (SPEC-CLUSTER5 5.1). Like the validators around it, it runs for config-file
+// tunnels and for the CLI-synthesized "default" tunnel, and everything it
+// rejects is a startup error naming the tunnel and the offending key or file:
+// a TLS setting that does not mean what its author thinks shows up at best as a
+// handshake failure in a browser far away, and at worst as plaintext the
+// operator believed was encrypted.
+//
+// When the settings are well-shaped, it also loads and parses the certificate
+// files once here, so that a path that does not exist or a PEM that does not
+// parse fails at load with the file named, not when the first visitor connects.
+func validateAgentTLS(tunnelName string, t *TunnelConfiguration) error {
+	// A tls block without the switch is a control that would do nothing at all:
+	// refuse it rather than let it sit in the file looking like it terminates
+	// something.
+	if !t.AgentTLSTermination {
+		if t.TLS != nil {
+			for _, pair := range []struct{ key, value string }{
+				{"tls.crt", t.TLS.Crt},
+				{"tls.key", t.TLS.Key},
+				{"tls.ca_crt", t.TLS.CaCrt},
+				{"tls.ca_key", t.TLS.CaKey},
+			} {
+				if pair.value != "" {
+					return fmt.Errorf("Tunnel %s sets %s but not agent_tls_termination: the tls block only applies to agent-terminated tunnels", tunnelName, pair.key)
+				}
+			}
+		}
+		return nil
+	}
+
+	// The feature is the https leg's: the http leg of the same tunnel keeps edge
+	// termination. A tunnel without an https leg has nothing to terminate, so
+	// the switch would be a no-op on tcp (and on http, where there is no TLS to
+	// hand over in the first place).
+	hasHTTPS := false
+	for proto := range t.Protocols {
+		if proto == msg.ProtoHTTPS {
+			hasHTTPS = true
+		}
+	}
+	if !hasHTTPS {
+		return fmt.Errorf("Tunnel %s: agent_tls_termination requires the tunnel's protocols to include https, got %v", tunnelName, protoNames(t.Protocols))
+	}
+
+	// Forwarding delivers plaintext http into the target tunnel's agent, and an
+	// agent-terminated target would be waiting for a TLS ClientHello instead:
+	// the two settings on one endpoint are a standstill, so say so at load
+	// (SPEC-CLUSTER5 5.4: forward targets stay plaintext http legs).
+	if t.Binding == msg.BindingInternal {
+		return fmt.Errorf("Tunnel %s: binding internal cannot be combined with agent_tls_termination: a forwarding target receives plaintext http, which an agent-terminated endpoint does not speak", tunnelName)
+	}
+
+	if t.TLS == nil {
+		// The ephemeral model: no files to check. The loud WARN about the
+		// temporary self-signed certificate happens when the tunnel is
+		// established (tlsagent.go), once per session.
+		return nil
+	}
+
+	// Shape: each pair is all-or-nothing, and the two models are alternatives.
+	// These are checked before any file is read so that a half-named pair
+	// reports the missing key instead of a confusing open error about the one
+	// that was named.
+	explicit, ca := t.TLS.Crt != "" || t.TLS.Key != "", t.TLS.CaCrt != "" || t.TLS.CaKey != ""
+	if explicit && ca {
+		return fmt.Errorf("Tunnel %s: choose explicit cert or CA, not both: tls.crt/tls.key and tls.ca_crt/tls.ca_key name two different certificate models", tunnelName)
+	}
+	if (t.TLS.Crt == "") != (t.TLS.Key == "") {
+		if t.TLS.Crt == "" {
+			return fmt.Errorf("Tunnel %s: tls.key requires tls.crt: the certificate and its private key are one pair", tunnelName)
+		}
+		return fmt.Errorf("Tunnel %s: tls.crt requires tls.key: the certificate and its private key are one pair", tunnelName)
+	}
+	if (t.TLS.CaCrt == "") != (t.TLS.CaKey == "") {
+		if t.TLS.CaCrt == "" {
+			return fmt.Errorf("Tunnel %s: tls.ca_key requires tls.ca_crt: the CA certificate and its private key are one pair", tunnelName)
+		}
+		return fmt.Errorf("Tunnel %s: tls.ca_crt requires tls.ca_key: the CA certificate and its private key are one pair", tunnelName)
+	}
+
+	// The files must load and parse now. The built *tls.Config is not kept:
+	// building the session config is tlsagent.go's job (and a cert rotated on
+	// disk is picked up when the tunnel is established). If this passes, the
+	// same call at registration time can only fail if a file changed under us,
+	// which the client then reports the same way.
+	if _, err := agentTLSConfig(t); err != nil {
+		return fmt.Errorf("Tunnel %s: %v", tunnelName, err)
+	}
+
+	return nil
+}
+
+// protoNames renders a protocol map's keys sorted, for error messages: a
+// config's proto section is a map, so iterating it directly would make the
+// same tunnel describe itself differently run to run.
+func protoNames(protocols map[string]string) string {
+	names := make([]string, 0, len(protocols))
+	for proto := range protocols {
+		names = append(names, proto)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 // isHttpProtocol reports whether a protocol key (as written in the config's

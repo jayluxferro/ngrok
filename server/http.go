@@ -45,6 +45,24 @@ Content-Length: 12
 Bad Request
 `
 
+	// MisdirectedRequest answers a request whose Host names an
+	// agent-terminated endpoint on a connection this server has already
+	// terminated (SPEC-CLUSTER5 5.2). 421 is the status RFC 9110 defines for
+	// exactly this -- "the request was directed at a server that is unable or
+	// unwilling to produce an authoritative response" -- and it matters more
+	// than a plain error here: a client that reached for the agent's endpoint
+	// over the wrong TLS layer must be told to re-connect naming the endpoint
+	// (SNI), because no response this server could produce would ever be
+	// authoritative for it. As with NotFound, the hostname is escaped and the
+	// body typed, because it is peer-supplied data a browser will render.
+	MisdirectedRequest = `HTTP/1.0 421 Misdirected Request
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Content-Length: %d
+
+%s`
+
+
 	BadGateway = `HTTP/1.0 502 Bad Gateway
 Content-Type: text/plain; charset=utf-8
 Content-Length: %d
@@ -118,11 +136,32 @@ func notFoundResponse(host string) []byte {
 	return []byte(fmt.Sprintf(NotFound, len(body), escaped))
 }
 
+// misdirectedResponse renders the 421 for a Host that names an agent-
+// terminated endpoint on a connection the server already terminated. The
+// hostname is escaped for the same reason notFoundResponse escapes it: it is
+// attacker-controlled and the body is rendered by a browser.
+func misdirectedResponse(host string) []byte {
+	escaped := html.EscapeString(host)
+	// Unlike NotFound, whose constant spells the sentence around its %s, the
+	// MisdirectedRequest constant ends in a bare %s: the sentence below IS the
+	// body, so it must be the value substituted -- passing the escaped host
+	// instead would announce the sentence's length and send only the host,
+	// and a conforming client would wait forever for the missing bytes.
+	body := fmt.Sprintf("Tunnel %s terminates TLS in its agent; connect again naming the endpoint's hostname (SNI)\n", escaped)
+	return []byte(fmt.Sprintf(MisdirectedRequest, len(body), body))
+}
+
 // Listens for new http(s) connections from the public internet
 func startHttpListener(addr string, tlsCfg *tls.Config) (listener *conn.Listener) {
-	// bind/listen for incoming connections
+	// The listener accepts raw connections on both variants: the plain-http
+	// listener always did (its TLS config is nil), and the https listener
+	// used to have conn.Listen wrap every accepted conn in tls.Server before
+	// anything could look at it. It must not any more (SPEC-CLUSTER5 5.2):
+	// whether this connection terminates here or passes through to an agent
+	// is decided per connection, from the ClientHello, and the wrap is part
+	// of that decision.
 	var err error
-	if listener, err = conn.Listen(addr, "pub", tlsCfg); err != nil {
+	if listener, err = conn.Listen(addr, "pub", nil); err != nil {
 		panic(err)
 	}
 
@@ -136,12 +175,194 @@ func startHttpListener(addr string, tlsCfg *tls.Config) (listener *conn.Listener
 
 	log.Info("Listening for public %s connections on %v", proto, listener.Addr.String())
 	go func() {
-		for conn := range listener.Conns {
-			go httpHandler(conn, proto)
+		for c := range listener.Conns {
+			if tlsCfg == nil {
+				go httpHandler(c, proto)
+				continue
+			}
+			go httpsConnHandler(c, tlsCfg)
 		}
 	}()
 
 	return
+}
+
+// httpsConnHandler demultiplexes one connection accepted on the https
+// listener (SPEC-CLUSTER5 5.2). The ClientHello is peeked first -- bounded,
+// with the same read budget and deadline every public connection gets -- and
+// the endpoint it names decides the connection's fate:
+//
+//   - SNI names an agent-terminated endpoint: the connection is joined to the
+//     endpoint's agent AS RAW BYTES. The server never terminates this TLS and
+//     never sees the plaintext; the peeked bytes are replayed so the agent's
+//     own TLS terminator sees the hello byte for byte.
+//   - everything else -- SNI absent, SNI unmatched, SNI matched to an edge
+//     endpoint, or a stream that is not a ClientHello at all -- terminates
+//     with the server certificate, and httpHandler routes by Host exactly as
+//     it always has. A failed peek is treated as SNI-absent on purpose: the
+//     TLS terminator, not this parser, answers a bad stream, and it does so
+//     with a real TLS alert because it sees the real bytes.
+func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
+	defer c.Close()
+	defer func() {
+		// recover from failures, as httpHandler does
+		if r := recover(); r != nil {
+			c.Warn("httpsConnHandler failed with error %v", r)
+		}
+	}()
+
+	// Make sure a connection that never finishes its ClientHello does not
+	// hold a slot forever; httpHandler re-arms its own deadline for the head.
+	c.SetDeadline(time.Now().Add(connReadTimeout))
+	sni, peeked, err := readClientHelloSNI(c, maxHeadBytes)
+
+	switch {
+	case err == nil:
+		c.Debug("ClientHello read in %d bytes", len(peeked))
+	case errors.Is(err, ErrSNIAbsent):
+		// A client that names no endpoint is normal (IP literals, some
+		// legacy stacks): terminate, and let the Host header speak.
+		c.Info("%v; terminating with the server certificate", err)
+	default:
+		c.Info("SNI peek failed (%v); treating the connection as SNI-absent", err)
+	}
+
+	if sni != "" {
+		// Registry keys are lower-cased (hostFromHead's rule); SNI hostnames
+		// are binary-safe octets on the wire, and the lowercase of the name
+		// is the name the tunnel was registered under.
+		host := strings.ToLower(sni)
+		c.Debug("Found SNI %s in ClientHello", host)
+
+		tunnel := tunnelRegistry.Get(fmt.Sprintf("%s://%s", msg.ProtoHTTPS, host))
+		switch {
+		case tunnel == nil:
+			c.Info("No tunnel found for SNI %s; terminating with the server certificate", host)
+		case tunnel.agentTLS():
+			c.Info("SNI %s routes to agent-terminated endpoint %s; passing the connection through as raw TLS bytes", host, tunnel.Id())
+			serveAgentTLS(c, tunnel, peeked)
+			return
+		default:
+			c.Info("SNI %s routes to edge-terminated endpoint %s; terminating with the server certificate", host, tunnel.Id())
+		}
+	}
+
+	terminateWithServerCert(c, peeked, tlsCfg)
+}
+
+// serveAgentTLS passes one public connection through to an agent-terminated
+// endpoint's proxy connection without the server ever inspecting a byte of
+// its payload. Everything the server is still entitled to see -- the source
+// address, the endpoint's on_tcp_connect policy, the forward_to chain --
+// is decided here, on the outside of the TLS; inside there is only ciphertext
+// this server has no key for.
+func serveAgentTLS(c conn.Conn, tunnel *Tunnel, peeked []byte) {
+	// The admission gates the http path applies in httpHandler apply here
+	// too: a passthrough connection is a public connection like any other.
+	// They live in this branch rather than in httpsConnHandler because the
+	// terminated branch re-enters httpHandler, which applies them itself --
+	// a conn must be counted exactly once, whichever route it takes.
+	ip := remoteIP(c.RemoteAddr())
+	if !publicLimiter.allow(ip) {
+		atomic.AddUint64(&rateDropCount, 1)
+		observe.events.publishRateLimitDrop(scopePublicHTTP, ip)
+		if warnSampler.allow("public-rate:" + ip) {
+			log.Warn("Rate-limited public request from %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return
+	}
+	if !connLimiter.acquire(ip) {
+		observe.events.publishConnectionCapDrop(scopePublicHTTP, ip)
+		if warnSampler.allow("public-cap:" + ip) {
+			log.Warn("Connection cap reached for %s", ip)
+		}
+		c.Write([]byte(BadRequest))
+		return
+	}
+	defer connLimiter.release(ip)
+	incPublicConns()
+	defer decPublicConns()
+
+	// The forward_to chain decides which endpoint actually serves this
+	// connection, exactly as it does on the Host path: an agent-terminated
+	// entry endpoint with a forward_to terminates at the internal endpoint
+	// the chain names, and the entry's agent never sees the traffic.
+	target, err := tunnelRegistry.ResolveForward(tunnel)
+	if err != nil {
+		respondBadGateway(c, err)
+		return
+	}
+
+	// on_tcp_connect stays server-side (SPEC-CLUSTER5 5.3): it runs before a
+	// proxy connection exists, on the only facts the server has -- the source
+	// address and the policy of the endpoint the chain terminates at. The
+	// synthetic response the verdict may carry is written onto the raw
+	// stream, where a TLS-speaking visitor cannot read it; the enforcement
+	// is the point, not the answer. The connection is closed either way: a
+	// refused connection must not reach an agent.
+	pol := tunnel.policyFor(target)
+	if v := connectVerdict(pol, c); v.Deny {
+		respondPolicyDeny(c, v)
+		return
+	}
+
+	// From here on the connection is ciphertext end to end. Give the peeked
+	// bytes back -- the ClientHello reaches the agent's TLS terminator as the
+	// stream's first bytes, which is what makes the pass-through transparent
+	// to it -- and clear the peek deadline: the join owns the connection now.
+	//
+	// The conn is also marked as a passthrough: if the forward_to chain below
+	// terminates at an endpoint that is NOT itself agent-terminated, that
+	// endpoint's join must still treat this stream as the opaque ciphertext it
+	// is -- this server holds no key for it, and the terminus's rewriter hooks
+	// must not be pointed at TLS records. The marker makes the entry
+	// endpoint's zero-knowledge property travel with the connection.
+	publicConn := &passthroughConn{newReplayConn(c, peeked, c)}
+	publicConn.SetDeadline(time.Time{})
+
+	target.HandlePublicConnection(publicConn, pol)
+}
+
+// terminateWithServerCert hands a peeked connection to the server's TLS
+// terminator and the Host router: the bytes the SNI peek consumed are put back
+// on the front of the stream, so the handshake sees the ClientHello exactly as
+// the client sent it, and httpHandler takes over as if it had accepted the
+// connection itself. This is the pre-SNI behavior, preserved byte for byte for
+// every connection the SNI does not claim for an agent.
+func terminateWithServerCert(c conn.Conn, peeked []byte, tlsCfg *tls.Config) {
+	tlsConn := tls.Server(newReplayConn(c, peeked, c), tlsCfg)
+	httpHandler(&terminatedConn{Conn: c, tlsConn: tlsConn}, msg.ProtoHTTPS)
+}
+
+// terminatedConn is a public connection whose payload flows through a TLS
+// layer the server built after peeking at it, while the connection's identity
+// -- id, log prefixes, Close, deadlines, addresses -- stays the accepted
+// connection's. It mirrors replayConn's embedding for the same reason: the
+// conn the listener accepted is the one whose life is being logged, and a
+// second identity would split that story in two.
+//
+// Read and Write go to the TLS layer; everything else goes to the accepted
+// conn underneath it, which is where those operations acted before the SNI
+// peek existed (conn.Listen used to swap the TLS layer in under the same
+// loggedConn, so deadlines and addresses always reached the raw socket).
+type terminatedConn struct {
+	conn.Conn
+	tlsConn *tls.Conn
+}
+
+func (c *terminatedConn) Read(p []byte) (int, error) {
+	return c.tlsConn.Read(p)
+}
+
+func (c *terminatedConn) Write(p []byte) (int, error) {
+	return c.tlsConn.Write(p)
+}
+
+// Close closes the TLS layer, which sends close_notify and closes the
+// underlying socket -- the same thing closing the pre-SNI wrapped conn did.
+func (c *terminatedConn) Close() error {
+	return c.tlsConn.Close()
 }
 
 // replayConn is a connection whose reads serve the request head that was taken
@@ -173,6 +394,17 @@ func newReplayConn(c conn.Conn, head []byte, rest io.Reader) conn.Conn {
 		Conn: c,
 		r:    io.MultiReader(bytes.NewReader(head), rest),
 	}
+}
+
+// passthroughConn marks a public connection that arrived over an
+// agent-terminated endpoint's SNI route: its payload is TLS ciphertext the
+// server has no key for, and it must be joined to its agent as raw bytes no
+// matter which tunnel in a forward_to chain ends up serving it -- the entry
+// endpoint's zero-knowledge property travels with the connection, because
+// rewriter hooks pointed at this stream would be parsing TLS records.
+// Tunnel.join reads the marker; nothing else about the connection changes.
+type passthroughConn struct {
+	conn.Conn
 }
 
 // readRequestHead reads exactly one request head off a public connection and
@@ -357,6 +589,21 @@ func httpHandler(c conn.Conn, proto string) {
 			c.Info("No tunnel found for hostname %s", host)
 		}
 		c.Write(notFoundResponse(host))
+		return
+	}
+
+	// The Host names an agent-terminated endpoint, but this connection was
+	// already terminated -- by construction: every conn that reaches this
+	// function had its TLS removed by this server (the plain listener's
+	// conns carry no TLS at all, and agent-terminated tunnels can only be
+	// registered under https urls, which only the terminated path looks up).
+	// Piping the plaintext into the agent's tunnel would feed it bytes the
+	// agent's TLS terminator cannot read, so the request is refused with 421
+	// (SPEC-CLUSTER5 5.2): the one status that tells the client it reached
+	// the right name over the wrong connection.
+	if tunnel.agentTLS() {
+		c.Info("Host %s names agent-terminated endpoint %s but this connection was terminated by the server; refusing with 421", host, tunnel.Id())
+		c.Write(misdirectedResponse(host))
 		return
 	}
 

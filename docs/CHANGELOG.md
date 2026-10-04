@@ -1,4 +1,158 @@
 # Changelog
+## 1.0.7 - 2026-10-04 - Zero-knowledge TLS + fixed remote TCP ports
+
+Two features about who holds the credentials of a public endpoint, plus the
+first end-to-end coverage the public https listener has ever had.
+
+**Agent TLS termination** (zero-knowledge TLS) moves the public side of an
+https endpoint from the server to the agent. The server routes an incoming TLS
+connection by the name in its ClientHello (SNI) and relays the records
+untouched: it never terminates the TLS, never holds the certificate or its
+key, and never sees the plaintext -- there is no plaintext on the server side
+of these tunnels at all. TLS terminates in the agent, which then speaks plain
+HTTP to the local service through the ordinary path. This is the capability
+commercial ngrok gates behind paid plans; here it removes the server
+certificate from the trust story entirely, because for an agent-terminated
+endpoint the server's certificate is simply not involved.
+
+**Fixed remote TCP ports** make a tcp tunnel's public port deterministic and
+owned: `-remote-port N` (or the existing `remote_port` config key) claims port
+N for the claiming auth token and keeps it against other tokens -- including
+across the window between one registration closing and the next opening, which
+is exactly the window a bare kernel bind leaves open.
+
+**Upgrade the client and the server together.** Be precise about what enforces
+this, because it is looser than it looks: the authentication handshake only
+compares the wire protocol version (`version.Proto`, "2"); the software
+version is exchanged for display and metrics, and the exact-equality helper
+`version.Compat` in `version/version.go` is not consulted by the handshake at
+all. `TLSTermination` is an additive wire field, so an older server decoding a
+1.0.7 registration drops it in silence: the registration *succeeds*, and the
+endpoint would come up edge-terminated while the agent arms its own TLS
+terminator. That pairing is refused rather than suffered: the server's success
+acknowledgement now echoes the termination mode it actually registered, and a
+client that asked for agent termination shuts the tunnel down at establishment
+with an error naming the version gap, instead of failing one proxied
+connection at a time. The safe order is still "server first, or both at once":
+a 1.0.7 server with an older client is fine (the missing field decodes as edge
+termination, today's behavior), and a 1.0.7 client against an older server
+refuses any tunnel configured with `agent_tls_termination`.
+
+### Server
+
+- **The https listener routes by SNI.** `server/sni.go` reads exactly one
+  ClientHello off each accepted connection -- bounded by the same 64 KiB
+  budget as the request-head parser, reassembled across fragmented TLS
+  records, every consumed byte returned for replay -- and the name it finds
+  decides the connection's fate. An SNI that matches an agent-terminated
+  endpoint passes the connection through as raw bytes; everything else (no
+  SNI, unmatched SNI, SNI on an edge endpoint, a stream that is not TLS at
+  all) is replayed into the server's TLS terminator and routed by Host exactly
+  as before. Edge http, edge https and tcp tunnels behave identically to
+  1.0.6 modulo the cost of one peeked read.
+- **Zero-knowledge joins are raw bytes, and stay raw.** For an
+  agent-terminated endpoint the server's join is `conn.Join` and nothing else:
+  no request hooks, no response hooks, no head parse. The property travels
+  with the connection through a `forward_to` chain -- if the entry endpoint is
+  agent-terminated, the chain's terminus receives ciphertext regardless of
+  what kind of endpoint it is, and its hooks are skipped for the same reason.
+- **`on_tcp_connect` stays server-side** and now runs on the passthrough path
+  too, before an agent is asked for anything, along with the per-IP rate
+  limits and connection caps. A connection refused here is closed; note the
+  synthetic refusal response is written onto the raw TLS stream, so a TLS
+  visitor experiences the enforcement as a closed connection rather than a
+  readable 403 (see Known limitations).
+- **A Host that names an agent-terminated endpoint on a terminated connection
+  answers `421 Misdirected Request`.** The server will never pipe plaintext
+  into such a tunnel, and 421 is the one status that tells a client it used
+  the right name over the wrong connection: reconnect naming the endpoint's
+  hostname (SNI).
+- **Fixed remote ports are owned by an auth token** (`server/portclaims.go`).
+  The claim is consulted before the kernel sees the bind: a port another
+  token holds is refused with "remote port %d already claimed by another auth
+  token"; a port the server itself listens on is refused with the listener
+  named; the same token re-claiming (a reconnect, another pooling member) is
+  allowed and never opens a free window. The claim is released when the
+  tunnel's teardown runs, and a bind that then fails (privileged port, foreign
+  process) releases it again rather than locking the account out of its own
+  request.
+
+### Client
+
+- **`agent_tls_termination: true`** on a tunnel (or `-agent-tls-termination`
+  for the default tunnel) moves that tunnel's https leg to the agent. The
+  certificate comes from a new `tls:` block with three models, in priority
+  order: explicit `crt`/`key` (one fixed leaf); `ca_crt`/`ca_key` (the agent
+  mints a short-lived leaf per SNI name on demand -- ECDSA P-256, 24h
+  validity, cached per name so every handshake for a name presents the same
+  certificate; the CA key never leaves the agent); or neither, which is a
+  temporary self-signed certificate with a loud WARN carrying its sha256
+  fingerprint. TLS 1.2 is the floor and no client certificates are requested,
+  in every model.
+- **Validation is at load and names the file.** A `tls:` block without the
+  switch, a half-named pair, both pairs at once, or a file that is missing or
+  unparseable is a startup error; a CA without `CA:TRUE` or without a
+  self-signature is refused with the reason. The files are re-read per
+  session, so a certificate rotated on disk is picked up at the next
+  reconnect.
+- **The agent-side policy split.** On an agent-terminated tunnel the
+  `on_http_request` / `on_http_response` phases run in the agent, compiled
+  with the same policy package the server uses, merged into the same rewriter
+  that carries the header and compression semantics. `on_tcp_connect` stays
+  server-side for every tunnel (it evaluates at accept time, before any proxy
+  connection exists -- an agent could not enforce it at all). Plain
+  edge-terminated tunnels are unchanged: their policy phases still run on the
+  server.
+- **Everything else survives the move, on the plaintext.** Header rewriting
+  (`host_header`, add/remove), X-Forwarded-For injection, response
+  compression, the inspector tee and the dead-upstream 502 -- which now goes
+  out over a *completed* handshake, so a visitor sees a real 502 instead of a
+  TLS decode error -- all act on the plaintext after the agent terminates.
+  The e2e suite proves the header rewrite and the deny action over a live
+  agent-terminated tunnel.
+- **`-remote-port N`** claims a fixed public port for the default tcp tunnel,
+  with the same rules the config key has (tcp only, exactly one protocol) and
+  two new guardrails: a port below 1024 is refused at load with a note that
+  the server process needs the privileges to bind it, and a flag value above
+  65535 is refused instead of wrapping around the uint16 wire field.
+
+### Known limitations
+
+- **Agent-terminated endpoints need SNI-capable visitors.** The endpoint's
+  name only exists in the ClientHello; a client that sends no SNI cannot be
+  routed, terminates at the server, and gets the 421 described above. IP-literal
+  access to an agent-terminated hostname is therefore impossible by design.
+- **A forward chain carries the entry's passthrough with it.** An
+  agent-terminated endpoint with a `forward_to` delivers ciphertext to the
+  chain's terminus even when that terminus is a plain HTTP endpoint, so the
+  terminus's own `on_http_*` phases and header rewrites do not run for those
+  connections. Serve agent-terminated traffic from the endpoint that
+  terminates it.
+- **The ephemeral cert model shows browser warnings by design.** A
+  self-signed certificate is exactly what the WARN says it is; the fingerprint
+  in the log pins which certificate a visitor that skipped verification
+  actually saw. Configure `tls.crt`/`tls.key` or `tls.ca_crt`/`tls.ca_key`
+  to make it go away.
+- **An `on_tcp_connect` denial on an agent-terminated endpoint is silent to a
+  TLS visitor.** The refusal is written before any TLS termination exists on
+  the path, so the bytes cannot be read by the visitor; enforcement is the
+  closed connection. The same denial on an edge endpoint still answers with
+  the readable 403.
+- **Fixed ports below 1024 need a privileged server process**, and a claimed
+  port the kernel cannot bind (foreign process, permissions) surfaces the
+  underlying bind error -- the ownership registry refuses claims it knows
+  about, it does not reserve the port against the rest of the machine.
+- **CA-minted leaves live 24 hours** and the per-name cache is per tunnel
+  session: a visitor pinning a leaf instead of trusting the CA will see the
+  leaf change across agent restarts. Trust the CA, not the leaf.
+- **A tight restart loop on a fixed port can lose the bind race.** Ownership
+  is claimed and released cleanly across restarts, but the kernel can still
+  hold the listening socket for a moment after the old process closes it, so
+  a client restarted with no settle delay can see the explicit-port
+  registration fail with a bind error (the claim is released again and the
+  next registration can take the port). A restart with even a short pause
+  between stop and start does not hit it.
+
 ## 1.0.6 - 2026-09-27 - Security hardening release
 
 A hardening pass over ngrokd, the agent and the policy engine, from a fuzzing

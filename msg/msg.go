@@ -128,6 +128,22 @@ type ReqTunnel struct {
 	// client and a policy-free endpoint take exactly the path they took
 	// before. The server compiles it once, when the tunnel is registered.
 	TrafficPolicy *policy.TrafficPolicy
+
+	// TLSTermination selects who terminates public TLS for an https endpoint
+	// (SPEC-CLUSTER5 5.1). "" (the zero value, so an old-style message decodes
+	// to it and every pre-existing tunnel keeps its behavior) is
+	// TLSTerminationEdge: the server terminates with its own certificate, as
+	// it always has. TLSTerminationAgent ("agent") is zero-knowledge TLS: the
+	// server routes by SNI and passes the TLS bytes through untouched, and the
+	// certificate, the keys and the plaintext all live on the agent side --
+	// the server never sees either.
+	//
+	// The field is only meaningful for the https leg of the request. Because
+	// the server splits a multi-leg request ("http+https") into one
+	// registration per leg while the field rides on the request as a whole,
+	// the server honors it on the https leg and ignores it on the others;
+	// see server/tunnel.go validateRequest.
+	TLSTermination string
 }
 
 // When the server opens a new tunnel on behalf of
@@ -142,6 +158,16 @@ type NewTunnel struct {
 	Url      string
 	Protocol string
 	Error    string
+
+	// TLSTermination echoes the termination mode the server actually
+	// registered the endpoint under, after normalize-and-refuse validation.
+	// It exists so a client that asked for agent termination can tell, at
+	// establishment time, whether it got it: a server from before this field
+	// decodes nothing here and an old-server client mispairing registers
+	// "successfully" but terminates nothing -- so the client treats a
+	// requested-but-not-echoed agent mode as a fatal error rather than serve
+	// an endpoint whose TLS the server holds and its own terminator expects.
+	TLSTermination string
 }
 
 // When the server wants to initiate a new tunneled connection, it sends
@@ -248,6 +274,18 @@ const (
 	// on "+" and registers one endpoint per leg, so a server never carries this
 	// spelling in a Tunnel.
 	ProtoHTTPPlusHTTPS = "http+https"
+
+	// TLSTerminationEdge and TLSTerminationAgent are the accepted values of
+	// ReqTunnel.TLSTermination (SPEC-CLUSTER5 5.1). The empty string is what
+	// the wire carries for a server-terminated endpoint, so "edge" is a
+	// configuration spelling only: the client normalizes it to "" at load
+	// time, and the server accepts exactly these two values and no others
+	// (server/tunnel.go). A value outside the pair is a refused registration,
+	// not a silent fallback to edge termination -- falling back would turn
+	// every spelling mistake into an endpoint where the server holds the
+	// certificate the operator believes the agent holds.
+	TLSTerminationEdge  = ""
+	TLSTerminationAgent = "agent"
 )
 
 // IsHTTP reports whether one protocol name -- a single leg, as it appears on

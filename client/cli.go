@@ -22,6 +22,8 @@ Examples:
 	ngrok -binding=internal -hostname=svc.internal 8080
 	ngrok -forward-to=https://svc.internal 80
 	ngrok -traffic-policy-file=policy.yml -hostname=guarded 8080
+	ngrok -proto=tcp -remote-port=2222 22
+	ngrok -agent-tls-termination -tls-ca-crt=ca.pem -tls-ca-key=ca.key -hostname=app.example.com 8080
 
 
 Advanced usage: ngrok [OPTIONS] <command> [command args] [...]
@@ -78,6 +80,19 @@ type Options struct {
 	// checked by exactly one code path whether it came from a flag or from a
 	// config file.
 	trafficPolicyFile string
+
+	// Fixed remote port and agent TLS termination (SPEC-CLUSTER5). Like the
+	// endpoint flags above, these only feed the synthesized "default" tunnel;
+	// config-file tunnels set the equivalent keys (remote_port,
+	// agent_tls_termination, tls) per tunnel. remotePort stays a uint64 here so
+	// that a flag value past uint16 reaches LoadConfiguration and is rejected
+	// with a message naming the flag, instead of wrapping around silently.
+	remotePort          uint64
+	agentTLSTermination bool
+	tlsCrt              string
+	tlsKey              string
+	tlsCaCrt            string
+	tlsCaKey            string
 }
 
 // stringList is a flag.Value that accumulates each occurrence of a repeatable
@@ -205,6 +220,36 @@ func ParseArgs() (opts *Options, err error) {
 		"",
 		"Path to a YAML traffic policy file to enforce on the server for this endpoint. The policy is validated at startup: a rule the server cannot enforce is a startup error, not a control that silently does nothing. (HTTP only)")
 
+	remotePort := flag.Uint64(
+		"remote-port",
+		0,
+		"Claim this specific public port for a tcp tunnel instead of a random one (0 lets the server choose). A port the server's own listeners use, one another auth token has already claimed, or one below 1024 (which the server process needs privileges to bind) is refused at registration. (TCP only)")
+
+	agentTLSTermination := flag.Bool(
+		"agent-tls-termination",
+		false,
+		"Terminate TLS for https connections in this agent instead of on the ngrok server: the server routes by SNI and relays the TLS bytes unread (it never sees plaintext), and this process decrypts and speaks plain HTTP to the local address. The certificate comes from -tls-crt/-tls-key, from -tls-ca-crt/-tls-ca-key, or -- with neither -- is a temporary self-signed one. (HTTPS only)")
+
+	tlsCrt := flag.String(
+		"tls-crt",
+		"",
+		"Path to a PEM certificate the agent presents on https connections when terminating TLS itself. Requires -tls-key. (with -agent-tls-termination)")
+
+	tlsKey := flag.String(
+		"tls-key",
+		"",
+		"Path to the PEM private key of -tls-crt. Requires -tls-crt. (with -agent-tls-termination)")
+
+	tlsCaCrt := flag.String(
+		"tls-ca-crt",
+		"",
+		"Path to a PEM certificate authority the agent uses to mint a certificate per requested hostname on the fly, instead of presenting one fixed certificate. Requires -tls-ca-key. (with -agent-tls-termination)")
+
+	tlsCaKey := flag.String(
+		"tls-ca-key",
+		"",
+		"Path to the PEM private key of -tls-ca-crt. It never leaves this machine. Requires -tls-ca-crt. (with -agent-tls-termination)")
+
 	flag.Parse()
 
 	opts = &Options{
@@ -227,6 +272,12 @@ func ParseArgs() (opts *Options, err error) {
 		forwardTo:            *forwardTo,
 		compression:          *compression,
 		trafficPolicyFile:    *trafficPolicyFile,
+		remotePort:           *remotePort,
+		agentTLSTermination:  *agentTLSTermination,
+		tlsCrt:               *tlsCrt,
+		tlsKey:               *tlsKey,
+		tlsCaCrt:             *tlsCaCrt,
+		tlsCaKey:             *tlsCaKey,
 		command:              flag.Arg(0),
 	}
 

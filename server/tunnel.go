@@ -60,6 +60,13 @@ type Tunnel struct {
 	// needs (its vars) lives in the hooks, which are built per connection.
 	policy *policy.Compiled
 
+	// claimedPort is the fixed remote port this tunnel holds a claim on in
+	// the port ownership registry (SPEC-CLUSTER5 4.1), 0 when it holds none.
+	// It is a field rather than a re-reading of req.RemotePort because a
+	// claim can exist for a port the request did not name (the affinity-cache
+	// rebind) and must not exist for a tunnel that only joined a pool.
+	claimedPort int
+
 	// logger
 	log.Logger
 
@@ -70,6 +77,21 @@ type Tunnel struct {
 // internal reports whether this tunnel is an internal (.internal) endpoint.
 func (t *Tunnel) internal() bool {
 	return t.req != nil && t.req.Binding == msg.BindingInternal
+}
+
+// agentTLS reports whether this endpoint terminates public TLS in its agent
+// (SPEC-CLUSTER5 5.1/5.2): the server routes such an endpoint's traffic by
+// SNI and joins it as raw bytes, and never holds the certificate, the keys,
+// or the plaintext.
+//
+// The protocol check is part of the definition, not a guard: agent
+// termination is a property of the https leg only. A multi-leg request
+// ("http+https") carries the field on every leg the server splits it into,
+// so an http or tcp leg arrives with TLSTermination set and must simply have
+// nothing to do with it -- validateRequest normalizes and checks the value's
+// spelling, and this is where it takes effect.
+func (t *Tunnel) agentTLS() bool {
+	return t.req != nil && t.req.Protocol == msg.ProtoHTTPS && t.req.TLSTermination == msg.TLSTerminationAgent
 }
 
 // forwardTo returns the raw forward_to target this tunnel was registered
@@ -328,6 +350,28 @@ func (t *Tunnel) validateRequest() error {
 		return fmt.Errorf("%s: Protocol %s is not supported", what, m.Protocol)
 	}
 
+	// TLSTermination (SPEC-CLUSTER5 5.1) is canonicalized like Binding: an
+	// exact spelling, accepted in exactly two values. A typo ("agents",
+	// "Agent-side") is refused rather than read as the edge default, because
+	// silently falling back to edge termination would register an endpoint
+	// where the server holds the certificate the operator believes the agent
+	// holds -- the one fallback this field must never take.
+	//
+	// It is honored only on the https leg (Tunnel.agentTLS). On the http and
+	// tcp legs of a multi-leg request it is deliberately inert rather than an
+	// error: the field rides on the request as a whole while the server
+	// registers one leg at a time, so "http+https" with agent termination --
+	// a legitimate endpoint pair -- would fail outright if the http leg
+	// refused a value only the https leg can act on. There is no TLS on those
+	// legs, so there is nothing whose termination could be misconfigured.
+	m.TLSTermination = strings.ToLower(strings.TrimSpace(m.TLSTermination))
+	switch m.TLSTermination {
+	case msg.TLSTerminationEdge, msg.TLSTerminationAgent:
+	default:
+		return fmt.Errorf("%s: TLSTermination %q is not supported (use %q for server-side termination or %q for agent-side termination)",
+			what, m.TLSTermination, msg.TLSTerminationEdge, msg.TLSTerminationAgent)
+	}
+
 	return nil
 }
 
@@ -427,7 +471,7 @@ func (t *Tunnel) registerTcp() error {
 
 	// use the custom remote port you asked for
 	if m.RemotePort != 0 {
-		return bindTcp(int(m.RemotePort))
+		return t.bindClaimedTcp(int(m.RemotePort), bindTcp)
 	}
 
 	// try to return to you the same port you had before
@@ -438,8 +482,11 @@ func (t *Tunnel) registerTcp() error {
 		port, parseErr := strconv.Atoi(portPart)
 		if parseErr != nil {
 			t.ctl.conn.Error("Failed to parse cached url port as integer: %s", portPart)
-		} else if bindErr := bindTcp(port); bindErr != nil {
-			// we have a valid, cached port, but we could not bind it
+		} else if bindErr := t.bindClaimedTcp(port, bindTcp); bindErr != nil {
+			// we have a valid, cached port, but we could not claim or bind it.
+			// A claim refusal (another account took the port while we were
+			// away) reads exactly like the bind failures it sits next to here:
+			// the port is gone, and a random one is the fallback it always was.
 			t.ctl.conn.Warn("Failed to get custom port %d: %v, trying a random one", port, bindErr)
 		} else {
 			// success, we're done
@@ -449,6 +496,34 @@ func (t *Tunnel) registerTcp() error {
 
 	// Bind for TCP connections
 	return bindTcp(0)
+}
+
+// bindClaimedTcp claims port for this tunnel's account and binds it, in that
+// order: the ownership registry (SPEC-CLUSTER5 4.1) is consulted before the
+// kernel sees the bind, so a port another account holds is refused with the
+// claim's reason and never turns into the raw "address already in use" that
+// hides who holds it.
+//
+// When the bind itself fails -- a privileged port, or a process outside this
+// registry holding the number -- the claim is released again: a port this
+// server could not bind must not stay locked against the account that asked
+// for it, and the next registration starts from a clean slate either way.
+// The claim that survives is recorded on the tunnel (t.claimedPort) so its
+// teardown releases exactly what it holds, pooling joiners included by
+// construction: a tunnel that joins a pooling bucket never binds, and so
+// never claims, and its Shutdown has nothing to release.
+func (t *Tunnel) bindClaimedTcp(port int, bindTcp func(int) error) error {
+	if err := portClaims.Claim(port, t.owner); err != nil {
+		return fmt.Errorf("%s: %w", endpointName(t.req), err)
+	}
+
+	t.claimedPort = port
+	if err := bindTcp(port); err != nil {
+		portClaims.Release(port, t.owner)
+		t.claimedPort = 0
+		return err
+	}
+	return nil
 }
 
 // pooledTcpUrl returns the url this pooling TCP tunnel would share with an
@@ -468,6 +543,16 @@ func (t *Tunnel) Shutdown() {
 
 	// mark that we're shutting down
 	atomic.StoreInt32(&t.closing, 1)
+
+	// Release the fixed-port claim this tunnel holds (SPEC-CLUSTER5 4.1).
+	// This is the release side of bindClaimedTcp's claim: the port becomes
+	// available to other accounts here, at teardown, and not one socket
+	// sooner -- which is the whole point of the registry. A tunnel that
+	// joined a pooling bucket never claimed a port and releases nothing.
+	if t.claimedPort != 0 {
+		portClaims.Release(t.claimedPort, t.owner)
+		t.claimedPort = 0
+	}
 
 	// Close the public listener if this is the tunnel that bound it. Pooling
 	// members share the creator's listener and must leave it open for the
@@ -681,6 +766,19 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 // that carries it to the agent, running the endpoint's traffic policy over the
 // heads in both directions.
 //
+// ZERO-KNOWLEDGE PASSTHROUGH (SPEC-CLUSTER5 5.2/8.2). For an agent-terminated
+// endpoint the join is RAW BYTES ONLY, whatever policies exist: the public leg
+// is TLS whose keys this server does not hold, every byte on it is ciphertext,
+// and there is no plaintext head here for a rewriter hook to parse -- pointing
+// the request/response hooks at this stream would feed them TLS records, and
+// worse, would mean the server was parsing traffic the whole design promises
+// it cannot read. The on_http_request / on_http_response phases for such an
+// endpoint run in the AGENT (client/model.go serveProxyConnection), where the
+// plaintext exists; on_tcp_connect already ran server-side, in serveAgentTLS.
+// Everything else about the endpoint keeps working over the raw join:
+// rewriting, XFF and compression happen agent-side after it terminates the
+// TLS, and the 502-on-dead-upstream path lives there too.
+//
 // The join direction mirrors the client's (client/model.go, relay): each
 // rewriter wraps the *source* end of the direction it rewrites -- the request
 // rewriter reads the public connection, the response rewriter reads the proxy
@@ -694,6 +792,20 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 // again here would do them twice on the same bytes. Without a policy the raw
 // join runs, which is the path this server took before policies existed.
 func (t *Tunnel) join(publicConn, proxyConn conn.Conn, pol *policy.Compiled) (bytesIn, bytesOut int64) {
+	if t.agentTLS() {
+		return conn.Join(publicConn, proxyConn)
+	}
+
+	// A connection that arrived over an agent-terminated entry endpoint's SNI
+	// route stays ciphertext even where its forward_to chain lands: if that is
+	// a plain-HTTP endpoint, THIS tunnel holds no TLS key for the stream
+	// either, and its hooks would be parsing TLS records. The marker set by
+	// serveAgentTLS carries the entry endpoint's zero-knowledge property with
+	// the connection (SPEC-CLUSTER5 8.2).
+	if _, raw := publicConn.(*passthroughConn); raw {
+		return conn.Join(publicConn, proxyConn)
+	}
+
 	if pol == nil {
 		return conn.Join(publicConn, proxyConn)
 	}

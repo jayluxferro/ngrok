@@ -43,6 +43,14 @@ type Tunnel struct {
 	Pooling   bool
 	ForwardTo string
 	Compress  bool
+
+	// AgentTLS reports that this tunnel's public TLS terminates in the agent
+	// (SPEC-CLUSTER5 5.3) instead of at the edge: the server relays the TLS
+	// bytes unread and this client decrypts. The proxy path reads it to decide
+	// whether to terminate, and a view may show it; nothing else in this
+	// package interprets it. Only meaningful for https public URLs -- a tunnel
+	// with both legs carries the flag, but its http leg is still edge-served.
+	AgentTLS bool
 }
 
 type ConnectionContext struct {

@@ -429,7 +429,12 @@ func armProxyPool(t *testing.T, ctl *Control) conn.Conn {
 func dispatch(t *testing.T, listenerOwner *Tunnel, proxyConn conn.Conn) msg.StartProxy {
 	t.Helper()
 
-	publicClient, err := net.DialTCP("tcp", nil, listenerOwner.listener.Addr().(*net.TCPAddr))
+	// Dial loopback explicitly, never the listener's own Addr(): bindTcp
+	// binds the 0.0.0.0 wildcard, and using that literal as a *destination*
+	// only maps to loopback on Linux — on macOS the connect stalls forever
+	// and the test times out.
+	port := listenerOwner.listener.Addr().(*net.TCPAddr).Port
+	publicClient, err := net.DialTCP("tcp", nil, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	if err != nil {
 		t.Fatalf("failed to dial the pooled port of %s: %v", listenerOwner.url, err)
 	}

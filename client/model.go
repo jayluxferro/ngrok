@@ -12,6 +12,7 @@ import (
 	"ngrok/conn"
 	"ngrok/log"
 	"ngrok/msg"
+	"ngrok/policy"
 	"ngrok/proto"
 	"ngrok/rewriter"
 	"ngrok/util"
@@ -54,7 +55,17 @@ const (
 	// consumes one of the bounded attempts. Without it, a server that rejects
 	// every mux conn would be redialed in a hot loop forever.
 	muxMinSessionLifetime = 5 * time.Second
-	BadGateway            = `<html>
+
+	// agentTLSHandshakeTimeout bounds the public TLS handshake of an
+	// agent-terminated tunnel (SPEC-CLUSTER5 5.3). It is the server's
+	// connReadTimeout (server/main.go) on purpose: the server bounds how long
+	// it will wait to see what a connection is, and the agent's answer to that
+	// wait -- the handshake -- should not be the step that outlives the
+	// patience on the other end. Like the server's, it is a deadline set before
+	// the handshake and cleared after, so a live connection is never throttled
+	// by it.
+	agentTLSHandshakeTimeout = 10 * time.Second
+	BadGateway               = `<html>
 <body style="background-color: #97a8b9">
     <div style="margin:auto; width:400px;padding: 20px 60px; background-color: #D3D3D3; border: 5px solid maroon;">
         <h2>Tunnel %s unavailable</h2>
@@ -108,6 +119,27 @@ type ClientModel struct {
 	// the watchdog replaces it while ReqProxy handlers read it.
 	muxMu sync.Mutex
 	mux   *muxSession
+
+	// Per-tunnel runtime for agent-terminated tunnels (SPEC-CLUSTER5 5.3),
+	// both keyed by public URL and both built when the tunnel is established
+	// (NewTunnel), i.e. once per tunnel session:
+	//
+	//   - agentTLS is the tls.Config that terminates the tunnel's public side.
+	//     Built per session on purpose: the ephemeral cert model is one
+	//     certificate per session, and re-reading the configured files per
+	//     session picks up a certificate rotated on disk.
+	//   - tunnelPolicies is the tunnel's traffic policy, compiled client-side
+	//     with the same policy package call the server's Tunnel.join uses. On
+	//     an agent-terminated tunnel the http phases run HERE, where plaintext
+	//     is visible; the server skips them for these tunnels.
+	//
+	// The mutexes are separate because the two maps are written and read at
+	// different times (TLS at establishment, hooks per connection) and are
+	// unrelated to each other.
+	agentTLSMu       sync.Mutex
+	agentTLS         map[string]*tls.Config
+	tunnelPoliciesMu sync.Mutex
+	tunnelPolicies   map[string]*policy.Compiled
 }
 
 // sessionSecretValue returns the session secret the server handed out, or ""
@@ -194,6 +226,11 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 
 		// bounded proxy setup workers
 		proxyWorkers: make(chan struct{}, config.ProxyMaxConcurrent),
+
+		// per-tunnel agent TLS and traffic-policy runtime (SPEC-CLUSTER5 5.3),
+		// populated per tunnel session by establishTunnelRuntime
+		agentTLS:       make(map[string]*tls.Config),
+		tunnelPolicies: make(map[string]*policy.Compiled),
 	}
 
 	// configure TLS
@@ -457,6 +494,35 @@ func (c *ClientModel) control() {
 			tunnelCfg := reqIdToTunnelConfig[m.ReqId]
 			tunnel := tunnelFromConfig(m.Url, m.Protocol, c.protoMap[m.Protocol], tunnelCfg)
 
+			// The ack must echo the termination mode this client asked for.
+			// A server from before agent TLS termination accepts the
+			// registration and drops the field in silence -- the endpoint
+			// comes up edge-terminated while this agent arms its own TLS
+			// terminator, and every connection then fails twice over. The
+			// echo turns that into a refusal here, at establishment, with an
+			// error that says what to do about it.
+			if err := terminationEchoError(m.Url, tunnelCfg, m); err != nil {
+				emsg := err.Error()
+				c.Error(emsg)
+				c.ctl.Shutdown(emsg)
+				continue
+			}
+
+			// Build the per-session runtime of agent-terminated tunnels: the
+			// tls.Config that will terminate the public side, and the traffic
+			// policy compiled client-side (its http phases run here, not on the
+			// server, for these tunnels). A failure is fatal to the session:
+			// the material was already validated at load, so this only fires
+			// when a certificate file changed or vanished under us, and
+			// silently serving the tunnel without TLS would be the one failure
+			// mode worse than stopping.
+			if err = c.establishTunnelRuntime(m.Url, tunnelCfg); err != nil {
+				emsg := fmt.Sprintf("Tunnel %s: %v", m.Url, err)
+				c.Error(emsg)
+				c.ctl.Shutdown(emsg)
+				continue
+			}
+
 			c.tunnelsMu.Lock()
 			c.tunnels[tunnel.PublicUrl] = tunnel
 			c.tunnelsMu.Unlock()
@@ -504,11 +570,28 @@ func reqTunnelFromConfig(reqId string, config *TunnelConfiguration) *msg.ReqTunn
 		Pooling:   config.Pooling,
 		ForwardTo: config.ForwardTo,
 
+		// SPEC-CLUSTER5 5.1: "" (the zero value every pre-cluster-5 client
+		// sends) is edge termination -- the server decrypts, today's default --
+		// and TLSTerminationAgent asks for passthrough: the server routes the
+		// tunnel's https traffic by SNI and never sees plaintext.
+		TLSTermination: tlsTerminationForWire(config),
+
 		// Nil when the tunnel has no policy, which is the common case and the
 		// value every pre-cluster-4 client sends: the field is additive, and
 		// the server's no-policy path is the one it always took.
 		TrafficPolicy: config.TrafficPolicy,
 	}
+}
+
+// tlsTerminationForWire maps the config's agent_tls_termination switch onto the
+// ReqTunnel.TLSTermination wire vocabulary (SPEC-CLUSTER5 5.1, single source of
+// truth in package msg): false is the empty string the wire has always carried
+// (edge termination), true is msg.TLSTerminationAgent.
+func tlsTerminationForWire(config *TunnelConfiguration) string {
+	if config.AgentTLSTermination {
+		return msg.TLSTerminationAgent
+	}
+	return msg.TLSTerminationEdge
 }
 
 // tunnelFromConfig builds the mvc.Tunnel the client works with for a tunnel the
@@ -542,6 +625,13 @@ func tunnelFromConfig(publicUrl, protocolName string, protocol proto.Protocol, c
 		Pooling:   config.Pooling,
 		ForwardTo: config.ForwardTo,
 		Compress:  config.Compress(),
+
+		// SPEC-CLUSTER5 5.3: the flag the proxy path checks to decide whether
+		// THIS connection's public side terminates here, and what a view may
+		// display. It rides on every leg of the tunnel; only the https leg's
+		// public URL actually gets termination (serveProxyConnection checks the
+		// scheme too).
+		AgentTLS: config.AgentTLSTermination,
 	}
 }
 
@@ -651,7 +741,11 @@ func (c *ClientModel) proxyStream(sess *muxSession) error {
 // apart: the metrics, the 502 for a dead upstream, the tee/rewriter stack
 // inside relay() and the byte accounting are common to both.
 //
-// The remainder of what used to be proxy()'s body follows, unchanged.
+// Since SPEC-CLUSTER5 5.3 it also serves agent-terminated tunnels: when the
+// tunnel's public TLS terminates here, the proxy stream arrives carrying the
+// visitor's TLS records (the server relays them unread), and the steps below
+// terminate that TLS before anything else happens. The order of the steps is
+// the spec's, and the dial-first order is the one this function has always had.
 func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.StartProxy) {
 	c.tunnelsMu.RLock()
 	tunnel, ok := c.tunnels[startPxy.Url]
@@ -661,20 +755,46 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 		return
 	}
 
-	// start up the private connection
+	// Step 1: dial the local upstream FIRST, before any TLS work, exactly as
+	// this path always has. The order is load-bearing for the dead-upstream
+	// case: on an agent-terminated tunnel the 502 has to go out over a
+	// completed TLS handshake (step 3), and knowing the dial's outcome before
+	// the handshake is what makes that one message instead of an
+	// alert-after-request.
 	start := time.Now()
-	localConn, err := conn.Dial(tunnel.LocalAddr, "prv", nil)
-	if err != nil {
-		remoteConn.Warn("Failed to open private leg %s: %v", tunnel.LocalAddr, err)
+	localConn, localErr := conn.Dial(tunnel.LocalAddr, "prv", nil)
+	if localErr != nil {
+		remoteConn.Warn("Failed to open private leg %s: %v", tunnel.LocalAddr, localErr)
+	}
 
+	if c.agentTerminated(tunnel) {
+		// Step 2: terminate the public TLS. The remote conn -- the proxy/mux
+		// stream the server is relaying raw -- becomes the plaintext leg the
+		// rest of the path works on.
+		plain, ok := c.terminatePublicTLS(remoteConn, tunnel, startPxy.ClientAddr)
+		if !ok {
+			return
+		}
+		defer plain.Close()
+
+		// Step 3: dead upstream, answered with the existing 502 over the
+		// terminated connection. The handshake is already complete, so the
+		// visitor gets a real HTTP 502 instead of a TLS decode error.
+		if localErr != nil {
+			c.writeBadGateway(plain, tunnel)
+			return
+		}
+
+		// Steps 4 and 5 happen in the relay below: the tee and the
+		// header/compression/traffic-policy rewriter all work on the plaintext
+		// legs, and the terminated conn takes the remote seat.
+		remoteConn = plain
+	} else if localErr != nil {
+		// The edge path's dead-upstream answer, unchanged: plaintext 502 when
+		// this tunnel speaks HTTP (and a human might see it), a bare close
+		// otherwise.
 		if msg.IsHTTP(tunnel.Protocol.GetName()) {
-			// try to be helpful when you're in HTTP mode and a human might see the output
-			badGatewayBody := fmt.Sprintf(BadGateway, tunnel.PublicUrl, tunnel.LocalAddr, tunnel.LocalAddr)
-			remoteConn.Write([]byte(fmt.Sprintf(`HTTP/1.0 502 Bad Gateway
-Content-Type: text/html
-Content-Length: %d
-
-%s`, len(badGatewayBody), badGatewayBody)))
+			c.writeBadGateway(remoteConn, tunnel)
 		}
 		return
 	}
@@ -685,6 +805,17 @@ Content-Length: %d
 	m.connMeter.Mark(1)
 	c.update()
 	m.connTimer.Time(func() {
+		// The inspector tee stays on the local leg, agent-terminated or not
+		// (SPEC-CLUSTER5 5.3 step 4). Both legs are plaintext at this point,
+		// but the tee's buffer roles are fixed by proto/http.go -- its
+		// WriteBuffer carries what is written INTO the conn (requests, on the
+		// local leg) and its ReadBuffer what is read FROM it (responses). Tee'd
+		// on the plain leg the roles would come out exactly reversed and the
+		// analyzer would parse responses as requests, which would take changes
+		// to proto/http.go that the spec rules out. On the local leg the
+		// analyzer sees the same plaintext it always has, with zero changes,
+		// which is the step's invariant ("analyzer sees plaintext, local-leg
+		// plumbing reused") kept by the one honest placement of the tee.
 		localConn := tunnel.Protocol.WrapConn(localConn, mvc.ConnectionContext{Tunnel: tunnel, ClientAddr: startPxy.ClientAddr})
 		bytesIn, bytesOut := c.relay(localConn, remoteConn, tunnel, startPxy.ClientAddr)
 		m.bytesIn.Update(bytesIn)
@@ -693,6 +824,186 @@ Content-Length: %d
 		m.bytesOutCount.Inc(bytesOut)
 	})
 	c.update()
+}
+
+// agentTerminated reports whether THIS proxy connection's public side
+// terminates in the agent (SPEC-CLUSTER5 5.3). Both conditions are needed: the
+// tunnel flag rides on every leg of a mixed http+https tunnel, but only the
+// https leg's connections arrive carrying TLS bytes to terminate -- the http
+// leg stays edge-served exactly as before.
+func (c *ClientModel) agentTerminated(tunnel mvc.Tunnel) bool {
+	return tunnel.AgentTLS && strings.HasPrefix(tunnel.PublicUrl, msg.ProtoHTTPS+"://")
+}
+
+// terminatePublicTLS is step 2: wrap the proxy stream -- which the server is
+// relaying as raw TLS bytes -- in tls.Server with the tunnel's per-session cert
+// config, and run the handshake under the handshake deadline.
+//
+// The deadline follows the established convention (the server's connReadTimeout
+// shape, server/http.go): set before the TLS work, cleared right after, so a
+// healthy handshake is bounded and a healthy connection is not throttled by the
+// deadline it survived.
+//
+// ok is false when the handshake failed: the connection is closed and the
+// failure logged at WARN. The visitor sees a TLS alert and nothing else --
+// whatever it sent, none of it reached the local upstream, which is the
+// zero-knowledge property holding at the least friendly edge of the path.
+// clientAddr is the visitor's address from StartProxy: the remote addr of the
+// proxy stream itself is this agent's link to the server, not the client the
+// handshake failed with, so the WARN names the visitor.
+func (c *ClientModel) terminatePublicTLS(remoteConn conn.Conn, tunnel mvc.Tunnel, clientAddr string) (plain conn.Conn, ok bool) {
+	cfg := c.agentTLSConfigFor(tunnel.PublicUrl)
+	if cfg == nil {
+		// Only reachable if the tunnel was established without its per-session
+		// runtime (establishTunnelRuntime): a wiring bug, which is why this is
+		// an Error and a close rather than an answer the visitor could read.
+		remoteConn.Error("No agent TLS configuration for tunnel %s", tunnel.PublicUrl)
+		remoteConn.Close()
+		return nil, false
+	}
+
+	tlsConn := tls.Server(remoteConn, cfg)
+	plain = conn.Wrap(tlsConn, "tls")
+
+	// The deadline bounds the handshake, and the timer below backs it up:
+	// on a TCP leg SetDeadline alone is enough (the kernel wakes a parked
+	// read), but on a mux stream SetReadDeadline only stores its value -- see
+	// the wake rationale in rewriter/conn.go -- so a peer that stalls
+	// mid-ClientHello would park the handshake forever. Closing the conn is
+	// the one ending every conn.Conn implementation obeys.
+	plain.SetDeadline(time.Now().Add(agentTLSHandshakeTimeout))
+	timer := time.AfterFunc(agentTLSHandshakeTimeout, func() { tlsConn.Close() })
+	err := tlsConn.Handshake()
+	timer.Stop()
+	plain.SetDeadline(time.Time{})
+	if err != nil {
+		plain.Warn("TLS handshake with public client %s failed: %v", clientAddr, err)
+		plain.Close()
+		return nil, false
+	}
+
+	return plain, true
+}
+
+// terminationEchoError checks a NewTunnel ack against the termination mode its
+// tunnel asked for (the ack's TLSTermination echo, set by the server from what
+// it actually registered). nil means the ack is consistent; an error means the
+// endpoint must not be served -- most importantly the old-server pairing,
+// where the registration succeeded, the field was dropped in silence, and the
+// only honest outcome is a refusal naming the version gap.
+func terminationEchoError(publicUrl string, tunnelCfg *TunnelConfiguration, m *msg.NewTunnel) error {
+	if tunnelCfg == nil || !tunnelCfg.AgentTLSTermination {
+		return nil
+	}
+	if m.TLSTermination == msg.TLSTerminationAgent {
+		return nil
+	}
+	return fmt.Errorf("Tunnel %s: the server did not confirm agent TLS termination "+
+		"(it echoed %q; this client asked for %q). The server predates zero-knowledge TLS -- "+
+		"upgrade ngrokd to 1.0.7 or later, or remove agent_tls_termination from this tunnel",
+		publicUrl, m.TLSTermination, msg.TLSTerminationAgent)
+}
+
+// writeBadGateway writes the HTTP/1.0 502 page for a dead upstream. It is the
+// inline spelling the edge path has always used, extracted so that the
+// agent-terminated path (SPEC-CLUSTER5 5.3 step 3) sends byte-for-byte the same
+// answer over its terminated connection -- the destination differs, the page
+// does not.
+func (c *ClientModel) writeBadGateway(dst conn.Conn, tunnel mvc.Tunnel) {
+	// try to be helpful when you're in HTTP mode and a human might see the output
+	badGatewayBody := fmt.Sprintf(BadGateway, tunnel.PublicUrl, tunnel.LocalAddr, tunnel.LocalAddr)
+	dst.Write([]byte(fmt.Sprintf(`HTTP/1.0 502 Bad Gateway
+Content-Type: text/html
+Content-Length: %d
+
+%s`, len(badGatewayBody), badGatewayBody)))
+}
+
+// establishTunnelRuntime builds the per-session state serving a tunnel needs
+// beyond its mvc.Tunnel, when the tunnel is established (msg.NewTunnel):
+//
+//   - for an agent-terminated tunnel, the tls.Config that will terminate its
+//     public side (tlsagent.go). Built per session on purpose: the ephemeral
+//     cert model is one certificate per session, and re-reading the configured
+//     files here means a certificate rotated on disk is picked up at the next
+//     reconnect without restarting the client. Everything that can be wrong
+//     with the files was already refused at load time (validateAgentTLS), so an
+//     error here is a file that changed under us.
+//   - for a tunnel with a traffic policy, the policy compiled client-side with
+//     the same policy package call the server's Tunnel.join uses. On an
+//     edge-terminated tunnel the map entry sits unused -- the server runs those
+//     phases, and attachPolicyHooks only consults the map for agent-terminated
+//     tunnels. (on_tcp_connect is NOT in this story: it stays server-side for
+//     every tunnel -- it runs at accept time, before any proxy conn exists, so
+//     an agent could not evaluate it at all. That is the phase split of
+//     SPEC-CLUSTER5 5.3 step 6.)
+func (c *ClientModel) establishTunnelRuntime(publicUrl string, tunnelCfg *TunnelConfiguration) error {
+	if tunnelCfg == nil {
+		return nil
+	}
+
+	if tunnelCfg.AgentTLSTermination {
+		// Only the https leg terminates here. A mixed tunnel registers one
+		// leg per protocol, both carrying the flag; building (and, for the
+		// ephemeral model, minting and warning about) a session config for the
+		// http leg would be runtime nothing can ever reach, because
+		// agentTerminated requires the https scheme too.
+		if strings.HasPrefix(publicUrl, msg.ProtoHTTPS+"://") {
+			cfg, err := agentTLSConfig(tunnelCfg)
+			if err != nil {
+				return err
+			}
+			c.setAgentTLSConfig(publicUrl, cfg)
+		}
+	}
+
+	if tunnelCfg.TrafficPolicy != nil {
+		compiled, err := tunnelCfg.TrafficPolicy.Compile()
+		if err != nil {
+			// The policy was validated at load and compiled by the server at
+			// registration (it answered NewTunnel, not an error), so this is
+			// "the same document stopped compiling here": report it with the
+			// URL, loudly, rather than serve an unpoliced tunnel.
+			return fmt.Errorf("traffic policy failed to compile: %v", err)
+		}
+		c.setCompiledPolicy(publicUrl, compiled)
+	}
+
+	return nil
+}
+
+// Per-URL accessors for the runtime maps. The setters lazy-init so that a
+// zero-value ClientModel (the tests build several) stores without a panic; the
+// getters read a nil map as "not set", which every caller already handles.
+
+func (c *ClientModel) setAgentTLSConfig(publicUrl string, cfg *tls.Config) {
+	c.agentTLSMu.Lock()
+	defer c.agentTLSMu.Unlock()
+	if c.agentTLS == nil {
+		c.agentTLS = make(map[string]*tls.Config)
+	}
+	c.agentTLS[publicUrl] = cfg
+}
+
+func (c *ClientModel) agentTLSConfigFor(publicUrl string) *tls.Config {
+	c.agentTLSMu.Lock()
+	defer c.agentTLSMu.Unlock()
+	return c.agentTLS[publicUrl]
+}
+
+func (c *ClientModel) setCompiledPolicy(publicUrl string, compiled *policy.Compiled) {
+	c.tunnelPoliciesMu.Lock()
+	defer c.tunnelPoliciesMu.Unlock()
+	if c.tunnelPolicies == nil {
+		c.tunnelPolicies = make(map[string]*policy.Compiled)
+	}
+	c.tunnelPolicies[publicUrl] = compiled
+}
+
+func (c *ClientModel) compiledPolicyFor(publicUrl string) *policy.Compiled {
+	c.tunnelPoliciesMu.Lock()
+	defer c.tunnelPoliciesMu.Unlock()
+	return c.tunnelPolicies[publicUrl]
 }
 
 // relay shuttles bytes between the two legs of a proxied connection until both
@@ -728,6 +1039,17 @@ func (c *ClientModel) relay(localConn, remoteConn conn.Conn, tunnel mvc.Tunnel, 
 	}
 
 	policy := policyFromTunnel(tunnel, clientAddr)
+
+	// SPEC-CLUSTER5 5.3 step 5: on an agent-terminated tunnel this client,
+	// not the server, runs the endpoint's traffic policy http phases -- the
+	// server has only ciphertext at its end of these tunnels. The hooks are
+	// merged into the same rewriter.Policy that carries the header and
+	// compression semantics, so a policy with phases and a tunnel with header
+	// settings act on one stream, in the rewriter's own order (hooks first,
+	// then the fixed headers -- see package rewriter). Tunnels without an
+	// https-agent flag keep the server-side split and get nothing here.
+	c.attachPolicyHooks(tunnel, clientAddr, policy)
+
 	if policy == nil || policy.IsNoop() {
 		// A no-op policy would only copy the bytes the long way round. A live
 		// HTTP tunnel cannot currently produce one -- SPEC 4.3's X-Forwarded
@@ -741,6 +1063,42 @@ func (c *ClientModel) relay(localConn, remoteConn conn.Conn, tunnel mvc.Tunnel, 
 	c.Debug("Tunnel %s: rewriting HTTP headers (host_header=%q)", tunnel.PublicUrl, policy.HostHeader)
 	toUpstream, fromUpstream := rewriter.NewConnPair(remoteConn, localConn, policy)
 	return conn.Join(fromUpstream, toUpstream)
+}
+
+// attachPolicyHooks merges a tunnel's compiled traffic policy http phases into
+// the connection's rewrite policy -- on an agent-terminated tunnel only.
+//
+// The split is the one SPEC-CLUSTER5 5.3 step 6 fixes in place: on_tcp_connect
+// stays server-side for every tunnel (it evaluates at accept time, before any
+// proxy conn exists, so the agent never sees a connection the phase would have
+// refused), while on_http_request / on_http_response move to the agent for
+// agent-terminated tunnels, because the server never has plaintext to run them
+// on. The hooks are built per connection -- they hold that connection's policy
+// vars -- with the same policy package API the server uses in Tunnel.join
+// (Compiled.RequestHook / Compiled.ResponseHook), and they are merged with, not
+// instead of, the tunnel's header and compression policy: the rewriter applies
+// a verdict's headers and the fixed headers to the same head.
+//
+// On an edge-terminated tunnel this does nothing on purpose: the server runs
+// the phases there, and running them here too would apply every action twice.
+// With no compiled policy, or a policy with no http phases, both hooks come
+// back nil and the rewriter behaves exactly as today.
+func (c *ClientModel) attachPolicyHooks(tunnel mvc.Tunnel, clientAddr string, p *rewriter.Policy) {
+	if p == nil || !c.agentTerminated(tunnel) {
+		return
+	}
+
+	compiled := c.compiledPolicyFor(tunnel.PublicUrl)
+	if compiled == nil {
+		return
+	}
+
+	// c carries the log.Logger the policy's log actions and fail-open warnings
+	// are written through, and clientAddr is what conn.client_ip /
+	// conn.remote_addr report -- the same value the server passes on this
+	// path's edge twin (the public connection's remote address).
+	p.RequestHook = compiled.RequestHook(c, clientAddr)
+	p.ResponseHook = compiled.ResponseHook(c, clientAddr)
 }
 
 // muxSession is the client's end of one multiplexed proxy connection (SPEC

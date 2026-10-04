@@ -297,11 +297,16 @@ func (c *Control) registerTunnel(rawTunnelReq *msg.ReqTunnel) {
 		// add it to the list of tunnels
 		c.tunnels = append(c.tunnels, t)
 
-		// acknowledge success
+		// acknowledge success. The termination echo is the ack's contract
+		// with agent-terminated endpoints: the client compares it against
+		// what it asked for and refuses the tunnel when they disagree, which
+		// is what turns "old server silently dropped the field" from a
+		// per-connection failure into a registration-time error.
 		c.out <- &msg.NewTunnel{
-			Url:      t.url,
-			Protocol: proto,
-			ReqId:    rawTunnelReq.ReqId,
+			Url:            t.url,
+			Protocol:       proto,
+			ReqId:          rawTunnelReq.ReqId,
+			TLSTermination: t.req.TLSTermination,
 		}
 
 		rawTunnelReq.Hostname = strings.Replace(t.url, proto+"://", "", 1)

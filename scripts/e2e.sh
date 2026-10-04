@@ -4,9 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-export GOCACHE="${GOCACHE:-/tmp/go-build-cache}"
-export GOMODCACHE="${GOMODCACHE:-/tmp/go-mod-cache}"
-export GOPATH="${GOPATH:-/tmp/go}"
+# Go caches default to the machine's configured paths (`go env`), never to an
+# empty /tmp directory: a hermetic-looking /tmp module cache is just a cold
+# one -- every run re-downloads every module, and a sandbox whose /tmp lacks
+# them fails the build outright. An inherited environment still wins.
+export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
+export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
+export GOPATH="${GOPATH:-$(go env GOPATH)}"
 export NGROK_INSECURE_SKIP_VERIFY="${NGROK_INSECURE_SKIP_VERIFY:-1}"
 
 TMPDIR="$(mktemp -d)"
@@ -719,6 +723,370 @@ fi
 if ! grep -q 'on_http_request\[0\] (rate-limit)' "$TMPDIR/policy-broken.out"; then
   echo "[e2e] the startup failure does not name the rule at fault:"
   cat "$TMPDIR/policy-broken.out"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Zero-knowledge TLS and fixed TCP ports (SPEC-CLUSTER5). Every scenario above
+# runs against a server whose https listener is disabled; this group starts a
+# SECOND ngrokd with -httpsAddr enabled -- the first coverage the public https
+# path has ever had. A second server rather than a restart, so the scenarios
+# above keep the exact server they were written against, and so this one can
+# run with -authToken set: port ownership (the tcp half of this cluster) is
+# only enforced BETWEEN tokens, and with no tokens configured every client
+# shares the one default owner -- there would be nothing to refuse.
+#
+# The second server runs on its embedded development certificate (no
+# -tlsCrt/-tlsKey), which is why every edge-terminated request below is
+# curl -k. For the agent-terminated tunnels that flag would miss the point:
+# the agent presents a leaf minted from the test CA generated below, and curl
+# verifies THAT chain with --cacert. The server's certificate is never
+# involved, which is the feature.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] generating the test CA for agent-terminated tunnels"
+# basicConstraints CA:TRUE is load-bearing, not decoration: the client refuses
+# a tls.ca_crt that is not a CA ("it lacks CA:TRUE"), and Go reads a
+# certificate with no basicConstraints extension at all as not-a-CA -- which
+# is what openssl's defaults produce unless the extension is spelled out.
+# -subj is load-bearing too, differently: without it openssl prompts for the
+# distinguished name even though the config's [dn] section answers it (at
+# least LibreSSL does), and a prompt on the suite's stdin parks the whole run.
+cat > "$TMPDIR/zk-ca.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = e2e-zk-ca
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+openssl req -x509 -newkey rsa:2048 -nodes -config "$TMPDIR/zk-ca.cnf" \
+  -keyout "$TMPDIR/zk-ca.key" -out "$TMPDIR/zk-ca.crt" -days 2 \
+  -subj "/CN=e2e-zk-ca" </dev/null >/dev/null 2>&1
+if [[ ! -s "$TMPDIR/zk-ca.crt" ]]; then
+  echo "[e2e] could not generate the test CA"
+  exit 1
+fi
+
+echo "[e2e] starting the https ngrokd (second server, ports distinct from the first)"
+./bin/ngrokd -domain=localhost -httpAddr= -httpsAddr=127.0.0.1:18443 \
+  -tunnelAddr=127.0.0.1:14444 -authToken=alpha,beta \
+  >/tmp/ngrok-e2e-tls-ngrokd.log 2>&1 &
+for i in {1..40}; do
+  if grep -q "Listening for public https connections" /tmp/ngrok-e2e-tls-ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for public https connections" /tmp/ngrok-e2e-tls-ngrokd.log 2>/dev/null; then
+  echo "[e2e] the https ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-tls-ngrokd.log || true
+  exit 1
+fi
+
+# Clients of the second server: same trust posture as above (the control
+# connection rides the server's embedded dev certificate), a token, and an
+# explicit protocol -- the flags feed the synthesized default tunnel, so
+# -proto must name exactly the leg each scenario tests.
+cat > "$TMPDIR/ngrok-tls.yml" <<'YAML'
+server_addr: 127.0.0.1:14444
+trust_host_root_certs: true
+YAML
+
+# wait_for_public_tls <hostname> <ca|->: the https twin of wait_for_public.
+# Two things about the curl spelling here are load-bearing. --resolve points
+# <hostname> at the listener without /etc/hosts and is what puts <hostname>
+# into the SNI extension, which is the name this cluster routes on; and the
+# Host header is pinned to the bare hostname because curl would otherwise
+# send "Host: <hostname>:18443" and the registry keys hostnames without a
+# port -- the same reason the http scenarios hand-write their Host headers.
+# 000 means the TLS handshake itself failed, which for an agent-terminated
+# hostname is the state BEFORE its tunnel registers (the server terminates
+# with its own dev certificate then, and --cacert rightly refuses it); both
+# 404 and 000 mean "not serving yet".
+wait_for_public_tls() {
+  local host="$1"
+  local ca="$2"
+  local code
+  for i in {1..40}; do
+    if [[ "$ca" == "-" ]]; then
+      code="$(curl -sSk -o /dev/null -w '%{http_code}' --resolve "$host:18443:127.0.0.1" -H "Host: $host" "https://$host:18443/" || true)"
+    else
+      code="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$ca" --resolve "$host:18443:127.0.0.1" -H "Host: $host" "https://$host:18443/" || true)"
+    fi
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  echo "[e2e] the https listener never learned the hostname $host"
+  return 1
+}
+
+# tls 1: the plain https this fork always had, finally exercised. The tunnel
+# is edge-terminated: the SNI names an edge endpoint, so the server decrypts
+# with its own certificate and routes by Host exactly as on the http listener.
+echo "[e2e] tls 1: edge-terminated https (server certificate, curl -k)"
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-tls-edge-client.log \
+  -authtoken=alpha -proto=https -hostname=edgetest 19001 >/tmp/ngrok-e2e-tls-edge-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-tls-edge-client.log "edgetest (edge-terminated https)"
+wait_for_public_tls edgetest -
+
+EDGE_RESP="$(curl -fsSk --resolve edgetest:18443:127.0.0.1 -H 'Host: edgetest' https://edgetest:18443/)"
+if [[ "$EDGE_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the edge-terminated https tunnel did not serve the upstream: $EDGE_RESP"
+  exit 1
+fi
+if ! grep -q "SNI edgetest routes to edge-terminated endpoint" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] the edge-terminated request did not take the SNI route:"
+  grep "edgetest" /tmp/ngrok-e2e-tls-ngrokd.log | tail -n 5 || true
+  exit 1
+fi
+
+# tls 2: the zero-knowledge proof. The tunnel is agent-terminated with the CA
+# cert model: curl verifies the leaf the AGENT minted for the SNI name, and
+# the server must have routed the connection by SNI and relayed it as raw TLS
+# bytes -- never terminating it, never seeing a plaintext head.
+echo "[e2e] tls 2: agent-terminated https (CA model) -- the zero-knowledge proof"
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-tls-zk-client.log \
+  -authtoken=alpha -proto=https -hostname=zk \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  19001 >/tmp/ngrok-e2e-tls-zk-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-tls-zk-client.log "zk (agent-terminated https)"
+wait_for_public_tls zk "$TMPDIR/zk-ca.crt"
+
+ZK_RESP="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve zk:18443:127.0.0.1 -H 'Host: zk' https://zk:18443/)"
+if [[ "$ZK_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the agent-terminated https tunnel did not serve the upstream: $ZK_RESP"
+  exit 1
+fi
+
+# The CA model's visible trace on the agent: a leaf minted for the name the
+# visitor's ClientHello carried. (The handshake's SNI reaches the agent's
+# terminator only because the server replayed the connection's first bytes.)
+if ! grep -q 'Minted a .* leaf for "zk"' /tmp/ngrok-e2e-tls-zk-client.log; then
+  echo "[e2e] the agent did not mint a CA leaf for the visitor's SNI name:"
+  tail -n 20 /tmp/ngrok-e2e-tls-zk-client.log || true
+  exit 1
+fi
+
+# The routing half of the proof: the server saw the SNI, found the
+# agent-terminated endpoint, and passed the connection through as raw bytes.
+if ! grep -q "SNI zk routes to agent-terminated endpoint" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] the agent-terminated request did not take the SNI route:"
+  grep "zk" /tmp/ngrok-e2e-tls-ngrokd.log | tail -n 5 || true
+  exit 1
+fi
+if ! grep -q "passing the connection through as raw TLS bytes" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] the server did not pass the agent-terminated connection through as raw bytes"
+  exit 1
+fi
+
+# The negative half, before any scenario below parses a Host: zk head on
+# purpose. "Found hostname" is what the server logs after reading a request
+# head IN PLAINTEXT, and DEBUG is ngrokd's default log level, so one of these
+# lines naming zk would mean the server decrypted this endpoint (or Host-
+# routed a terminated connection at it, which answers 421 and logs as much).
+if grep -q "Found hostname zk in request" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] ZERO-KNOWLEDGE LEAK: the server parsed a plaintext request head for the agent-terminated hostname"
+  grep "Found hostname zk" /tmp/ngrok-e2e-tls-ngrokd.log || true
+  exit 1
+fi
+if grep -q "refusing with 421" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] a connection was Host-routed at the agent-terminated endpoint and answered 421; expected the SNI route"
+  exit 1
+fi
+
+# Scoped to the one connection that carried the request: read its id off the
+# passthrough line and confirm nothing on that connection ever went through a
+# plaintext head parse or a termination failure.
+ZK_CONN="$(grep 'SNI zk routes to agent-terminated endpoint' /tmp/ngrok-e2e-tls-ngrokd.log | grep -o 'pub:[0-9a-f]*' | head -n 1)"
+if [[ -z "$ZK_CONN" ]]; then
+  echo "[e2e] could not read the passthrough connection id from the server log"
+  exit 1
+fi
+if grep -q "\[$ZK_CONN\] Found hostname" /tmp/ngrok-e2e-tls-ngrokd.log || \
+   grep -q "\[$ZK_CONN\] Failed to read valid" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] ZERO-KNOWLEDGE LEAK: connection $ZK_CONN had its payload parsed as plaintext:"
+  grep "\[$ZK_CONN\]" /tmp/ngrok-e2e-tls-ngrokd.log || true
+  exit 1
+fi
+
+# tls 3: SNI demultiplexing on one port. Both tunnels above are live on the
+# same listener; hitting both names back to back and getting each tunnel's own
+# upstream through the right TLS layer is the demux.
+echo "[e2e] tls 3: SNI demux -- one :443, one edge-terminated and one agent-terminated endpoint"
+DEMUX_EDGE="$(curl -fsSk --resolve edgetest:18443:127.0.0.1 -H 'Host: edgetest' https://edgetest:18443/)"
+DEMUX_ZK="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve zk:18443:127.0.0.1 -H 'Host: zk' https://zk:18443/)"
+if [[ "$DEMUX_EDGE" != "e2e-ok" || "$DEMUX_ZK" != "e2e-ok" ]]; then
+  echo "[e2e] the SNI demux served the wrong thing: edge=\"$DEMUX_EDGE\" agent=\"$DEMUX_ZK\""
+  exit 1
+fi
+
+# tls 4: a client that names NO SNI. The handshake then terminates at the
+# server (there is nothing to route on), so the request head arrives in
+# plaintext and Host: zk names an agent-terminated endpoint from a connection
+# that is already terminated -- the one shape the 421 exists for: the right
+# name over the wrong connection.
+echo "[e2e] tls 4: no-SNI client asking for the agent-terminated host gets 421"
+# -quiet implies -ign_eof, so s_client keeps reading until the server closes
+# and the response lands on stdout. -noservername states the intent (some
+# openssls default to deriving an SNI from the connect host; for an IP
+# literal none is sent either way, and older LibreSSLs lack the flag).
+SNI_FLAG=""
+if openssl s_client -help 2>&1 | grep -q -- -noservername; then
+  SNI_FLAG="-noservername"
+fi
+printf 'GET / HTTP/1.1\r\nHost: zk\r\nConnection: close\r\n\r\n' \
+  | openssl s_client -connect 127.0.0.1:18443 $SNI_FLAG -quiet 2>/dev/null >"$TMPDIR/sni-absent.out"
+if ! grep -q "HTTP/1.0 421 Misdirected Request" "$TMPDIR/sni-absent.out"; then
+  echo "[e2e] expected a 421 Misdirected Request for a no-SNI request naming the agent-terminated host:"
+  cat "$TMPDIR/sni-absent.out"
+  exit 1
+fi
+if ! grep -q "refusing with 421" /tmp/ngrok-e2e-tls-ngrokd.log; then
+  echo "[e2e] the server answered 421 without logging the misdirected Host"
+  exit 1
+fi
+
+# tls 5: the traffic policy over an agent-terminated tunnel. The http phases
+# of such a tunnel's policy run in the AGENT -- the server holds only
+# ciphertext -- so a passing deny here proves the agent-side phase split end
+# to end. The upstream echoes a body on every answer, so an empty body on the
+# 403 is the evidence that the agent, not the upstream, answered.
+echo "[e2e] tls 5: policy deny runs agent-side on an agent-terminated tunnel"
+cat > "$TMPDIR/agent-deny.yml" <<'YAML'
+on_http_request:
+  - name: deny
+    expressions:
+      - 'req.url.path == "/blocked"'
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-tls-guard-client.log \
+  -authtoken=alpha -proto=https -hostname=guardzk \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  -traffic-policy-file="$TMPDIR/agent-deny.yml" \
+  19006 >/tmp/ngrok-e2e-tls-guard-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-tls-guard-client.log "guardzk (agent-terminated + policy)"
+wait_for_public_tls guardzk "$TMPDIR/zk-ca.crt"
+
+GUARD_CODE="$(policy_curl -o "$TMPDIR/agent-blocked.body" --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve guardzk:18443:127.0.0.1 -H 'Host: guardzk' https://guardzk:18443/blocked)"
+if [[ "$GUARD_CODE" != "403" ]]; then
+  echo "[e2e] expected the agent-side deny to answer 403, got $GUARD_CODE"
+  exit 1
+fi
+if [[ -s "$TMPDIR/agent-blocked.body" ]]; then
+  echo "[e2e] the denied request reached the upstream:"
+  cat "$TMPDIR/agent-blocked.body"
+  exit 1
+fi
+
+# Control for the deny: the expression matches only /blocked, so another path
+# reaches the upstream untouched (its echo answers, with nothing added).
+GUARD_RESP="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve guardzk:18443:127.0.0.1 \
+  -H 'Host: guardzk' https://guardzk:18443/allowed)"
+if [[ "$GUARD_RESP" != "x-policy=;x-who=" ]]; then
+  echo "[e2e] the path the policy does not match did not reach the upstream: \"$GUARD_RESP\""
+  exit 1
+fi
+
+# tls 6 (composition): host_header rewrite over an agent-terminated tunnel.
+# The upstream is the 403-unless-loopback app from the ollama scenario, so a
+# 200 here is the rewrite having been applied AFTER the agent decrypted -- on
+# the plaintext, where the server has nothing to do with it.
+echo "[e2e] tls 6: host_header rewrite over an agent-terminated tunnel"
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-tls-rewrite-client.log \
+  -authtoken=alpha -proto=https -hostname=rewritezk \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  -host-header=rewrite \
+  19002 >/tmp/ngrok-e2e-tls-rewrite-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-tls-rewrite-client.log "rewritezk (agent-terminated + host_header)"
+wait_for_public_tls rewritezk "$TMPDIR/zk-ca.crt"
+
+REWRITE_RESP="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve rewritezk:18443:127.0.0.1 \
+  -H 'Host: rewritezk' https://rewritezk:18443/)"
+if [[ "$REWRITE_RESP" != "ok" ]]; then
+  echo "[e2e] the host_header rewrite did not reach the upstream over the agent-terminated tunnel: \"$REWRITE_RESP\""
+  exit 1
+fi
+
+# tls 7: fixed remote TCP ports and their ownership. A claims the port, B
+# (a different token -- the second one this server was started with) is
+# refused it by name, and A's restart reclaims it.
+echo "[e2e] ports: client A claims remote port 14877"
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-port-client-a.log \
+  -authtoken=alpha -proto=tcp -remote-port=14877 \
+  19001 >/tmp/ngrok-e2e-port-a-stdout.log 2>&1 &
+PORT_A_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-port-client-a.log "tcp remote-port (client A)"
+
+PORT_URL="$(sed -n 's/.*Tunnel established at \([^ ]*\).*/\1/p' /tmp/ngrok-e2e-port-client-a.log | head -n 1)"
+if [[ "$PORT_URL" != *":14877" ]]; then
+  echo "[e2e] the claimed port did not come back in the tunnel's url: got \"$PORT_URL\""
+  exit 1
+fi
+
+# A tcp tunnel is a raw pipe to the upstream, which speaks HTTP: curl is the
+# end-to-end proof that the fixed port serves THIS agent's local app.
+PORT_RESP="$(curl -fsS --max-time 10 http://127.0.0.1:14877/)"
+if [[ "$PORT_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the fixed remote port did not reach the agent's upstream: $PORT_RESP"
+  exit 1
+fi
+
+echo "[e2e] ports: client B (another auth token) is refused the same port"
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-port-client-b.log \
+  -authtoken=beta -proto=tcp -remote-port=14877 \
+  19001 >/tmp/ngrok-e2e-port-b-stdout.log 2>&1 &
+PORT_B_PID=$!
+
+PORT_B_REFUSED=0
+for i in {1..40}; do
+  if grep -q "remote port 14877 already claimed by another auth token" /tmp/ngrok-e2e-port-client-b.log 2>/dev/null; then
+    PORT_B_REFUSED=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$PORT_B_REFUSED" != "1" ]]; then
+  echo "[e2e] the second token was not refused the claimed port:"
+  tail -n 40 /tmp/ngrok-e2e-port-client-b.log || true
+  exit 1
+fi
+kill "$PORT_B_PID" 2>/dev/null || true
+
+echo "[e2e] ports: client A restarts and reclaims its own port"
+kill "$PORT_A_PID" 2>/dev/null || true
+wait "$PORT_A_PID" 2>/dev/null || true
+
+# Wait for the teardown to complete before re-registering: the claim survives
+# until the old tunnel closes, and the public listener dies with it, so a
+# restart that races the teardown would fail its BIND (address in use) rather
+# than its claim. Only a REFUSED connect is proof here -- a tunnel whose agent
+# is gone still accepts on the listener until the server's teardown runs, so
+# "curl fails" alone would break out of this loop with the port still bound.
+# curl's exit 7 is connection refused; 28 (timeout) means still accepting.
+for i in {1..40}; do
+  rc=0
+  curl -sS --max-time 2 -o /dev/null http://127.0.0.1:14877/ 2>/dev/null || rc=$?
+  if [[ "$rc" == "7" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+
+./bin/ngrok -config="$TMPDIR/ngrok-tls.yml" -log=/tmp/ngrok-e2e-port-client-a2.log \
+  -authtoken=alpha -proto=tcp -remote-port=14877 \
+  19001 >/tmp/ngrok-e2e-port-a2-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-port-client-a2.log "tcp remote-port (client A restart)"
+
+PORT_RESP="$(curl -fsS --max-time 10 http://127.0.0.1:14877/)"
+if [[ "$PORT_RESP" != "e2e-ok" ]]; then
+  echo "[e2e] the restarted client did not reclaim its port: $PORT_RESP"
   exit 1
 fi
 

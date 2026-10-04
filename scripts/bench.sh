@@ -35,6 +35,24 @@
 #               sum of %{num_connects} over the transfers). 1-2 means reuse
 #               worked; ~1000 means it did not, whatever the req/s says.
 #
+#   tls-conn-rate  200 requests through the HTTPS listener, each on a fresh TLS
+#               connection (the TLS twin of conn-rate), twice: to an
+#               edge-terminated endpoint, where the server terminates the TLS
+#               with its own certificate, and to an agent-terminated one, where
+#               the server peeks the ClientHello's SNI and relays the records.
+#               The delta is the server-side difference itself -- peek + raw
+#               join versus full termination and Host routing -- plus one
+#               confound stated rather than hidden: the certificates are not
+#               the same algorithm. The edge column terminates with the
+#               server's embedded RSA-2048 development certificate, the agent
+#               column with an ECDSA P-256 leaf it minted, and RSA-2048
+#               handshakes cost measurably more on this box. Read the two
+#               columns as "each route with its default certificate", not as a
+#               pure routing comparison; a like-for-like one would point
+#               -tlsCrt/-tlsKey at an ECDSA pair. The agent column verifies
+#               its chain against the harness's own CA -- a run that silently
+#               lost the zero-knowledge path would fail, not slow down.
+#
 # Honesty rules this script tries to keep:
 #
 #   - No knobs for the numbers. Fixed body size, fixed request counts, fixed
@@ -66,23 +84,37 @@ cd "$ROOT"
 # The same environment e2e.sh pins. The build path below needs it, and
 # inheriting the caller's caches keeps a bench run from re-downloading the whole
 # module graph.
-export GOCACHE="${GOCACHE:-/tmp/go-build-cache}"
-export GOMODCACHE="${GOMODCACHE:-/tmp/go-mod-cache}"
-export GOPATH="${GOPATH:-/tmp/go}"
+# Go caches default to the machine's configured paths (`go env`), never to an
+# empty /tmp directory: a hermetic-looking /tmp module cache is just a cold
+# one -- every run re-downloads every module, and a sandbox whose /tmp lacks
+# them fails the build outright. An inherited environment still wins.
+export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
+export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
+export GOPATH="${GOPATH:-$(go env GOPATH)}"
 export NGROK_INSECURE_SKIP_VERIFY="${NGROK_INSECURE_SKIP_VERIFY:-1}"
 
 # Fixed parameters. Keeping these as constants rather than flags is deliberate.
 BENCH_HOST="bench"            # vhost the tunnel registers; also the Host: header
 BENCH_UPSTREAM_PORT=19101     # python fixture          (e2e.sh uses 19001-19005)
 BENCH_HTTP_PORT=18180         # public listener         (e2e.sh uses 18080)
+BENCH_HTTPS_PORT=18480        # public https listener   (e2e.sh uses 18443)
 BENCH_TUNNEL_PORT=15443       # client <-> server       (e2e.sh uses 14443)
 BENCH_ADMIN_PORT=19190        # admin                   (e2e.sh uses 19090)
 BASE_URL="http://127.0.0.1:${BENCH_HTTP_PORT}"
+
+# The tls-conn-rate scenario's two endpoints: same upstream, same listener,
+# different terminator. "edge" is served with the server's own certificate
+# (measured with verification off, like curl -k); "agent" is agent-terminated
+# and is measured with FULL verification against the harness CA below -- the
+# measurement doubles as a correctness check on the zero-knowledge path.
+BENCH_TLS_EDGE_HOST="bench-tls"
+BENCH_TLS_ZK_HOST="bench-zk"
 
 BULK_BYTES=$((64 * 1024 * 1024))
 BULK_RUNS=3
 CONN_RATE_REQUESTS=200
 KEEPALIVE_REQUESTS=1000
+TLS_REQUESTS=200
 
 RESULT_JSON="${BENCH_RESULT_JSON:-/tmp/ngrok-bench-result.json}"
 
@@ -198,6 +230,32 @@ wait_for_public() {
   return 1
 }
 
+# wait_for_public_tls <label> <host> <ca|->: the https twin, over the https
+# listener. --resolve is what sends the SNI (and spares /etc/hosts); the Host
+# header is pinned to the bare hostname because curl would otherwise send
+# "host:port" and the registry keys hostnames without a port. An empty/absent
+# tunnel answers 404 like the http side; 000 here means the TLS handshake
+# failed, which for the agent-terminated hostname is also "not registered yet"
+# (the server terminates with its own certificate then, and --cacert rightly
+# refuses it).
+wait_for_public_tls() {
+  local label="$1" host="$2" ca="$3" code i
+  for i in $(seq 1 40); do
+    if [[ "$ca" == "-" ]]; then
+      code="$(curl -sSk -o /dev/null -w '%{http_code}' --resolve "$host:$BENCH_HTTPS_PORT:127.0.0.1" -H "Host: $host" "https://$host:$BENCH_HTTPS_PORT/" 2>/dev/null || true)"
+    else
+      code="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$ca" --resolve "$host:$BENCH_HTTPS_PORT:127.0.0.1" -H "Host: $host" "https://$host:$BENCH_HTTPS_PORT/" 2>/dev/null || true)"
+    fi
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  log "the https listener never learned $host for variant '$label'"
+  dump_logs "$label"
+  return 1
+}
+
 # --- fixtures ----------------------------------------------------------------
 
 write_fixtures() {
@@ -248,6 +306,27 @@ class H(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", PORT), H).serve_forever()
 PY
+
+  # The CA the agent-terminated bench tunnel mints its per-hostname leaves
+  # from. -subj and </dev/null are load-bearing, not tidiness: without -subj
+  # openssl prompts for the distinguished name even though the config's [dn]
+  # section answers it, and a prompt on this script's stdin parks the whole
+  # run (the same trap e2e.sh documents at its own CA generation).
+  cat > "$WORKDIR/bench-ca.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = bench-zk-ca
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+  openssl req -x509 -newkey rsa:2048 -nodes -config "$WORKDIR/bench-ca.cnf" \
+    -keyout "$WORKDIR/bench-ca.key" -out "$WORKDIR/bench-ca.crt" -days 2 \
+    -subj "/CN=bench-zk-ca" </dev/null >/dev/null 2>&1
+  [[ -s "$WORKDIR/bench-ca.crt" ]] || die "could not generate the bench CA"
 }
 
 # --- scenarios ---------------------------------------------------------------
@@ -418,14 +497,109 @@ print("keepalive_n=%d" % n)
 PY
 }
 
+# tls-conn-rate -- 200 requests over the https listener, fresh TLS connection
+# each, once per terminator, for the zero-knowledge cluster.
+#
+# The request loop is python's for the same reason conn-rate's is: process
+# spawn would sit inside the quantity being measured. SNI is sent explicitly
+# (server_hostname), because the https listener routes on it -- a python
+# client pointed at 127.0.0.1 would send none, and both endpoints would come
+# back through the server-cert terminator instead of the two routes under
+# test. Each sample is one full TCP + TLS + request + teardown cycle, which is
+# the honest unit here: both terminators pay a handshake, so the difference is
+# route + certificate, not TLS vs no TLS. The certificate caveat is stated in
+# the header above (RSA-2048 server dev pair vs ECDSA P-256 minted leaf).
+#
+# The agent column handshakes with FULL verification against the harness CA
+# (CERT_REQUIRED and hostname check are PROTOCOL_TLS_CLIENT's defaults), so it
+# doubles as a correctness check: a bench run in which the passthrough path
+# regressed into edge termination would fail on the certificate, not report a
+# plausible-looking number measured through the wrong route.
+scenario_tls_conn_rate() {
+  local label="$1"
+  python3 - "$BENCH_TLS_EDGE_HOST" "$BENCH_TLS_ZK_HOST" "$BENCH_HTTPS_PORT" \
+    "$WORKDIR/bench-ca.crt" "$TLS_REQUESTS" >> "$WORKDIR/result-$label.env" <<'PY'
+import math
+import socket
+import ssl
+import sys
+import time
+
+edge_host, zk_host, port, ca_path, n = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5]),
+)
+
+
+def measure(host, ca):
+    times = []
+    for i in range(n):
+        started = time.perf_counter()
+        raw = socket.create_connection(("127.0.0.1", port), timeout=30)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if ca:
+            # defaults: CERT_REQUIRED, check_hostname on -- verified against
+            # the harness CA and the SNI name, both of which the agent's
+            # minted leaf must satisfy
+            ctx.load_verify_locations(ca)
+        else:
+            # the server's own certificate is the embedded dev pair
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        tls = ctx.wrap_socket(raw, server_hostname=host)
+        try:
+            tls.sendall(
+                (
+                    "GET /small HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                    % host
+                ).encode()
+            )
+            data = b""
+            while True:
+                chunk = tls.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            tls.close()
+        times.append(time.perf_counter() - started)
+
+        head, _, body = data.partition(b"\r\n\r\n")
+        parts = head.split(b" ")
+        if len(parts) < 2 or parts[1] != b"200" or body != b"bench-ok":
+            sys.exit(
+                "tls-conn-rate (%s): request %d answered %r %r"
+                % (host, i + 1, head[:64], body[:32])
+            )
+    return times
+
+
+def report(prefix, times):
+    ordered = sorted(times)
+    total = sum(times)
+
+    def pct(p):
+        # nearest rank, like conn-rate
+        return ordered[max(0, math.ceil(p * len(times)) - 1)]
+
+    print("%s_rps=%.1f" % (prefix, len(times) / total))
+    print("%s_p50_ms=%.2f" % (prefix, pct(0.50) * 1000))
+    print("%s_p95_ms=%.2f" % (prefix, pct(0.95) * 1000))
+
+
+report("tls_edge", measure(edge_host, None))
+report("tls_agent", measure(zk_host, ca_path))
+print("tls_requests=%d" % n)
+PY
+}
+
 # --- variant lifecycle -------------------------------------------------------
 
 start_stack() {
   local label="$1" dir="$2" port
 
-  for port in "$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_TUNNEL_PORT" "$BENCH_ADMIN_PORT"; do
+  for port in "$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_TUNNEL_PORT" "$BENCH_ADMIN_PORT"; do
     if port_in_use "$port"; then
-      die "port $port is already in use -- a previous bench run (or another service) still holds it; this harness owns 19101/18180/15443/19190"
+      die "port $port is already in use -- a previous bench run (or another service) still holds it; this harness owns 19101/18180/18480/15443/19190"
     fi
   done
 
@@ -439,10 +613,12 @@ start_stack() {
   UPSTREAM_PID=$!
   PIDS+=("$UPSTREAM_PID")
 
+  # The https listener is enabled for tls-conn-rate; the http scenarios are
+  # unaffected (the SNI peek lives entirely on the https path).
   "$dir/ngrokd" \
     -domain=localhost \
     -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
-    -httpsAddr= \
+    -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
     -tunnelAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
     -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
     > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
@@ -450,6 +626,10 @@ start_stack() {
   PIDS+=("$NGROKD_PID")
   sleep 1
 
+  # Three tunnels, one client: the http bench endpoint, the same upstream over
+  # an edge-terminated https endpoint, and over an agent-terminated one. All
+  # three serve the same fixture, so a number that looks off between columns
+  # cannot be the upstream's.
   cat > "$WORKDIR/ngrok-bench-$label.yml" <<YAML
 server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
 trust_host_root_certs: true
@@ -458,10 +638,22 @@ tunnels:
     hostname: $BENCH_HOST
     proto:
       http: $BENCH_UPSTREAM_PORT
+  bench-tls:
+    hostname: $BENCH_TLS_EDGE_HOST
+    proto:
+      https: $BENCH_UPSTREAM_PORT
+  bench-zk:
+    hostname: $BENCH_TLS_ZK_HOST
+    proto:
+      https: $BENCH_UPSTREAM_PORT
+    agent_tls_termination: true
+    tls:
+      ca_crt: $WORKDIR/bench-ca.crt
+      ca_key: $WORKDIR/bench-ca.key
 YAML
 
   "$dir/ngrok" -config="$WORKDIR/ngrok-bench-$label.yml" \
-    -log="/tmp/ngrok-bench-$label-client.log" start bench \
+    -log="/tmp/ngrok-bench-$label-client.log" start bench bench-tls bench-zk \
     > "/tmp/ngrok-bench-$label-client-stdout.log" 2>&1 &
   CLIENT_PID=$!
   PIDS+=("$CLIENT_PID")
@@ -499,11 +691,20 @@ stop_stack() {
 # One discarded request before the measured ones: the first request through a
 # fresh tunnel pays client-side one-time setup that no later request pays, and it
 # belongs to neither the first bulk sample nor the first conn-rate sample. It is
-# never counted anywhere.
+# never counted anywhere. The https endpoints get their own warmups for the same
+# reason -- the agent-terminated one also mints its first leaf certificate on
+# that handshake, which is exactly the kind of one-time cost warmup exists for.
 warmup() {
   local label="$1"
   curl -sS --max-time 60 -o /dev/null -H "Host: $BENCH_HOST" "$BASE_URL/small" \
     || die "warmup request through variant '$label' failed"
+  curl -sSk --max-time 60 -o /dev/null --resolve "$BENCH_TLS_EDGE_HOST:$BENCH_HTTPS_PORT:127.0.0.1" \
+    -H "Host: $BENCH_TLS_EDGE_HOST" "https://$BENCH_TLS_EDGE_HOST:$BENCH_HTTPS_PORT/small" \
+    || die "https warmup through variant '$label' failed (edge endpoint)"
+  curl -sS --max-time 60 -o /dev/null --cacert "$WORKDIR/bench-ca.crt" \
+    --resolve "$BENCH_TLS_ZK_HOST:$BENCH_HTTPS_PORT:127.0.0.1" \
+    -H "Host: $BENCH_TLS_ZK_HOST" "https://$BENCH_TLS_ZK_HOST:$BENCH_HTTPS_PORT/small" \
+    || die "https warmup through variant '$label' failed (agent-terminated endpoint)"
 }
 
 run_variant() {
@@ -518,6 +719,8 @@ run_variant() {
   start_stack "$label" "$dir"
   wait_for_tunnel "$label"
   wait_for_public "$label"
+  wait_for_public_tls "$label" "$BENCH_TLS_EDGE_HOST" "-"
+  wait_for_public_tls "$label" "$BENCH_TLS_ZK_HOST" "$WORKDIR/bench-ca.crt"
   warmup "$label"
 
   log "bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
@@ -526,6 +729,8 @@ run_variant() {
   scenario_conn_rate "$label"
   log "keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
   scenario_keepalive "$label"
+  log "tls-conn-rate: $TLS_REQUESTS requests x {edge, agent-terminated} over https"
+  scenario_tls_conn_rate "$label"
 
   stop_stack
   log "variant '$label' done (logs: /tmp/ngrok-bench-$label-*.log)"
@@ -539,6 +744,7 @@ write_params() {
     echo "mode=$mode"
     echo "host=$BENCH_HOST"
     echo "public_port=$BENCH_HTTP_PORT"
+    echo "https_port=$BENCH_HTTPS_PORT"
     echo "tunnel_port=$BENCH_TUNNEL_PORT"
     echo "upstream_port=$BENCH_UPSTREAM_PORT"
     echo "admin_port=$BENCH_ADMIN_PORT"
@@ -546,6 +752,9 @@ write_params() {
     echo "bulk_runs=$BULK_RUNS"
     echo "conn_rate_requests=$CONN_RATE_REQUESTS"
     echo "keepalive_requests=$KEEPALIVE_REQUESTS"
+    echo "tls_requests=$TLS_REQUESTS"
+    echo "tls_edge_host=$BENCH_TLS_EDGE_HOST"
+    echo "tls_zk_host=$BENCH_TLS_ZK_HOST"
     if [[ "$mode" == "compare" ]]; then
       echo "baseline_dir=$first"
       echo "current_dir=$second"
@@ -575,6 +784,12 @@ ROWS = [
     ("conn-rate p95 ms (lower is better)", "conn_rate_p95_ms", "%.2f"),
     ("keep-alive req/s (1000, one curl)", "keepalive_rps", "%.1f"),
     ("keep-alive TCP conns opened", "keepalive_conns", "%d"),
+    ("tls edge req/s (200 x fresh TLS conn)", "tls_edge_rps", "%.1f"),
+    ("tls edge p50 ms (lower is better)", "tls_edge_p50_ms", "%.2f"),
+    ("tls edge p95 ms (lower is better)", "tls_edge_p95_ms", "%.2f"),
+    ("tls agent-passthrough req/s (same listener, CA-verified)", "tls_agent_rps", "%.1f"),
+    ("tls agent-passthrough p50 ms (lower is better)", "tls_agent_p50_ms", "%.2f"),
+    ("tls agent-passthrough p95 ms (lower is better)", "tls_agent_p95_ms", "%.2f"),
 ]
 
 
@@ -626,12 +841,13 @@ print(
     )
 )
 print(
-    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl"
+    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}"
     % (
         int(params.get("bulk_bytes", 0)) // 1024 // 1024,
         params.get("bulk_runs", "?"),
         params.get("conn_rate_requests", "?"),
         params.get("keepalive_requests", "?"),
+        params.get("tls_requests", "?"),
     )
 )
 for label, kv in variants:

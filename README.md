@@ -7,7 +7,8 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost, allowing y
 ## Features
 
 - **HTTP/HTTPS Tunneling**: Expose local web servers to the internet
-- **TCP Tunneling**: Tunnel arbitrary TCP traffic
+- **TCP Tunneling**: Tunnel arbitrary TCP traffic, with fixed, owned remote ports (`-remote-port`)
+- **Zero-Knowledge TLS**: Terminate https TLS in the agent — the server routes by SNI and never sees plaintext or your certificates
 - **Web Interface**: Inspect HTTP requests and responses in real-time
 - **Terminal UI**: Beautiful terminal interface for monitoring tunnels
 - **Self-Hosted**: Run your own ngrok server for complete control
@@ -183,6 +184,60 @@ tunnels:
       tcp: 3306
 ```
 
+**Zero-knowledge TLS (agent-side termination).** With `agent_tls_termination`
+the server routes an https connection by the hostname in the visitor's TLS
+ClientHello (SNI) and relays the bytes unread: it never terminates the TLS,
+never holds your certificate or key, and never sees plaintext. TLS ends in the
+agent, which then speaks plain HTTP to your local service:
+
+```yaml
+server_addr: your-server.com:4443
+trust_host_root_certs: true
+
+tunnels:
+  api:
+    hostname: api.example.com
+    proto:
+      https: 3000
+    agent_tls_termination: true
+    tls:
+      ca_crt: /etc/ngrok/ca.crt   # the agent mints a leaf per requested hostname
+      ca_key: /etc/ngrok/ca.key   # the CA key never leaves this machine
+
+  fixed-cert:
+    hostname: app.example.com
+    proto:
+      https: 3001
+    agent_tls_termination: true
+    tls:
+      crt: /etc/ssl/app.crt       # or present one explicit certificate
+      key: /etc/ssl/app.key
+```
+
+Visitors verify against *your* certificate chain (distribute `ca.crt` to the
+clients that need it), not the server's. With neither pair configured the
+agent presents a temporary self-signed certificate, logs a WARN with its
+fingerprint, and browsers show a certificate error — by design. Both cert
+files are read and validated at startup, so a bad path or PEM fails the client
+before it registers. Two limits to know: visitors must send SNI (a request
+with no hostname answers `421 Misdirected Request`), and `on_http_request` /
+`on_http_response` traffic policies for such tunnels run in the agent rather
+than on the server — the server has only ciphertext.
+
+**Tunnel an IoT/TCP device.** A plain tcp tunnel forwards raw bytes to a
+local service port — e.g. a Levis IoT node listening on `127.0.0.1:5681`:
+
+```yaml
+  iot:
+    proto:
+      tcp: 127.0.0.1:5681
+```
+
+On the command line, claim a deterministic public port for it:
+`ngrok -proto=tcp -remote-port=15781 127.0.0.1:5681`. A claimed port belongs
+to your auth token until the tunnel closes: reconnects get the same port back,
+and another token asking for it is refused at registration.
+
 ## Command Line Options
 
 **Client (`ngrok`):**
@@ -197,6 +252,16 @@ Options:
   -subdomain=name    Request a specific subdomain
   -hostname=name     Request a specific hostname
   -authtoken=token   Authentication token (for self-hosted server)
+  -remote-port=N     Claim this fixed public port for a tcp tunnel (reconnects keep it;
+                     another auth token is refused it)
+  -agent-tls-termination
+                     Terminate public https TLS in this agent: the server routes by SNI
+                     and relays TLS bytes unread (zero-knowledge TLS)
+  -tls-crt=path      Certificate the agent presents (with -agent-tls-termination; needs -tls-key)
+  -tls-key=path      Private key of -tls-crt
+  -tls-ca-crt=path   CA the agent mints per-hostname certificates from
+                     (with -agent-tls-termination; needs -tls-ca-key)
+  -tls-ca-key=path   Private key of -tls-ca-crt; never leaves this machine
 ```
 
 **Server (`ngrokd`):**
