@@ -23,8 +23,28 @@ jobs:
 
       - name: Update dependencies (patch/minor)
         run: |
-          go get -u ./...
+          # A blanket `go get -u ./...` aborts the whole run the first time
+          # some module's newest release requires a newer Go than this repo
+          # pins (the 1.21 pin is deliberate -- cel-go); go refuses the
+          # upgrade and that refusal used to be a weekly red X. Update one
+          # module at a time instead: skip exactly the toolchain-floor
+          # refusals (warned and summarized), fail on any other error.
+          skipped=""
+          for mod in $(go list -m all | tail -n +2); do
+            if ! go get -u "$mod" 2>/tmp/goget.err; then
+              if grep -q 'requires go >=' /tmp/goget.err; then
+                echo "::warning::skipping $mod: newest release needs a newer Go than the pinned 1.21 toolchain"
+                skipped="$skipped $mod"
+              else
+                cat /tmp/goget.err >&2
+                exit 1
+              fi
+            fi
+          done
           go mod tidy
+          if [ -n "$skipped" ]; then
+            echo "### Skipped (need newer Go than 1.21):${skipped}" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run tests
         run: |
