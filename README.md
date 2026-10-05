@@ -326,6 +326,33 @@ configurable header, plain 401 — there is no standard challenge for a
 custom header) round out the set; see [docs/CHANGELOG.md](docs/CHANGELOG.md)
 for their exact config shapes and the current limitations.
 
+**Webhook verification.** A webhook provider's deliveries can be verified
+at the edge before they are forwarded: a `webhook-verification` rule checks
+the provider's signature (Stripe, GitHub or Svix) over the request body and
+forwards only what verifies — each provider's signing secret comes inline or
+from a vault, and several secrets mean rotation:
+
+```yaml
+tunnels:
+  hooks:
+    hostname: hooks.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: webhook-verification
+          config:
+            provider: stripe          # stripe | github | svix
+            secrets:
+              - 'secret("main/stripe")'
+            tolerance_seconds: 300    # send-time skew allowed; default 300
+```
+
+Verification is fail-closed: a tampered body, wrong secret, stale timestamp,
+malformed signature header — and every request whose body the engine cannot
+buffer to verify (chunked, close-delimited, over the 1 MiB cap) — answers
+one fixed 403, never a pass-through and never a 400.
+
 **Secret vaults.** Credential entries can be kept out of the policy document
 and sourced from a named vault instead — `secret("vault/key")` as the whole
 value, resolved once at configuration load, never per request and never

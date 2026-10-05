@@ -1,4 +1,142 @@
 # Changelog
+## 1.0.15 - 2026-10-05 - Webhook verification
+
+A request-phase policy action that verifies the signatures webhook providers
+put on their deliveries -- Stripe, GitHub and Svix -- over the request body,
+before anything reaches the local service. It is the policy engine's first
+body-consuming action, so this release is as much about the rewriter as
+about the action: the request path's first body buffering, with the
+verdict deferred until the body is in hand.
+
+### The action
+
+```yaml
+traffic_policy:
+  on_http_request:
+    - name: webhook-verification
+      config:
+        provider: stripe            # stripe | github | svix
+        secrets:                    # one or more -- several = rotation
+          - "whsec_..."             # inline, or secret("vault/key")
+        tolerance_seconds: 300      # send-time skew allowed; default 300
+```
+
+- **`provider: stripe`** reads `Stripe-Signature: t=<unix>,v1=<hex>` and
+  checks HMAC-SHA256 over `{t}.{body}`. Every `v1` entry is checked (Stripe
+  sends one per live endpoint key), an entry this engine cannot parse
+  refuses the whole header rather than being skipped past, and a second
+  `t=` is malformed -- the header would not say which time signed the
+  payload. Version tags the scheme does not carry (Stripe has issued `v0`
+  historically) are ignored: admission still requires a verified `v1`, so
+  ignoring one cannot admit anything.
+- **`provider: github`** reads `X-Hub-Signature-256: sha256=<hex>` and
+  checks HMAC-SHA256 over the body alone. No timestamp participates -- the
+  tolerance field is accepted and simply unused -- so a genuinely signed
+  delivery replays for as long as its secret is configured. That is
+  GitHub's scheme, not a choice of ours; rotation (removing a leaked key
+  from the config) is the retirement story.
+- **`provider: svix`** reads `svix-id`, `svix-timestamp` and
+  `svix-signature: v1,<base64>` and checks HMAC-SHA256 over
+  `{svix-id}.{svix-timestamp}.{body}` with the DECODED bytes of the
+  `whsec_`-prefixed secret. A value without the prefix, or whose remainder
+  does not base64-decode, is refused at load: Svix issues its secrets in
+  exactly that spelling, and a wrong-credential paste is better named at
+  load than discovered as a webhook that refuses every real delivery for a
+  year.
+- **Every comparison is constant-time, and no key short-circuits the
+  list.** A refused request is answered only after every configured secret
+  has been tried -- the same discipline the credential lists use -- so the
+  time to a 403 says nothing about which entry was being tried, and
+  rotation leaks no oracle. The cost is one extra HMAC per configured key.
+- **The tolerance covers skew in both directions and its boundary is
+  inclusive**: a timestamp exactly `tolerance_seconds` from now is admitted
+  (the operator's own stated accept, not something to tighten by a
+  nanosecond of wall clock); anything beyond is refused. The default 300
+  seconds is what Stripe's and Svix's own SDKs use.
+- **Failure is one fixed 403 per provider**, built once at load: a
+  malformed signature header, a stale timestamp, a wrong secret, and a body
+  that could not be buffered all answer the same bytes. None of them
+  answers 400 -- a distinct code per malformation would teach a probing
+  client which part of its forgery was wrong. The failure log names the
+  method, target and a fixed label; no signature material and nothing
+  request-derived reaches a log line or a response body.
+
+### Fail-closed
+
+The action's authority is the body, so every request whose body cannot be
+verified refuses rather than passes: `Transfer-Encoding: chunked` (not
+de-chunked in this release), no Content-Length (close-delimited), a declared
+length over the cap, a body that ends short of its declaration, and a
+request with no body field at all -- all answer the same fixed 403, never a
+400, never an open door. The sharpest of these is deliberate: a request
+that declares a body but presents none for verification is refused even
+though an HMAC over the empty string is a perfectly legal computation,
+because an empty verification body is the fail-open shape -- sign nothing
+once, smuggle anything forever in front of a signature that never covered
+it.
+
+### Vaults
+
+`secrets` entries compose with the vaults like every credential field:
+`secret("vault/key")` as the whole value, resolved at load on whichever
+side loads the policy -- the reference text is what crosses the wire, the
+server re-resolves at registration, and a server without the vault refuses
+the registration rather than expose an endpoint that only looks verified.
+One rule is stricter than the credential path, on purpose: a resolved value
+spelled `sha256:...` is refused. A pre-digested credential is the
+credential path's whole point -- compare digests, hold no plaintext -- but
+an HMAC is computed *with* the key, so a digest of the key verifies
+nothing; the plaintext signing secret has to exist somewhere, and the
+honest choice is to demand it rather than accept a form that can never
+verify. Empty values and values carrying CR/LF are refused at load as well
+(an empty secret verifies nothing; a CR or LF in a header-carried scheme is
+injection). The svix provider additionally demands its `whsec_` spelling at
+load, per the scheme note above.
+
+### The rewriter: first request-body buffering
+
+A body-consuming verdict cannot be made from the head, and the body is, by
+the rewriter's own rules, never somewhere a hook could read it -- it is
+still on the wire when the verdict is due. A policy whose request phase
+declares a body cap (only `webhook-verification` today, 1 MiB) switches the
+request rewriter to a deferred verdict: the head is withheld, the declared
+body is banked as it arrives, and the hook runs once over head + body. The
+framing is checked before anything is withheld -- Content-Length present
+and within the cap, no `Transfer-Encoding`, not an upgrade -- and every
+uncapturable shape goes to the hook with the body marked absent, where the
+action's fail-closed rule answers it. Buffers come from the existing 64 KiB
+pooled slabs, drawn only as the body needs them (a small webhook POST costs
+one slab), and every exit path -- verdict terminate, verdict forward,
+truncated body, connection close -- releases them exactly once, on the
+reading goroutine.
+
+The switch is opt-in per compiled policy and costs a policy that does not
+ask for it one integer comparison per head: the bulk (64 MiB) bench parity
+row measured -0.8%, inside noise. Both enforcement points carry the cap --
+the server's tunnel join and the client's `attachPolicyHooks` -- so an
+agent-terminated tunnel verifies deliveries exactly as an edge-terminated
+one does.
+
+### Known limitations
+
+- **CL-framed bodies only.** A chunked or close-delimited delivery is
+  refused with the fixed 403, not verified. Providers sign a payload they
+  send with a length, so real deliveries carry Content-Length; a sender
+  that does not cannot be verified by this release.
+- **`Expect: 100-continue` stalls under a buffering policy.** The rewriter
+  withholds the request head while the body is buffered, so nothing answers
+  the interim `100` a client asked for until the verdict; the client waits
+  out its own continue timeout and sends anyway. Real webhook senders do
+  not send Expect, and the over-cap refusal (which answers the head
+  immediately) is unaffected.
+- **Slack's `url_verification` challenge echo is deferred**: answering it
+  needs a response body derived from the request, and the engine's
+  synthetic responses are built at load. A Slack endpoint behind this
+  action must answer its own challenge.
+- **The body is never exposed to CEL.** No `req.body.*` variable exists and
+  expressions cannot read buffered bytes: what a policy can know about a
+  body is that a webhook action verified it, nothing else.
+
 ## 1.0.14 - 2026-10-05 - Wildcard hostnames
 
 A tunnel can now claim every name exactly one label under the server's own

@@ -7,7 +7,8 @@
 //
 //	on_tcp_connect   restrict-ips, deny, log
 //	on_http_request  add-headers, remove-headers, deny, custom-response, log, set-vars,
-//	                 basic-auth, bearer-auth, apikey-auth, jwt-validation
+//	                 basic-auth, bearer-auth, apikey-auth, jwt-validation,
+//	                 webhook-verification
 //	on_http_response add-headers, remove-headers, log
 //
 // A rule is one action with an optional name and optional conditions:
@@ -94,6 +95,14 @@ const (
 	ActionBearerAuth    = "bearer-auth"
 	ActionAPIKeyAuth    = "apikey-auth"
 	ActionJWTValidation = "jwt-validation"
+
+	// The request-phase webhook verification action (SPEC-CLUSTER10). It
+	// dispatches on the same terminator path as the four above and is a
+	// no-op for a request that carries a genuine provider signature; its
+	// refusal is a fixed 403 (the schemes prescribe no challenge), and it is
+	// the one action whose verdict needs the request body, which is what
+	// Compiled.RequestBodyCap reports to the rewriter.
+	ActionWebhookVerification = "webhook-verification"
 )
 
 // phase is one of the three points in a connection's life a policy can act on.
@@ -158,6 +167,14 @@ type Compiled struct {
 	connect  []*compiledAction
 	request  []*compiledAction
 	response []*compiledAction
+
+	// requestBodyCap is the request-body buffering the request phase needs:
+	// 0 when no request-phase action consumes a body, otherwise the largest
+	// cap its body-consuming actions declare (webhookBodyCap; the flag spec
+	// section 3 calls NeedsBody, in the form the rewriter consumes). Set
+	// once by build, from the same traversal that built the actions, and
+	// read through RequestBodyCap.
+	requestBodyCap int
 }
 
 // compiledAction is one rule with everything it needs resolved once, at
@@ -180,14 +197,17 @@ type compiledAction struct {
 	enforce     bool         // restrict-ips
 	allow, deny []*net.IPNet // restrict-ips
 
-	// auth carries the whole runtime of a request-phase authentication action
-	// (basic-auth, bearer-auth, apikey-auth, jwt-validation): the digests of
-	// the configured credentials, the prebuilt 401 challenge, and -- for
-	// jwt-validation -- the parser and the JWKS cache. Only set for those four
-	// action types; built by the same traversal that validates their config
-	// (auth_actions.go, jwt.go), which is why a compiled policy holds no
-	// credential material it does not need: the static-credential actions keep
-	// only digests.
+	// auth carries the whole runtime of a request-phase authentication
+	// action (basic-auth, bearer-auth, apikey-auth, jwt-validation, and
+	// webhook-verification, which shares the terminator shape if not the
+	// 401): the digests of the configured credentials, the prebuilt 401
+	// challenge, and -- for jwt-validation -- the parser and the JWKS cache,
+	// or -- for webhook-verification -- the provider's scheme entry and the
+	// resolved signing keys (webhook.go). Only set for those action types;
+	// built by the same traversal that validates their config
+	// (auth_actions.go, jwt.go, webhook.go), which is why a compiled policy
+	// holds no credential material it does not need: the static-credential
+	// actions keep only digests.
 	auth authAction
 }
 
@@ -388,6 +408,32 @@ func (c *Compiled) ResponseHook(lg log.Logger, clientAddr string) func(*http.Res
 	}
 }
 
+// RequestBodyCap reports how many request-body bytes the rewriter must
+// buffer for this policy's request phase: 0 when no request-phase action
+// consumes a body -- the overwhelming case, and the one that must stay free
+// -- otherwise webhookBodyCap (1 MiB, webhook.go).
+//
+// It is the one number the enforcement points copy onto the rewriter:
+//
+//	rewriter.Policy{..., BodyBufferCap: compiled.RequestBodyCap()}
+//
+// (server/tunnel.go's join for edge-terminated tunnels, client/model.go's
+// attachPolicyHooks for agent-terminated ones). A cap left unset there is
+// not a slower policy but an unhonest one: the rewriter never buffers, the
+// hook never sees a body, and the action refuses every request --
+// webhook.go's fail-closed rule is what makes the missing copy loud in
+// traffic rather than silent in review. The same number is the version-skew
+// marker spec section 3 describes: a policy with RequestBodyCap() > 0 may
+// only be enforced by a rewriter that implements BodyBufferCap, and a
+// registration that cannot confirm that refuses the policy loudly
+// (TestNewTunnelRefusesAPolicyItCannotEnforce's precedent).
+func (c *Compiled) RequestBodyCap() int {
+	if c == nil {
+		return 0
+	}
+	return c.requestBodyCap
+}
+
 // evalRequest runs the on_http_request rules in order and returns what the
 // rewriter should do about the request: header changes, or a synthetic response
 // that replaces it. It returns nil when no action changed anything, which the
@@ -419,17 +465,19 @@ func (c *Compiled) evalRequest(st *evalState, req *http.Request) *rewriter.Reque
 			verdict.Terminate = &rewriter.SyntheticResponse{StatusCode: a.statusCode}
 			return verdict
 
-		case ActionBasicAuth, ActionBearerAuth, ActionAPIKeyAuth, ActionJWTValidation:
-			// The authentication actions are terminators that take the same
-			// path deny takes, with two differences the scheme fixes and no
-			// config can change: the answer is always a 401 carrying the
-			// challenge their scheme prescribes (spec section 4), and a request
-			// that carries acceptable credentials is admitted as a no-op --
-			// the action adds nothing and the later rules proceed. The
-			// decision itself lives behind a.auth, built per action type at
-			// load time; this line is the only place in the executor that
-			// knows the actions exist, which is what keeps adding one of them
-			// a validator-plus-implementation change and not a dispatch change.
+		case ActionBasicAuth, ActionBearerAuth, ActionAPIKeyAuth, ActionJWTValidation, ActionWebhookVerification:
+			// The authentication actions (and webhook-verification, which
+			// shares the terminator shape) take the same path deny takes,
+			// with two differences the scheme fixes and no config can change:
+			// the answer is the response their scheme prescribes -- a 401
+			// carrying the credential actions' challenge, the webhook
+			// action's fixed 403 -- and a request that carries acceptable
+			// credentials is admitted as a no-op -- the action adds nothing
+			// and the later rules proceed. The decision itself lives behind
+			// a.auth, built per action type at load time; this line is the
+			// only place in the executor that knows the actions exist, which
+			// is what keeps adding one of them a
+			// validator-plus-implementation change and not a dispatch change.
 			if ch := a.auth.authenticate(req, st); ch != nil {
 				st.info("%s: %s %s refused with status %d", a.action, req.Method, requestTarget(req), ch.StatusCode)
 				verdict.Terminate = ch

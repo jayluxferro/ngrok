@@ -52,7 +52,9 @@ import (
 // compiled action); evalRequest asks it to judge every matching request.
 //
 // authenticate returns nil to admit the request -- the action is then a no-op
-// and later rules proceed -- or the synthetic 401 the client is answered with.
+// and later rules proceed -- or the synthetic response the client is answered
+// with: the 401 challenge for the credential actions, the fixed 403 for
+// webhook-verification (webhook.go), which implements this interface too.
 // An implementation must never place credential material (a password, a
 // token, a key, a JWT, or a fragment of any of them) in the response or in a
 // log line: the responses are built once, at load time, from static strings,

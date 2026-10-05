@@ -23,6 +23,13 @@
 // transform section below). It is the only place this package re-frames
 // anything: the input's framing is still read, not re-encoded, and every
 // response the transform declines keeps the byte-identical identity path.
+//
+// The one opt-in exception to "no buffering" is the deferred verdict
+// (Policy.BodyBufferCap): a request-phase hook that cannot judge a head
+// without the body holds the head, captures the declared body into pooled
+// 64 KiB slabs, and only then is asked. The capture is bounded, framed
+// (Content-Length only), and off by default -- every policy that does not
+// ask for it stays on the byte-identical head-only path.
 package rewriter
 
 import (
@@ -99,13 +106,55 @@ type Policy struct {
 	// Proto are populated; for a response only StatusCode, Header and Proto
 	// are. Anything else on the object -- Body, ContentLength, RemoteAddr,
 	// RequestURI, TLS -- is the zero value that reader produced, not something
-	// read from the wire.
+	// read from the wire. (The one exception is the deferred verdict under
+	// BodyBufferCap below, which populates Body -- or nils it, as a finding.)
 	//
 	// RequestHook may also terminate the request (see RequestVerdict): the
 	// connection is answered from the edge, the request never reaches the
 	// upstream, and the rest of the connection is closed rather than parsed.
 	RequestHook  func(req *http.Request) *RequestVerdict
 	ResponseHook func(resp *http.Response) *ResponseVerdict
+
+	// BodyBufferCap turns on the deferred verdict (spec cluster 10): the one
+	// case in which the request hook is asked about a request whose body it
+	// can actually read. Zero -- the value every policy built before this
+	// existed carries -- means no buffering at all, and the hook contract is
+	// the head-only one documented above, byte for byte.
+	//
+	// Greater than zero (and only together with a RequestHook; the compile
+	// drops the cap otherwise, because a captured body no verdict ever sees
+	// is dead weight) means: when a request head parses, it is NOT emitted.
+	// The rewriter looks at the framing first, and one of two things happens.
+	//
+	// If the body is Content-Length-framed and its declared length is at most
+	// the cap, the body is captured into pooled 64 KiB slabs (never one
+	// growing allocation) and the hook runs once, with req.Body reading
+	// exactly the captured bytes and req.ContentLength as the head declared
+	// them. The verdict either terminates (the normal plumbing: synthetic
+	// response, drain) or the head is emitted followed by the captured body
+	// and the stream continues as if nothing had been held.
+	//
+	// Every other body shape -- Transfer-Encoding of any kind, no
+	// Content-Length at all, a Content-Length over the cap, one that does not
+	// parse, an upgrade request, and a body that ends before its declared
+	// length -- cannot be captured, and the hook is asked with req.Body set
+	// to nil. This is the pinned cross-package contract (policy/webhook.go's
+	// bufferedBody is the consumer): http.ReadRequest never produces a nil
+	// Body, so nil at the hook is unambiguous -- it can only mean "not
+	// captured", and a body-consuming action must fail the request closed.
+	// The rewriter itself never decides the response: it provides the body,
+	// or an honest nil, and the action's verdict is carried out through the
+	// same terminate-or-emit plumbing as any other. A hook that returns no
+	// verdict for a nil body gets the request forwarded exactly as the
+	// unbuffered path would have forwarded it.
+	//
+	// Known limitation, documented rather than solved: a client that sends
+	// "Expect: 100-continue" under a buffering policy waits for an interim
+	// response the withheld head can never provoke. The upstream never sees
+	// the request until the body arrives, and this package does not fabricate
+	// interim responses; webhook deliveries -- the feature's traffic -- do not
+	// send Expect. The client's own continue timeout (or its send) decides.
+	BodyBufferCap int
 }
 
 // SyntheticResponse is a response the edge fabricates without consulting the
@@ -276,6 +325,16 @@ func (p *Policy) Validate() error {
 	// an add entry there is no field value for a CR/LF to hide in. What it
 	// changes on the wire is decided per response by the skip matrix, not by
 	// configuration.
+	//
+	// BodyBufferCap is checked for the one value a caller cannot mean: a
+	// negative cap would silently compile to "no buffering" (compilePolicy
+	// normalizes it), and a policy whose author asked for body buffering and
+	// typo'd the bound must fail at load, not 403 every webhook later because
+	// the hook it armed never saw a body. Zero stays legal -- it is the
+	// default and the shape of every policy without a body-consuming action.
+	if p.BodyBufferCap < 0 {
+		return fmt.Errorf("body_buffer_cap %d must not be negative", p.BodyBufferCap)
+	}
 	return nil
 }
 
@@ -539,6 +598,14 @@ type compiledPolicy struct {
 	// them from the one compiled value they already share.
 	reqHook  func(req *http.Request) *RequestVerdict
 	respHook func(resp *http.Response) *ResponseVerdict
+
+	// bodyBufferCap is Policy.BodyBufferCap after one normalization: a cap
+	// without a request hook is dropped to zero. Capturing a body is the
+	// expensive half of the deferred verdict; running it for a verdict nobody
+	// will compute would hold every request of such a connection for nothing.
+	// The head-only branch in stepHead reads this field once per head, which
+	// is the entire cost a policy without a body cap pays for the feature.
+	bodyBufferCap int
 }
 
 // compilePolicy precomputes everything the per-request path needs. lg receives
@@ -554,6 +621,9 @@ func compilePolicy(p *Policy, lg log.Logger) *compiledPolicy {
 		xfpValue:    p.XForwardedProto,
 		reqHook:     p.RequestHook,
 		respHook:    p.ResponseHook,
+	}
+	if p.RequestHook != nil && p.BodyBufferCap > 0 {
+		cp.bodyBufferCap = p.BodyBufferCap
 	}
 
 	var hostOverride string
@@ -636,6 +706,7 @@ type state int
 const (
 	stHead         state = iota // assembling a head
 	stBodyCL                    // copying a Content-Length body
+	stBodyBuffer                // capturing a Content-Length body for a deferred verdict
 	stChunkSize                 // reading a chunk-size line
 	stChunkData                 // copying chunk data
 	stChunkDataEnd              // copying the CRLF that closes a chunk
@@ -918,6 +989,14 @@ type streamRewriter struct {
 	chunkLeft  int64 // stChunkData: chunk bytes still to copy
 	chunkEnd   int   // stChunkDataEnd: framing bytes still to copy
 	failedOpen bool  // already warned about giving up on this direction
+
+	// Deferred-verdict capture state (stBodyBuffer), all of it confined to the
+	// reading goroutine: nothing else touches a direction's source, and the
+	// capture's slabs are released only from here (see bodyCapture.release for
+	// why the Close path must not).
+	capture  *bodyCapture // the body bytes captured so far; nil except mid-capture
+	capHead  *parsedHead  // the head being held back; its bytes alias pending
+	bodyLeft int64        // declared body bytes still to read
 
 	// hookWarned records that the policy hook already failed on this direction,
 	// so that a hook which panics on every message gets one WARN per connection
@@ -1417,6 +1496,8 @@ func (r *streamRewriter) step() error {
 		return r.stepHead()
 	case stBodyCL:
 		return r.stepBodyCL()
+	case stBodyBuffer:
+		return r.stepBodyBuffer()
 	case stChunkSize:
 		return r.stepChunkSize()
 	case stChunkData:
@@ -1644,6 +1725,34 @@ func (r *streamRewriter) stepHead() error {
 		r.st.recordResponse()
 	}
 
+	// A policy with a body cap re-routes every request head into the deferred
+	// path before anything is emitted: the head is held, the body is captured,
+	// and the hook is consulted with the body in hand. Everything the path can
+	// do -- forward, terminate -- is carried out by the same advanceHead the
+	// ordinary path uses, reached with the verdict already computed, so a
+	// buffering policy changes WHEN the hook is asked and nothing else about
+	// how the verdict is carried out. compilePolicy dropped the cap for
+	// policies without a request hook, so this branch is unreachable on the
+	// head-only path: one integer comparison per head is what the feature
+	// costs a policy that does not ask for it.
+	if r.side == sideRequest && r.cp.bodyBufferCap > 0 {
+		return r.deferRequest(head, gen)
+	}
+
+	return r.advanceHead(head, gen, func() *hookRewrite { return r.hookRewrite(head, nil) })
+}
+
+// advanceHead carries stepHead's tail: the framing decision, the hook, and the
+// rewritten head's emission. It exists so the deferred path (deferRequest, and
+// the two capture endings) can reach the identical code with a verdict it has
+// already computed, instead of a second copy of the tail drifting away from
+// this one.
+//
+// hookFn defers the hook call to after nextPhase has accepted the framing,
+// which is the order the hook always ran in: a request whose framing cannot be
+// parsed fails open before its hook is consulted, so a hook never observes a
+// request this package could not frame -- on this path or the deferred one.
+func (r *streamRewriter) advanceHead(head *parsedHead, gen int, hookFn func() *hookRewrite) error {
 	// The transform decision is made here, before the head is re-emitted, because
 	// it decides two things at once: what the head says about the body (a
 	// compressed body has no content-length to declare, and needs its framing
@@ -1657,7 +1766,7 @@ func (r *streamRewriter) stepHead() error {
 		return nil
 	}
 
-	hook := r.hookRewrite(head)
+	hook := hookFn()
 	if hook != nil && hook.terminate != nil {
 		// The request is answered by the edge. The head is dropped -- the
 		// upstream must never see the request -- and the response side is the
@@ -1694,6 +1803,263 @@ func (r *streamRewriter) stepHead() error {
 	r.emit(rewritten)
 	r.phase = next
 	return nil
+}
+
+// The deferred verdict (Policy.BodyBufferCap).
+//
+// A body-consuming hook cannot judge a head it cannot see the body of, and the
+// body is, by the package's own rules, never somewhere a hook could read it:
+// it is still on the wire when the verdict is due. The deferred path is the
+// one exception, armed per policy and shaped by three fixed rules.
+//
+// First, the rewriter provides the body and the action decides the response.
+// When the body cannot be captured the hook is asked with req.Body nil -- a
+// definite finding, not an absent one (http.ReadRequest never yields nil, so
+// nil can only mean this path put it there) -- and the action answers. The
+// rewriter never fabricates a refusal of its own, so the bytes a client sees
+// for "unverifiable" are the same bytes it sees for "unverified": one fixed
+// response per action, and no framing-shaped 400s to probe with.
+//
+// Second, capture is all-or-nothing per request and bounded by the cap. The
+// declared length is checked before the head is withheld; the bytes are drawn
+// into pooled 64 KiB slabs as they arrive (never one growing allocation), and
+// a stream that ends short of its declaration abandons the capture rather
+// than forwarding a body it cannot account for.
+//
+// Third, every path out of the capture releases its slabs exactly once, on
+// the reading goroutine: the verdict's terminate, the verdict's emission, the
+// source's end mid-capture, and the connection's close -- the last one by
+// ending the parked read (filteredConn.Close), which surfaces here as the
+// source error above. The chain is never returned to the pool from the Close
+// path directly, because the reading goroutine may be inside a Read whose
+// destination is a slab being released; the same discipline the direction's
+// own read buffer follows, with the read interruption doing the work.
+
+// deferRequest is the BodyBufferCap branch of stepHead, entered with the head
+// parsed and the shared state updated. It decides between the two shapes the
+// deferred path has -- capture, or the nil-Body consultation -- and never
+// emits anything itself: emission belongs to the verdict.
+func (r *streamRewriter) deferRequest(head *parsedHead, gen int) error {
+	length, declared, err := head.contentLength()
+	capturable := err == nil && declared &&
+		length <= int64(r.cp.bodyBufferCap) &&
+		!head.hasField("transfer-encoding") &&
+		!head.isUpgrade()
+
+	if !capturable {
+		// The body cannot be captured: a Transfer-Encoding (chunked is the
+		// common one; an unknown coding names a body this package could not
+		// frame either), no Content-Length, a length over the cap, an
+		// unparseable one, or an upgrade request whose "body" is the
+		// upgraded protocol itself. The hook is asked with Body nil and its
+		// verdict carried out exactly as the ordinary path would -- including
+		// a nil verdict, which forwards the request through the same
+		// nextPhase decision the unbuffered path would have made (a chunked
+		// body streams by chunks, a long one is copied by length, an upgrade
+		// goes raw after its head). The hook has already run when this
+		// closure is consulted, so it runs once per request on this path too.
+		hook := r.hookRewrite(head, nil)
+		return r.advanceHead(head, gen, func() *hookRewrite { return hook })
+	}
+
+	// Hold the head and capture the declared body. capHead's bytes alias
+	// pending, which nothing else touches until the capture ends -- the
+	// buffering state reads through scratch and the head steps are not
+	// reachable from here -- so the head survives to be rewritten (and
+	// re-read by the hook) at the verdict.
+	r.capture = &bodyCapture{}
+	r.capHead = head
+	r.bodyLeft = length
+	if length == 0 {
+		// A declared-empty body is fully captured already; there is no
+		// buffer state to sit in. The hook still runs (an action may refuse
+		// an empty body), and the hook object's Body is non-nil and empty --
+		// captured, just of size zero. nil is reserved for "not captured".
+		return r.finishCapture()
+	}
+	r.phase = stBodyBuffer
+	return nil
+}
+
+// stepBodyBuffer banks the captured body until its declared length is met,
+// then runs the verdict. The reads go through scratch like every other
+// body step, so the capture's slabs never alias the reader's buffer and no
+// slab is live inside a source read.
+func (r *streamRewriter) stepBodyBuffer() error {
+	n := int64(len(r.scratch))
+	if n > r.bodyLeft {
+		n = r.bodyLeft
+	}
+	read, err := r.br.Read(r.scratch[:n])
+	if read > 0 {
+		r.capture.write(r.scratch[:read])
+		r.bodyLeft -= int64(read)
+		if r.bodyLeft == 0 {
+			return r.finishCapture()
+		}
+	}
+	if err != nil {
+		if read > 0 {
+			return nil // bytes banked; the error surfaces on the next read
+		}
+		return r.abandonCapture()
+	}
+	return nil
+}
+
+// finishCapture is the verdict of a fully captured body: the hook is asked
+// once, with Body reading exactly the bytes that will follow the head if the
+// verdict forwards. Terminate takes the ordinary plumbing; forwarding emits
+// the rewritten head and then the captured bytes, in that order, and the
+// stream continues from the socket -- the next head, not a re-read body.
+func (r *streamRewriter) finishCapture() error {
+	// The head outlives the capture's teardown: dropCapture releases the
+	// slabs and clears the held state, but the verdict still has to be
+	// rewritten from the held head, whose bytes alias pending (untouched
+	// since the capture began).
+	head := r.capHead
+	body := r.capture.join()
+	r.dropCapture()
+
+	hook := r.hookRewrite(head, body)
+	if hook != nil && hook.terminate != nil {
+		r.st.setTerminate(hook.terminate, r.gen)
+		r.pending = r.pending[:0]
+		r.phase = stDrain
+		return nil
+	}
+
+	rewritten := r.cp.rewriteRequestHead(head, hook)
+	r.pending = r.pending[:0]
+	r.emit(rewritten)
+	r.emit(body)
+	r.phase = stHead
+	return nil
+}
+
+// abandonCapture is the capture's failure shape: the source ended (or broke)
+// before the declared length arrived, so the body can be neither completed
+// nor accounted for. The hook is asked with Body nil -- could-not-buffer, the
+// same finding the uncapturable framings produce -- and a verdict that
+// forwards gets the head plus whatever did arrive, with the rest copied by
+// the ordinary Content-Length path, where a source that ends early is the
+// peer's truncation to report, not ours to paper over.
+func (r *streamRewriter) abandonCapture() error {
+	r.lg.Warn("%s: request body ended %d bytes short of its declared length while it was being captured for a deferred verdict; the hook is asked without a body",
+		r.dir, r.bodyLeft)
+
+	hook := r.hookRewrite(r.capHead, nil)
+	if hook != nil && hook.terminate != nil {
+		r.dropCapture()
+		r.st.setTerminate(hook.terminate, r.gen)
+		r.pending = r.pending[:0]
+		r.phase = stDrain
+		return nil
+	}
+
+	rewritten := r.cp.rewriteRequestHead(r.capHead, hook)
+	r.pending = r.pending[:0]
+	r.emit(rewritten)
+	r.emitCapturedBody()
+	r.dropCapture()
+	r.remaining = r.bodyLeft // the unarrived rest truncates as it always did
+	r.phase = stBodyCL
+	return nil
+}
+
+// emitCapturedBody queues the captured bytes in arrival order, slab by slab.
+// Only the last slab is partial; every earlier one is exactly full, which is
+// the invariant bodyCapture.write maintains.
+func (r *streamRewriter) emitCapturedBody() {
+	last := len(r.capture.slabs) - 1
+	for i, slab := range r.capture.slabs {
+		end := readBufferSize
+		if i == last {
+			end = r.capture.fill
+		}
+		r.emit(slab.b[:end])
+	}
+}
+
+// dropCapture returns the capture's slabs to the pool and clears the held
+// state. Reading goroutine only: a slab may be the destination of a source
+// read in flight, and the pool may hand a returned slab to another
+// connection immediately.
+func (r *streamRewriter) dropCapture() {
+	if r.capture != nil {
+		r.capture.release()
+	}
+	r.capture, r.capHead = nil, nil
+}
+
+// bodyCapture accumulates one request body out of pooled 64 KiB slabs: the
+// same readBuf cells readBufPool circulates for the directions' own readers,
+// drawn only as the body needs them, so a capture of a small webhook POST
+// costs one slab and the cap bounds the worst case at cap/64KiB of them.
+// The alternative -- one append-growing slice -- is exactly the unbounded
+// doubling allocation the pool exists to keep off this path.
+//
+// Ownership: the reading goroutine creates it, fills it, reads out of it and
+// releases it, exactly once, on whichever path ends the capture. release is
+// idempotent not because a second caller is expected but because exactly-once
+// is the invariant the pooled_test ownership counters check, and an invariant
+// that one slip would break is worth one branch.
+type bodyCapture struct {
+	slabs    []*readBuf // in arrival order; all but the last are exactly full
+	fill     int        // bytes used in the last slab
+	n        int64      // total bytes captured
+	released bool
+}
+
+// write banks p. A full slab is retired and a fresh one acquired only when
+// there is still something to write, so a body that ends on a slab boundary
+// never acquires an empty trailing slab.
+func (c *bodyCapture) write(p []byte) {
+	for len(p) > 0 {
+		var cur *readBuf
+		if n := len(c.slabs); n > 0 && c.fill < readBufferSize {
+			cur = c.slabs[n-1]
+		} else {
+			cur = getReadBuf()
+			c.slabs = append(c.slabs, cur)
+			c.fill = 0
+		}
+		k := copy(cur.b[c.fill:], p)
+		c.fill += k
+		c.n += int64(k)
+		p = p[k:]
+	}
+}
+
+// join returns the captured bytes as one slice the capture does not own: a
+// fresh allocation, so the hook (and the emission) can hold it after the
+// slabs have gone back to the pool and been scribbled by the next connection.
+// The result is never nil -- for an empty capture it is an empty slice --
+// because nil is the capture's "did not happen" signal at the hook.
+func (c *bodyCapture) join() []byte {
+	out := make([]byte, 0, c.n)
+	for i, slab := range c.slabs {
+		end := readBufferSize
+		if i == len(c.slabs)-1 {
+			end = c.fill
+		}
+		out = append(out, slab.b[:end]...)
+	}
+	return out
+}
+
+// release puts every slab back, once. After it runs the capture holds no
+// array, so a stray second call (there is no path to one) is a no-op rather
+// than a double Put of a live buffer.
+func (c *bodyCapture) release() {
+	if c.released {
+		return
+	}
+	c.released = true
+	for _, slab := range c.slabs {
+		putReadBuf(slab)
+	}
+	c.slabs, c.fill = nil, 0
 }
 
 // syntheticHeadTooLargeBody and syntheticMalformedHeadBody are the bodies of the
@@ -1783,17 +2149,21 @@ var testParkGapHook func(*connState)
 // rewrite -- or nil, which is the "nothing to change" answer every caller
 // handles as the no-hook case.
 //
+// body is the captured request body the deferred verdict runs over (see
+// Policy.BodyBufferCap): nil on the response side and on the head-only path,
+// where the request object stays exactly what the head bytes describe.
+//
 // It exists so that stepHead says what it does with a verdict and this says how
 // one is asked for: the request side runs its hook on every head (the request
 // is a fresh one each time), the response side only on final responses (1xx
 // heads are the interim answer or the upgrade handshake, not a response any
 // action describes).
-func (r *streamRewriter) hookRewrite(head *parsedHead) *hookRewrite {
+func (r *streamRewriter) hookRewrite(head *parsedHead, body []byte) *hookRewrite {
 	if r.side == sideRequest {
 		if r.cp.reqHook == nil {
 			return nil
 		}
-		verdict := r.callRequestHook(head.raw)
+		verdict := r.callRequestHook(head.raw, body)
 		if verdict == nil {
 			return nil
 		}
@@ -1819,7 +2189,22 @@ func (r *streamRewriter) hookRewrite(head *parsedHead) *hookRewrite {
 // what is populated -- and a hook that panics or a head that net/http cannot
 // read as a request is a skipped hook, never a broken connection: the request
 // is forwarded exactly as the static policy left it.
-func (r *streamRewriter) callRequestHook(raw []byte) (verdict *RequestVerdict) {
+//
+// body is the deferred verdict's captured body, and it has exactly three
+// shapes, which the Body field of the object the hook receives carries:
+//
+//   - body non-nil: the capture path. req.Body is set to read exactly these
+//     bytes, which are the bytes that follow the head on the wire if the
+//     verdict forwards.
+//   - body nil under a buffering policy (compilePolicy only arms the
+//     deferred path when one is set): the body could not be captured, and
+//     req.Body is set to nil explicitly. ReadRequest never produces a nil
+//     Body, so nil at the hook is unambiguous -- the pinned signal a
+//     body-consuming action fails closed on (policy/webhook.go's bufferedBody).
+//   - body nil with no buffering policy: the object is untouched, which is
+//     the head-only contract the package has always had (and which
+//     TestHookSeesHeadOnlyObjects pins).
+func (r *streamRewriter) callRequestHook(raw, body []byte) (verdict *RequestVerdict) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			verdict = nil
@@ -1827,12 +2212,19 @@ func (r *streamRewriter) callRequestHook(raw []byte) (verdict *RequestVerdict) {
 		}
 	}()
 	// ReadRequest is given the head alone, so the request it returns has no
-	// body: the bytes behind the head are still in this direction's reader and
-	// are copied, or not, according to what the verdict says.
+	// body from the wire: the bytes behind the head are still in this
+	// direction's reader and are copied, or not, according to what the verdict
+	// says -- or handed to the hook here, when the deferred path captured them.
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		r.hookFailed("request head is not readable by net/http (%v)", err)
 		return nil
+	}
+	switch {
+	case body != nil:
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	case r.cp.bodyBufferCap > 0:
+		req.Body = nil
 	}
 	return r.cp.reqHook(req)
 }

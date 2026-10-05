@@ -1,6 +1,6 @@
 # Spec 10 — Webhook verification
 
-Status: approved (user: parity items, work autonomously). Recon complete (see agent
+Status: shipped (see the changelog entry for its release; this document is the design record) (user: parity items, work autonomously). Recon complete (see agent
 report — anchors below). v1.0.14 material. The load-bearing change is in the REWRITER:
 the first body buffering in the request path, with a deferred verdict.
 

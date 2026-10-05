@@ -32,6 +32,10 @@ var minimalConfig = map[string]map[string]interface{}{
 	ActionBearerAuth:    {"tokens": []interface{}{"probe"}},
 	ActionAPIKeyAuth:    {"keys": []interface{}{"probe"}},
 	ActionJWTValidation: {"jwks_uri": "https://idp.example/jwks.json"},
+	// The webhook verification action (SPEC-CLUSTER10): its two required
+	// fields. The secret is inline here; the vault round-trip is
+	// webhook_test.go's.
+	ActionWebhookVerification: {"provider": "stripe", "secrets": []interface{}{"probe"}},
 }
 
 // TestPhaseActionsMatchesTheMatrix is the first half: the list the message

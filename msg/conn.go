@@ -106,7 +106,13 @@ const (
 // Inline plaintext and vault-sourced credentials are indistinguishable here
 // and both must be hidden (SPEC-CLUSTER9 3.3): the redaction is by field
 // name, so it does not care which source filled the array.
-var policyCredentialFieldNames = []string{`"credentials"`, `"tokens"`, `"keys"`}
+var policyCredentialFieldNames = []string{`"credentials"`, `"tokens"`, `"keys"`,
+	// "secrets" is webhook-verification's signing-key list (SPEC 10): the
+	// same class of credential as the auth actions' lists -- an HMAC key is
+	// if anything more sensitive, it forges signatures -- and it joined the
+	// wire after the original three, crossing both DEBUG logs in plaintext
+	// until the webhook e2e's sentinel scenario caught it.
+	`"secrets"`}
 
 // redactSecrets returns the bytes to log for a serialized message: the same
 // bytes with the value of every "Secret" field replaced by a placeholder, and

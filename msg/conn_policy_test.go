@@ -277,3 +277,36 @@ func TestHttpAuthIsRedacted(t *testing.T) {
 		t.Fatalf("redaction must leave the rest of the message intact: %s", red)
 	}
 }
+
+// TestWebhookSecretsAreRedacted pins the cluster-14 addition to the
+// credential-field list: webhook-verification's secrets array is signing-key
+// material crossing inside the policy document, and it crossed both DEBUG
+// wire logs in plaintext until the webhook e2e's sentinel caught it.
+func TestWebhookSecretsAreRedacted(t *testing.T) {
+	doc := &policy.TrafficPolicy{
+		OnHTTPRequest: []*policy.Action{
+			{
+				Name: policy.ActionWebhookVerification,
+				Config: map[string]interface{}{
+					"provider": "stripe",
+					"secrets":  []interface{}{"whsec_plain_signing_key"},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(&ReqTunnel{
+		Protocol:      "http",
+		Hostname:      "whredact.test",
+		TrafficPolicy: doc,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	red := redactSecrets(raw)
+	if bytes.Contains(red, []byte("whsec_plain_signing_key")) {
+		t.Fatalf("webhook signing secret survived redaction: %s", red)
+	}
+	if !bytes.Contains(red, []byte("webhook-verification")) {
+		t.Fatalf("redaction must leave the policy structure intact: %s", red)
+	}
+}

@@ -52,6 +52,13 @@ var actionPhases = map[string][]phase{
 	ActionBearerAuth:    {phaseRequest},
 	ActionAPIKeyAuth:    {phaseRequest},
 	ActionJWTValidation: {phaseRequest},
+
+	// Webhook verification (SPEC-CLUSTER10) is request-phase only, for the
+	// credential actions' reason and a steeper one besides: its verdict is
+	// computed over the request body, which only the request phase ever
+	// has -- and only when the rewriter buffers it, which is why compiling
+	// one sets the compiled policy's body cap.
+	ActionWebhookVerification: {phaseRequest},
 }
 
 // phaseActions lists, in a stable order, the actions a phase implements, for
@@ -134,6 +141,11 @@ func (tp *TrafficPolicy) build() (*Compiled, error) {
 	if c.request, err = buildPhase(phaseRequest, tp.OnHTTPRequest); err != nil {
 		return nil, err
 	}
+	// The body cap comes out of the same traversal, so a policy cannot
+	// contain a body-consuming action the rewriter was never told about:
+	// the flag is derived from the built actions, not declared beside them,
+	// and cannot drift from what actually compiled.
+	c.requestBodyCap = requestBodyCapOf(c.request)
 	if c.response, err = buildPhase(phaseResponse, tp.OnHTTPResponse); err != nil {
 		return nil, err
 	}
@@ -377,6 +389,21 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 			return nil, err
 		}
 		auth, err := buildJWTValidation(where, cfg)
+		if err != nil {
+			return nil, err
+		}
+		a.auth = auth
+
+	case ActionWebhookVerification:
+		// The webhook verification action follows the authentication actions'
+		// shape: keys first, so a typo'd field is refused with the standard
+		// "unknown config field" message every other action gives, then the
+		// builder that owns its runtime (webhook.go), which resolves the
+		// secrets and freezes the per-provider refusal.
+		if err := checkConfigKeys(where, cfg, "provider", "secrets", "tolerance_seconds"); err != nil {
+			return nil, err
+		}
+		auth, err := buildWebhookVerification(where, cfg)
 		if err != nil {
 			return nil, err
 		}

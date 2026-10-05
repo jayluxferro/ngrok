@@ -1038,8 +1038,14 @@ func (t *Tunnel) join(publicConn, proxyConn conn.Conn, pol *policy.Compiled) (by
 	}
 
 	toUpstream, fromUpstream := rewriter.NewConnPair(publicConn, proxyConn, &rewriter.Policy{
-		RequestHook:  reqHook,
+		RequestHook: reqHook,
 		ResponseHook: respHook,
+		// The one-line bridge to the webhook body buffering (SPEC 10 §3):
+		// when the compiled request phase contains a body-consuming action,
+		// the rewriter defers its verdict until the request body is banked
+		// and hands it to the hook. Zero for every policy that does not ask,
+		// which is every pre-webhook policy -- one int compare of overhead.
+		BodyBufferCap: pol.RequestBodyCap(),
 	})
 	return conn.Join(fromUpstream, toUpstream)
 }

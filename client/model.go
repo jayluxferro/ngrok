@@ -1523,6 +1523,11 @@ func (c *ClientModel) attachPolicyHooks(tunnel mvc.Tunnel, clientAddr string, p 
 	// path's edge twin (the public connection's remote address).
 	p.RequestHook = compiled.RequestHook(c, clientAddr)
 	p.ResponseHook = compiled.ResponseHook(c, clientAddr)
+	// The agent-side twin of the server's join wiring (SPEC 10 §3): a policy
+	// whose request phase consumes the body gets the rewriter's deferred
+	// verdict + bounded buffering here too, so agent-terminated tunnels
+	// enforce webhook verification identically to edge-terminated ones.
+	p.BodyBufferCap = compiled.RequestBodyCap()
 }
 
 // streamCarrier is the transport a mux session runs on (SPEC-CLUSTER7 5): the
