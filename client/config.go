@@ -713,7 +713,95 @@ func validateEndpointPolicy(tunnelName string, t *TunnelConfiguration) error {
 		return fmt.Errorf("Tunnel %s: hostname/subdomain are only valid for http/https protocols, got %s", tunnelName, protoNames(t.Protocols))
 	}
 
+	// Wildcard hostnames (SPEC 11). The checks sit after the port-routed
+	// refusal on purpose: a wildcard on a tcp/udp tunnel is refused by THAT
+	// rule, in its words -- a name on a port-routed endpoint is a control that
+	// could never mean anything, wildcard or not -- so the grammar below only
+	// ever judges names a name-routed endpoint could actually carry.
+	//
+	// The wildcard lives in the hostname field only: a '*' in subdomain is a
+	// spelling the server has no branch for (it would register the star as a
+	// literal subdomain label), so it is refused here with the hostname
+	// spelling named. And the client's check is grammar-only, deliberately:
+	// which domains may carry a wildcard is the server's own-domain rule, and
+	// the client cannot know the server's domain -- the server refuses a
+	// wildcard over anything else with that domain named (the mirror
+	// discipline: same grammar both sides, the domain rule server-side only).
+	if strings.Contains(t.Subdomain, "*") {
+		return fmt.Errorf("Tunnel %s: subdomain %q must not contain '*': write the wildcard in the hostname instead (for example hostname: \"*.example.com\")",
+			tunnelName, t.Subdomain)
+	}
+	if strings.Contains(t.Hostname, "*") {
+		if err := validateWildcardHostname(tunnelName, t); err != nil {
+			return err
+		}
+	}
+
 	return validateForwardTo(tunnelName, t)
+}
+
+// validateWildcardHostname polices the registration grammar of SPEC 11 §2 for
+// a hostname that contains '*': exactly one leading "*." label, nothing else
+// wild, no '*' mid-name -- the shape `*.<domain>`. It is called from
+// validateEndpointPolicy for config-file tunnels and the CLI-synthesized
+// "default" tunnel alike, and it validates GRAMMAR only: the server serves a
+// wildcard over its own configured domain and refuses every other base with
+// that domain named, which is a rule this side cannot restate (it does not
+// know the domain). What the client can do is refuse, at load, every
+// wildcard-bearing spelling that is not a wildcard at all -- "*", "a.*.b",
+// "*." with nothing behind it -- so the operator's typo is a startup error
+// naming the accepted shape instead of a registration error (or, worse, a
+// literal-star name registered and never routed) from the server.
+//
+// It also canonicalizes: the hostname is lowercased and trimmed before the
+// grammar runs and written back, so the grammar judges -- and the wire
+// carries -- the exact name the server will register. That is the same
+// canonicalization the server applies to every public hostname it registers
+// (lowercase, surrounding space stripped), so "*.EXAMPLE.com" and
+// " *.example.com" are one hostname here the way they are one hostname there;
+// the "*.base" spelling itself survives untouched, and the tunnel's url keeps
+// the literal wildcard.
+//
+// On binding internal the refusal is categorical and comes first: an internal
+// endpoint is an exact name in the .internal namespace -- it is how other
+// tunnels address it in forward_to -- and a wildcard there would be an
+// endpoint with no single name to address.
+func validateWildcardHostname(tunnelName string, t *TunnelConfiguration) error {
+	if t.Binding == msg.BindingInternal {
+		return fmt.Errorf("Tunnel %s: hostname %q must not contain '*': wildcards are a public-binding feature, and internal endpoints are exact names in the %s namespace (the owner namespace must stay exact)",
+			tunnelName, t.Hostname, msg.InternalSuffix)
+	}
+
+	hostname := strings.ToLower(strings.TrimSpace(t.Hostname))
+
+	rest, ok := strings.CutPrefix(hostname, "*.")
+	if !ok {
+		return fmt.Errorf("Tunnel %s: hostname %q is not a valid wildcard: the only wildcard form is one leading \"*.\" followed by an exact domain, with no other '*' anywhere (for example \"*.example.com\")",
+			tunnelName, t.Hostname)
+	}
+	if rest == "" {
+		return fmt.Errorf("Tunnel %s: hostname %q has no domain after \"*.\" (for example \"*.example.com\")",
+			tunnelName, t.Hostname)
+	}
+	if strings.Contains(rest, "*") {
+		return fmt.Errorf("Tunnel %s: hostname %q has more than one '*': exactly one leading \"*.\" is allowed (for example \"*.example.com\")",
+			tunnelName, t.Hostname)
+	}
+	for _, label := range strings.Split(rest, ".") {
+		if label == "" {
+			return fmt.Errorf("Tunnel %s: hostname %q is not a domain: labels between dots cannot be empty (for example \"*.example.com\")",
+				tunnelName, t.Hostname)
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return fmt.Errorf("Tunnel %s: hostname %q is not a domain: %q is not a hostname label -- letters, digits and '-' only (for example \"*.example.com\")",
+					tunnelName, t.Hostname, label)
+			}
+		}
+	}
+
+	t.Hostname = hostname
+	return nil
 }
 
 // validateInternalEndpoint checks the .internal namespace rules of SPEC 3.2:

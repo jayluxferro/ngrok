@@ -152,8 +152,18 @@ func connectVerdict(pol *policy.Compiled, c conn.Conn) policy.ConnectVerdict {
 	return pol.EvaluateConnect(c.RemoteAddr().String())
 }
 
-// Common functionality for registering virtually hosted protocols
-func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
+// derivedVhost is the public host that tunnels on a protocol derive their
+// urls from, canonicalized the way registerVhost has always canonicalized it:
+// the VHOST override when one is set, otherwise the server's -domain and the
+// serving port, with the protocol's default port stripped and the whole name
+// lower-cased.
+//
+// It is the single spelling of that derivation, shared by registerVhost
+// (which builds urls from it) and validateRequest (which pins wildcard
+// hostnames to it, SPEC 11). Two copies of a canonicalization that must
+// agree is exactly how a wildcard the validator accepted and the "*.base"
+// key the registration actually builds drift apart, so there is one copy.
+func derivedVhost(protocol string, servingPort int) string {
 	vhost := os.Getenv("VHOST")
 	if vhost == "" {
 		vhost = fmt.Sprintf("%s:%d", opts.domain, servingPort)
@@ -162,7 +172,7 @@ func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
 	// Canonicalize virtual host by removing default port (e.g. :80 on HTTP)
 	defaultPort, ok := defaultPortMap[protocol]
 	if !ok {
-		return fmt.Errorf("Couldn't find default port for protocol %s", protocol)
+		return ""
 	}
 
 	defaultPortSuffix := fmt.Sprintf(":%d", defaultPort)
@@ -171,7 +181,15 @@ func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
 	}
 
 	// Canonicalize by always using lower-case
-	vhost = strings.ToLower(vhost)
+	return strings.ToLower(vhost)
+}
+
+// Common functionality for registering virtually hosted protocols
+func registerVhost(t *Tunnel, protocol string, servingPort int) (err error) {
+	vhost := derivedVhost(protocol, servingPort)
+	if vhost == "" {
+		return fmt.Errorf("Couldn't find default port for protocol %s", protocol)
+	}
 
 	// A public binding derives its hostname from vhost (the domain or the
 	// VHOST override): if the derivation ends in .internal, every derived url
@@ -376,6 +394,47 @@ func (t *Tunnel) validateRequest() error {
 	case msg.ProtoHTTP, msg.ProtoHTTPS:
 	default:
 		return fmt.Errorf("%s: Protocol %s is not supported", what, m.Protocol)
+	}
+
+	// Wildcard hostnames (SPEC 11). A request may claim every name exactly
+	// one label under this server's own public domain with the shape
+	// "*.<domain>", and nothing else wild: arbitrary-domain wildcards need an
+	// ownership model this server does not have, a wildcard is a public,
+	// HTTP-shaped binding by definition, and the canonical spelling is the
+	// hostname field -- subdomain would derive the same url, but the grammar
+	// living in one field is what makes both sides (client config, server)
+	// refuse the same inputs for the same reason.
+	//
+	// The base a wildcard must carry is the vhost registerVhost will derive
+	// for this protocol -- the same derivation, not a second opinion -- so
+	// acceptance here and the literal "*.base" key registered there cannot
+	// disagree. Every refusal names the rule it enforces and the accepted
+	// shape, because the operator's next move depends on knowing both.
+	if strings.Contains(m.Hostname, "*") || strings.Contains(m.Subdomain, "*") {
+		if m.Binding == msg.BindingInternal {
+			return fmt.Errorf("%s: wildcard hostnames cannot bind internal; internal endpoints are exact names under %s", what, msg.InternalSuffix)
+		}
+		switch m.Protocol {
+		case msg.ProtoHTTP, msg.ProtoHTTPS:
+		default:
+			return fmt.Errorf("%s: wildcard hostnames are only supported for http and https endpoints (tcp and udp endpoints are port-routed, not name-routed)", what)
+		}
+		if strings.Contains(m.Subdomain, "*") {
+			return fmt.Errorf("%s: subdomain %q cannot be a wildcard; write the wildcard in the hostname field (e.g. *.%s)", what, strings.TrimSpace(m.Subdomain), opts.domain)
+		}
+		base, ok := wildcardBase(strings.ToLower(strings.TrimSpace(m.Hostname)))
+		if !ok {
+			return fmt.Errorf("%s: wildcard hostname %q is malformed; the accepted shape is exactly one leading \"*.\" label with no \"*\" anywhere else (for example *.%s)", what, strings.TrimSpace(m.Hostname), opts.domain)
+		}
+		servingPort := defaultPortMap[m.Protocol]
+		if l, ok := listeners[m.Protocol]; ok {
+			if addr, ok := l.Addr.(*net.TCPAddr); ok {
+				servingPort = addr.Port
+			}
+		}
+		if want := derivedVhost(m.Protocol, servingPort); base != want {
+			return fmt.Errorf("%s: wildcard hostnames must be *.%s, this server's own domain; %q is not a domain this server serves", what, want, strings.TrimSpace(m.Hostname))
+		}
 	}
 
 	// TLSTermination (SPEC-CLUSTER5 5.1) is canonicalized like Binding: an

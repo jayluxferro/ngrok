@@ -2669,4 +2669,380 @@ PY
   chmod 755 "$TMPDIR/vault-readonly"
 fi
 
+# ---------------------------------------------------------------------------
+# Wildcard hostnames (SPEC-CLUSTER15). A tunnel may claim every name exactly
+# one label under the server's own domain with hostname "*.<domain>", and the
+# claim serves exactly the names no exact registration took: the exact map
+# hit always wins, the wildcard is a miss-path fallback, one label deep. Every
+# earlier group names exact hostnames; this one starts a SIXTH ngrokd because
+# the wildcard needs two things no earlier server had at once: -authToken
+# (the cross-owner refusal is only observable BETWEEN tokens -- with none
+# configured every client shares the one default owner, the same reasoning
+# the tls and udp groups document) and an https listener (the agent-
+# terminated scenario). Its ports are distinct from all five earlier servers.
+#
+# One harness spelling here is load-bearing: the wildcard base is whatever
+# the server's vhost derivation produces, and $VHOST overrides that
+# derivation wholesale. With listeners on high ports (18084/18445) and no
+# VHOST, the derived base would be "localhost:18084" -- a base no hostname
+# grammar can spell -- so this server is started with VHOST=localhost, which
+# is the derivation a production server on :80/:443 gets from -domain alone.
+# Pinning it via the documented override keeps the group on unprivileged
+# ports; the feature under test (index, matcher, refusals) never sees the
+# difference, and the VHOST-less refusal of a high-port base is 1.0.14's
+# documented own-domain rule working as written, not a bug this group hides.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] starting the wildcard ngrokd (sixth server: auth tokens + https, ports distinct)"
+VHOST=localhost ./bin/ngrokd -domain=localhost \
+  -httpAddr=127.0.0.1:18084 -httpsAddr=127.0.0.1:18445 \
+  -tunnelAddr=127.0.0.1:14449 -adminAddr=127.0.0.1:19095 -authToken=alpha,beta \
+  >/tmp/ngrok-e2e-wild-ngrokd.log 2>&1 &
+WILD_SERVER_PID=$!
+for i in {1..40}; do
+  if grep -q "Listening for public http connections" /tmp/ngrok-e2e-wild-ngrokd.log 2>/dev/null && \
+     grep -q "Listening for public https connections" /tmp/ngrok-e2e-wild-ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for public http connections" /tmp/ngrok-e2e-wild-ngrokd.log 2>/dev/null || \
+   ! grep -q "Listening for public https connections" /tmp/ngrok-e2e-wild-ngrokd.log 2>/dev/null; then
+  echo "[e2e] the wildcard ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-wild-ngrokd.log || true
+  exit 1
+fi
+
+# Marker upstreams on the pooling group's pool_upstream.py (name, port) ->
+# answers with its name: the same one-name-per-upstream trick that let the
+# pooling scenario tell its two agents apart, now telling a wildcard hit from
+# an exact one. Reuse is deliberate, as with the tls group's CA below: one
+# marker server, one place to look.
+echo "[e2e] starting the wildcard group's marker upstreams (wildstar :19007, wildexact :19008)"
+python3 "$TMPDIR/pool_upstream.py" wildstar 19007 >/tmp/ngrok-e2e-wild-app-star.log 2>&1 &
+python3 "$TMPDIR/pool_upstream.py" wildexact 19008 >/tmp/ngrok-e2e-wild-app-exact.log 2>&1 &
+
+cat > "$TMPDIR/ngrok-wild-cli.yml" <<'YAML'
+server_addr: 127.0.0.1:14449
+trust_host_root_certs: true
+YAML
+
+# wild 1-3 ride one client with BOTH tunnels, because the interesting
+# wildcard property is exactly the coexistence: the wildcard serves misses
+# while an exact sibling is live. wildstar is a POOLING tunnel on purpose,
+# and the reason is the refusal ladder in server/registry.go, not the
+# feature: a bucket refuses a newcomer on the first rule that fires, and a
+# plain (non-pooling) wildcard's bucket refuses the cross-owner client with
+# the generic "already registered" before ownership is ever compared.
+# Registering the wildcard as a pooling member moves the decision past that
+# branch, so wild 4 below exercises the rule the spec names -- a second
+# WILDCARD over the same base from another owner -- instead of the taken-url
+# refusal any duplicate would meet. With exactly one member the pool routes
+# identically to a plain tunnel, so wild 1-3 read the same either way. This
+# client is also the config-file road for the grammar; wild 4 and wild 6
+# spell the same hostname on the CLI road.
+echo "[e2e] starting the wildcard client (wildstar=*.localhost pooled, wildexact=api.localhost)"
+cat > "$TMPDIR/ngrok-wild.yml" <<'YAML'
+server_addr: 127.0.0.1:14449
+trust_host_root_certs: true
+auth_token: alpha
+tunnels:
+  wildstar:
+    hostname: "*.localhost"
+    pooling: true
+    proto: {http: "127.0.0.1:19007"}
+  wildexact:
+    hostname: api.localhost
+    proto: {http: "127.0.0.1:19008"}
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-wild.yml" -log=/tmp/ngrok-e2e-wild-client.log \
+  start wildstar wildexact >/tmp/ngrok-e2e-wild-client-stdout.log 2>&1 &
+WILD_CLIENT_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-wild-client.log "wildstar+wildexact"
+wait_for_public_at 18084 api.localhost
+wait_for_public_at 18084 wildone.localhost
+
+echo "[e2e] wild 1: the wildcard serves an otherwise-unregistered name"
+WILD_RESP="$(curl -fsS -H 'Host: wildone.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_RESP" != "wildstar" ]]; then
+  echo "[e2e] the wildcard tunnel did not serve an unregistered name under its base: \"$WILD_RESP\""
+  exit 1
+fi
+# A second arbitrary name: one wildcard bucket, every one-label name under it.
+WILD_RESP="$(curl -fsS -H 'Host: wildtwo.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_RESP" != "wildstar" ]]; then
+  echo "[e2e] a second name under the base did not reach the wildcard tunnel: \"$WILD_RESP\""
+  exit 1
+fi
+
+echo "[e2e] wild 2: exact wins -- api.localhost hits its own tunnel, the rest hit the wildcard"
+WILD_EXACT="$(curl -fsS -H 'Host: api.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_EXACT" != "wildexact" ]]; then
+  echo "[e2e] the exact registration did not win over the live wildcard: \"$WILD_EXACT\""
+  exit 1
+fi
+WILD_REST="$(curl -fsS -H 'Host: wildthree.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_REST" != "wildstar" ]]; then
+  echo "[e2e] with the exact name registered, the wildcard stopped serving misses: \"$WILD_REST\""
+  exit 1
+fi
+
+echo "[e2e] wild 3: one label deep -- two labels under the base, and the bare base, still 404"
+WILD_DEEP="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: a.b.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_DEEP" != "404" ]]; then
+  echo "[e2e] a two-label name matched the one-label wildcard (got $WILD_DEEP, want 404)"
+  exit 1
+fi
+WILD_BASE="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_BASE" != "404" ]]; then
+  echo "[e2e] the bare base itself matched the wildcard (got $WILD_BASE, want 404)"
+  exit 1
+fi
+
+echo "[e2e] wild 4: a second token is refused the same wildcard base (cross-owner)"
+# Refused-registration shape, ports group's pattern: the refusal ends the
+# client, so wait on the EXIT and grep the stdout it leaves behind -- never
+# the -log file, whose tail records an exiting process can lose to log4go's
+# async writer. No -log on purpose.
+./bin/ngrok -config="$TMPDIR/ngrok-wild-cli.yml" \
+  -authtoken=beta -proto=http -hostname='*.localhost' -pooling \
+  19007 >"$TMPDIR/wild-b-refused.log" 2>&1 &
+WILD_B_PID=$!
+WILD_B_EXITED=0
+for i in {1..40}; do
+  if ! kill -0 "$WILD_B_PID" 2>/dev/null; then
+    WILD_B_EXITED=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$WILD_B_EXITED" != "1" ]]; then
+  echo "[e2e] the second token was not refused the wildcard base (client did not exit):"
+  cat "$TMPDIR/wild-b-refused.log" || true
+  kill "$WILD_B_PID" 2>/dev/null || true
+  exit 1
+fi
+if ! grep -qF "is already registered by a different account" "$TMPDIR/wild-b-refused.log" || \
+   ! grep -qF "http://*.localhost" "$TMPDIR/wild-b-refused.log"; then
+  echo "[e2e] the second token exited but its output does not carry the cross-owner wildcard refusal:"
+  cat "$TMPDIR/wild-b-refused.log" || true
+  exit 1
+fi
+# The refusal must not have disturbed the bucket it was refused by.
+WILD_AFTER="$(curl -fsS -H 'Host: wildtwo.localhost' http://127.0.0.1:18084/)"
+if [[ "$WILD_AFTER" != "wildstar" ]]; then
+  echo "[e2e] the refused join changed what the wildcard serves: \"$WILD_AFTER\""
+  exit 1
+fi
+
+echo "[e2e] wild 5a: a wildcard over a foreign domain is refused, naming this server's domain"
+# The client's check is grammar-only by design (it cannot know the server's
+# domain), so this registration REACHES the server and is refused there --
+# the one wildcard refusal that is server-shaped, and the mirror of the
+# client-side refusals in 5b/5c. Same exit-then-grep shape as wild 4.
+./bin/ngrok -config="$TMPDIR/ngrok-wild-cli.yml" \
+  -authtoken=alpha -proto=http -hostname='*.wrongdomain.example' \
+  19007 >"$TMPDIR/wild-foreign-refused.log" 2>&1 &
+WILD_FOREIGN_PID=$!
+WILD_FOREIGN_EXITED=0
+for i in {1..40}; do
+  if ! kill -0 "$WILD_FOREIGN_PID" 2>/dev/null; then
+    WILD_FOREIGN_EXITED=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$WILD_FOREIGN_EXITED" != "1" ]]; then
+  echo "[e2e] a wildcard over a foreign domain was not refused (client did not exit):"
+  cat "$TMPDIR/wild-foreign-refused.log" || true
+  kill "$WILD_FOREIGN_PID" 2>/dev/null || true
+  exit 1
+fi
+if ! grep -qF 'wildcard hostnames must be *.localhost' "$TMPDIR/wild-foreign-refused.log" || \
+   ! grep -qF "is not a domain this server serves" "$TMPDIR/wild-foreign-refused.log"; then
+  echo "[e2e] the foreign-domain refusal does not name the accepted base and the rule:"
+  cat "$TMPDIR/wild-foreign-refused.log" || true
+  exit 1
+fi
+
+echo "[e2e] wild 5b: a '*' mid-name is refused by the client grammar at load"
+# Client-side startup refusal, policy group's shape: the process must exit
+# nonzero at load, and the output must carry the rule and the accepted shape.
+cat > "$TMPDIR/ngrok-wild-broken.yml" <<'YAML'
+server_addr: 127.0.0.1:14449
+trust_host_root_certs: true
+auth_token: alpha
+tunnels:
+  broken:
+    hostname: "a.*.b"
+    proto:
+      http: 19007
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-wild-broken.yml" start broken >"$TMPDIR/wild-grammar-refused.out" 2>&1; then
+  echo "[e2e] the client started with a hostname that is not a wildcard but carries '*':"
+  cat "$TMPDIR/wild-grammar-refused.out"
+  exit 1
+fi
+if ! grep -qF '"a.*.b"' "$TMPDIR/wild-grammar-refused.out" || \
+   ! grep -qF "is not a valid wildcard" "$TMPDIR/wild-grammar-refused.out"; then
+  echo "[e2e] the grammar refusal does not name the spelling and the rule:"
+  cat "$TMPDIR/wild-grammar-refused.out" || true
+  exit 1
+fi
+
+echo "[e2e] wild 5c: a tcp tunnel with a wildcard hostname is refused by the port-routed rule"
+# By design the port-routed refusal fires before the wildcard grammar: a
+# name on an endpoint no name can reach is a control that could never mean
+# anything, wildcard or not (client/config.go orders the checks so).
+if ./bin/ngrok -config="$TMPDIR/ngrok-wild-cli.yml" -authtoken=alpha \
+     -proto=tcp -hostname='*.localhost' 19007 >"$TMPDIR/wild-tcp-refused.out" 2>&1; then
+  echo "[e2e] the client started a tcp tunnel carrying a wildcard hostname:"
+  cat "$TMPDIR/wild-tcp-refused.out"
+  exit 1
+fi
+if ! grep -qF "hostname/subdomain are only valid for http/https protocols" "$TMPDIR/wild-tcp-refused.out"; then
+  echo "[e2e] the tcp wildcard refusal does not name the port-routed rule:"
+  cat "$TMPDIR/wild-tcp-refused.out" || true
+  exit 1
+fi
+
+# wild 6: the zero-knowledge composition. Agent-terminated TLS is unchanged
+# by the wildcard: the server routes the ClientHello's SNI through the same
+# one matcher and relays the connection as raw TLS bytes, and the AGENT mints
+# a leaf for the exact name the visitor asked for -- which with a wildcard is
+# a different name per visitor, so two names must produce two minted leaves.
+# The CA is the tls group's zk-ca (reuse deliberate, as in the quic group:
+# one CA, one place to look). The visitor name is chosen to never ride the
+# plaintext http leg (wild 1-3 use other names), which is what makes the
+# whole-log leak grep below meaningful.
+echo "[e2e] wild 6: agent-terminated wildcard -- a leaf minted per visitor name"
+./bin/ngrok -config="$TMPDIR/ngrok-wild-cli.yml" -log=/tmp/ngrok-e2e-wild-zk-client.log \
+  -authtoken=alpha -proto=https -hostname='*.localhost' \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  19007 >/tmp/ngrok-e2e-wild-zk-stdout.log 2>&1 &
+WILD_ZK_PID=$!
+wait_for_tunnel /tmp/ngrok-e2e-wild-zk-client.log "wild zk (agent-terminated wildcard)"
+
+# wait_for_wild_tls <name>: the 18445 twin of wait_for_public_tls (whose port
+# is hardcoded to the tls group's 18443) -- same --resolve-sends-SNI and
+# bare-Host reasoning, same "404 or 000 means not serving yet".
+wait_for_wild_tls() {
+  local host="$1"
+  local code
+  for i in {1..40}; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$TMPDIR/zk-ca.crt" --resolve "$host:18445:127.0.0.1" -H "Host: $host" "https://$host:18445/" || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  echo "[e2e] the wildcard https listener never learned the name $host"
+  return 1
+}
+
+wait_for_wild_tls wildsecret.localhost
+WILD_ZK1="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve 'wildsecret.localhost:18445:127.0.0.1' \
+  -H 'Host: wildsecret.localhost' https://wildsecret.localhost:18445/)"
+if [[ "$WILD_ZK1" != "wildstar" ]]; then
+  echo "[e2e] the agent-terminated wildcard did not serve its upstream: \"$WILD_ZK1\""
+  exit 1
+fi
+WILD_ZK2="$(curl -fsS --cacert "$TMPDIR/zk-ca.crt" --resolve 'wildguest.localhost:18445:127.0.0.1' \
+  -H 'Host: wildguest.localhost' https://wildguest.localhost:18445/)"
+if [[ "$WILD_ZK2" != "wildstar" ]]; then
+  echo "[e2e] a second visitor name did not reach the agent-terminated wildcard: \"$WILD_ZK2\""
+  exit 1
+fi
+
+# The composition's visible trace on the agent: one leaf PER VISITOR NAME,
+# minted from the CA -- two names, two Minted lines.
+if ! grep -q 'Minted a .* leaf for "wildsecret.localhost"' /tmp/ngrok-e2e-wild-zk-client.log; then
+  echo "[e2e] the agent did not mint a leaf for the first visitor's exact name:"
+  tail -n 20 /tmp/ngrok-e2e-wild-zk-client.log || true
+  exit 1
+fi
+if ! grep -q 'Minted a .* leaf for "wildguest.localhost"' /tmp/ngrok-e2e-wild-zk-client.log; then
+  echo "[e2e] the agent did not mint a leaf for the second visitor's exact name:"
+  tail -n 20 /tmp/ngrok-e2e-wild-zk-client.log || true
+  exit 1
+fi
+
+# The routing half, on the server: the SNI found the wildcard bucket and the
+# connection went through un-inspected.
+if ! grep -q 'SNI "wildsecret.localhost" routes to agent-terminated endpoint' /tmp/ngrok-e2e-wild-ngrokd.log; then
+  echo "[e2e] the agent-terminated wildcard request did not take the SNI route:"
+  grep "wildsecret" /tmp/ngrok-e2e-wild-ngrokd.log | tail -n 5 || true
+  exit 1
+fi
+
+# Zero-knowledge negative, scoped the way tls 2 scopes it. This name has
+# never been asked for over plaintext http on this server, so ANY
+# "Found hostname" line for it means the server parsed a request head that
+# belonged behind the agent's TLS. BEFORE the 421 pin below, deliberately:
+# the 421 connection is a terminated one whose head the server legitimately
+# reads, and it would plant exactly this line.
+if grep -q "Found hostname wildsecret.localhost in request" /tmp/ngrok-e2e-wild-ngrokd.log; then
+  echo "[e2e] ZERO-KNOWLEDGE LEAK: the server parsed a plaintext request head for the wildcard zk name"
+  grep "Found hostname wildsecret.localhost" /tmp/ngrok-e2e-wild-ngrokd.log || true
+  exit 1
+fi
+WILD_ZK_CONN="$(grep 'SNI "wildsecret.localhost" routes to agent-terminated endpoint' /tmp/ngrok-e2e-wild-ngrokd.log | grep -o 'pub:[0-9a-f]*' | head -n 1)"
+if [[ -z "$WILD_ZK_CONN" ]]; then
+  echo "[e2e] could not read the wildcard passthrough connection id from the server log"
+  exit 1
+fi
+if grep -q "\[$WILD_ZK_CONN\] Found hostname" /tmp/ngrok-e2e-wild-ngrokd.log || \
+   grep -q "\[$WILD_ZK_CONN\] Failed to read valid" /tmp/ngrok-e2e-wild-ngrokd.log; then
+  echo "[e2e] ZERO-KNOWLEDGE LEAK: connection $WILD_ZK_CONN had its payload parsed as plaintext:"
+  grep "\[$WILD_ZK_CONN\]" /tmp/ngrok-e2e-wild-ngrokd.log || true
+  exit 1
+fi
+
+# The 421 path, unchanged for wildcards: a client that names NO SNI leaves
+# the server nothing to route on, so it terminates with its own certificate
+# and reads the request head -- where Host: <the wildcard zk name> names an
+# agent-terminated endpoint from an already-terminated connection. A
+# wildcard hit on the Host path must 421 exactly as an exact hit does.
+echo "[e2e] wild 6: a no-SNI client asking for the wildcard zk host gets 421"
+printf 'GET / HTTP/1.1\r\nHost: wildsecret.localhost\r\nConnection: close\r\n\r\n' \
+  | openssl s_client -connect 127.0.0.1:18445 $SNI_FLAG -quiet 2>/dev/null >"$TMPDIR/wild-sni-absent.out"
+if ! grep -q "HTTP/1.0 421 Misdirected Request" "$TMPDIR/wild-sni-absent.out"; then
+  echo "[e2e] expected a 421 for a no-SNI request naming the wildcard zk host:"
+  cat "$TMPDIR/wild-sni-absent.out"
+  exit 1
+fi
+if ! grep -qF "Host wildsecret.localhost names agent-terminated endpoint" /tmp/ngrok-e2e-wild-ngrokd.log || \
+   ! grep -qF "refusing with 421" /tmp/ngrok-e2e-wild-ngrokd.log; then
+  echo "[e2e] the server answered 421 without logging the misdirected wildcard Host:"
+  grep -i "421" /tmp/ngrok-e2e-wild-ngrokd.log | tail -n 5 || true
+  exit 1
+fi
+
+# wild 7: the behavior change, pinned live. An explicit DEFAULT port in Host
+# used to make the lookup miss -- the port stayed part of the name, so
+# name:80 answered 404 while bare name routed -- and Match now strips the
+# protocol's default port before the exact hit and the wildcard fallback
+# alike. Both roads below must serve; a NON-default port must still miss.
+echo "[e2e] wild 7: an explicit default port in Host now routes (name:80, was a 404 before)"
+WILD_P80="$(curl -fsS -H 'Host: wildone.localhost:80' http://127.0.0.1:18084/)"
+if [[ "$WILD_P80" != "wildstar" ]]; then
+  echo "[e2e] Host with an explicit :80 did not reach the wildcard tunnel: \"$WILD_P80\""
+  exit 1
+fi
+WILD_P80_EXACT="$(curl -fsS -H 'Host: api.localhost:80' http://127.0.0.1:18084/)"
+if [[ "$WILD_P80_EXACT" != "wildexact" ]]; then
+  echo "[e2e] Host with an explicit :80 did not reach the exact tunnel: \"$WILD_P80_EXACT\""
+  exit 1
+fi
+# The discipline behind the change: ONLY the default port is stripped. A
+# non-default port stays part of the name, so name:9999 misses even though
+# name:80 routes. (A miss with an explicit :80 is not pin-able here: any
+# one-label name under a live wildcard routes -- that is the feature.)
+WILD_P80_MISS="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: nosuch.localhost:9999' http://127.0.0.1:18084/)"
+if [[ "$WILD_P80_MISS" != "404" ]]; then
+  echo "[e2e] a non-default port stopped being part of the Host name (got $WILD_P80_MISS, want 404)"
+  exit 1
+fi
+
 echo "[e2e] PASS"

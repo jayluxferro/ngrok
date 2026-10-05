@@ -36,7 +36,7 @@ rounds with no feature spec — their record is the changelog.
 | [08-udp-tunnels.md](08-udp-tunnels.md) | UDP tunnels: flow model, datagram framing, per-protocol port claims | v1.0.10 | shipped |
 | [09-vaults-event-export.md](09-vaults-event-export.md) | Secret vaults (`secret()` at build time), event export destinations with drop accounting | v1.0.11 | shipped |
 | [10-webhook-verification.md](10-webhook-verification.md) | webhook-verification policy action; the rewriter's bounded body buffering with deferred verdict | — | approved, implementation next |
-| [11-wildcard-hostnames.md](11-wildcard-hostnames.md) | `*.<server-domain>` tunnels: one shared matcher, exact-wins routing | — | approved, queued |
+| [11-wildcard-hostnames.md](11-wildcard-hostnames.md) | `*.<server-domain>` tunnels: one shared matcher, exact-wins routing | v1.0.14 | shipped |
 
 ## Not specced here
 

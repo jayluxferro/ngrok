@@ -1,4 +1,81 @@
 # Changelog
+## 1.0.14 - 2026-10-05 - Wildcard hostnames
+
+A tunnel can now claim every name exactly one label under the server's own
+domain: `hostname: "*.example.com"` serves `anything.example.com` -- every
+otherwise-unregistered one-label name -- while exact registrations keep
+winning. The shape is deliberately narrow, because the narrowness is what
+makes it safe to hand out: the base must be the server's own domain, the
+match is one label deep, and the wildcard only ever serves misses.
+
+### Server
+
+**One matcher, both routing sites.** The registry gained `Match(proto,
+host)`: the exact map hit first -- a hit costs what a lookup always cost,
+the wildcard index is never consulted on a hit -- then, on a miss, a single
+lookup of the name's base in a wildcard index (`*.example.com` registers
+under its literal `http://*.example.com` key *and* the index entry
+`http://example.com`). The SNI handler and the Host handler both call it,
+so an https visitor routing by ClientHello and an http visitor routing by
+Host header cannot disagree about who serves a name. Only the protocol's
+default port is stripped from a Host header (`name.example.com:80` routes;
+a non-default port stays part of the name and misses, as it always has),
+and the reserved `.internal` namespace is excluded before the fallback.
+
+**Exact-first is a routing guarantee, not a reservation.** `api.example.com`
+registered by any agent is served by its own tunnel even while
+`*.example.com` is live; the wildcard serves the rest. Exact names under a
+live wildcard remain independently registerable, first-come -- the wildcard
+promise is about routing precedence, never about holding a name.
+
+**Cross-owner wildcards are refused with pooling's wording.** A wildcard
+bucket carries an owner like any bucket: a second wildcard over the same
+base from another token is refused ("already registered by a different
+account; pooling only joins a pool owned by the same account"). A wildcard
+over the same base from the same owner joins as a pooling member and
+round-robins like any pooled endpoint.
+
+**Every refusal names the rule and the accepted shape.** Wildcards bind
+publicly on http and https only; a wildcard whose base is not this server's
+own domain (`-domain`/`$VHOST`) is refused with the wanted base spelled out.
+
+**Agent-terminated wildcards work unchanged.** The agent mints a leaf per
+visitor name: a ClientHello for `anything.example.com` routes by SNI and
+passes through as raw TLS bytes, answered with a leaf naming exactly the
+name the visitor asked for. Edge-terminated wildcards keep the single
+server certificate, exactly like every hostname tunnel today.
+
+**Behavior change: an explicit default port in Host now routes.** A request
+with `Host: name.example.com:80` used to 404 -- the port stayed part of the
+name, so it missed the exact key while the bare name routed. Match now
+strips the protocol's default port before looking, so `name:80` serves the
+tunnel `name` serves. Called out as the change it is: a client that relied
+on the old 404 will now be served.
+
+### Client
+
+`hostname: "*.example.com"` is accepted wherever a hostname is -- config
+file and CLI flags alike -- and the derived public url keeps the literal
+star. The client refuses at load, naming the accepted shape: every
+wildcard-bearing spelling that is not a wildcard (`a.*.b`, `*`, `*.`), a
+`*` in `subdomain` (write the wildcard in `hostname`), and a wildcard on
+`binding: internal` or on a tcp/udp tunnel (the port-routed rule fires
+first, in its words). The grammar is the mirror of the server's; the one
+check the client deliberately does not restate is the own-domain rule,
+because it cannot know the server's domain -- that refusal is the server's,
+with the base it wanted named.
+
+### Known limitations
+
+- The base must be the server's own domain. Wildcards over arbitrary
+  domains need an ownership model this fork does not have yet.
+- One label only: `*.example.com` matches `api.example.com`, never
+  `a.b.example.com` and never `example.com` itself.
+- A wildcard is not a reservation: only names nobody exactly registered are
+  served, and any exact name under it stays registerable while it lives.
+- The `subdomain` field cannot carry the star, and `GetInternal` and
+  `.internal` lookups never match a wildcard.
+
 ## 1.0.13 - 2026-10-04 - Toolchain bump and cel-go module migration
 
 The deliberate dependency migration the 1.21 pin was holding back. The go

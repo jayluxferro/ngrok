@@ -1,25 +1,27 @@
 # ngrok - Self-Hosted Secure Tunnels to Localhost
 
-ngrok is a self-hosted tool that creates secure tunnels to localhost, allowing you to expose local servers to the internet. This is a modernized fork of the original ngrok v1 codebase, updated to work with current Go versions (1.21+).
-
-**This project is designed for self-hosting** - you run both the client and server yourself, giving you complete control over your tunnels and data.
+ngrok is a self-hosted tool that creates secure tunnels to localhost: you run both the server (ngrokd) and the client yourself, with complete control over your tunnels and your data. It is an independent, actively developed fork of the original ngrok v1 codebase (see [Acknowledgments](#acknowledgments)) — a decade of porting work plus traffic policies, zero-knowledge TLS, UDP tunnels, a QUIC transport, secret vaults and event export that the original never had.
 
 ## Features
 
-- **HTTP/HTTPS Tunneling**: Expose local web servers to the internet
-- **TCP Tunneling**: Tunnel arbitrary TCP traffic, with fixed, owned remote ports (`-remote-port`)
-- **UDP Tunneling**: Expose local UDP services (DNS resolvers, game servers, IoT devices) on a public UDP port, datagram-preserving, with the same fixed, owned remote ports
-- **Zero-Knowledge TLS**: Terminate https TLS in the agent — the server routes by SNI and never sees plaintext or your certificates
-- **Web Interface**: Inspect HTTP requests and responses in real-time
-- **Terminal UI**: Beautiful terminal interface for monitoring tunnels
-- **Self-Hosted**: Run your own ngrok server for complete control
+- **HTTP/HTTPS tunneling** — expose local web servers, with header control (host rewrite, add/remove, X-Forwarded-*)
+- **Wildcard hostnames** — `hostname: "*.example.com"` serves every otherwise-unregistered name one label under the server's own domain; exact registrations always win
+- **TCP tunneling** — arbitrary TCP, with fixed, owned remote ports (`-remote-port`)
+- **UDP tunneling** — datagram-preserving public UDP (DNS, game servers, IoT devices), per-flow admission, same owned ports
+- **Zero-knowledge TLS** — terminate https in the agent; the server routes by SNI and never sees plaintext or your certificates
+- **Traffic policy engine** — CEL-expressed rules per tunnel: deny, custom responses, header actions, IP restrictions, and request authentication (basic-auth, bearer, API key, JWT via JWKS)
+- **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported
+- **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting
+- **QUIC agent transport** — the agent↔server multiplexed connection rides QUIC when enabled (no TCP head-of-line blocking across streams), with automatic smux fallback
+- **Endpoint pooling & compression** — share one public endpoint across agents; gzip response compression
+- **Web inspector & terminal UI** — inspect HTTP traffic in real time
 
 ## Quick Start
 
 ### Building from Source
 
 **Requirements:**
-- Go 1.21 or later
+- Go 1.23 or later (the go.mod directive is the authority)
 - Make (optional, for using the Makefile)
 
 **Build the client and server:**
@@ -88,22 +90,23 @@ You can run your own ngrok server for complete control over your tunnels. See [d
 
 ```
 ngrok/
-├── client/          # Client code
-│   ├── assets/      # Generated asset files
+├── client/          # Agent: model, config, CLI, agent-TLS termination
 │   ├── mvc/         # MVC framework
 │   └── views/       # UI views (terminal & web)
-├── server/          # Server code
-│   └── assets/      # Generated asset files
-├── conn/            # Connection handling
-├── log/             # Logging utilities
-├── msg/             # Protocol messages
-├── proto/           # Protocol implementations (HTTP, TCP, UDP)
-├── util/            # Utility functions
-├── main/            # Entry points
-│   ├── ngrok/       # Client main
-│   └── ngrokd/      # Server main
+├── server/          # ngrokd: listeners, registry, policy enforcement,
+│   │                #   UDP flows, event export, admin API
+├── policy/          # Traffic-policy engine: CEL envs, actions, vaults, JWKS
+├── rewriter/        # Streaming header rewriter (the data-path brain)
+├── conn/            # Connection plumbing, zero-copy, pooling
+├── msg/             # Wire messages + redaction
+├── proto/           # Protocol identities (HTTP, TCP, UDP) + datagram framing
+├── log/             # Logging
+├── util/            # Utilities
+├── main/            # Entry points (ngrok client, ngrokd server)
 └── assets/          # Static assets (HTML, CSS, JS, TLS certs)
 ```
+
+Design documents for every feature live in [docs/specs/](docs/specs/README.md).
 
 ### Development Workflow
 
@@ -185,6 +188,28 @@ tunnels:
       tcp: 3306
 ```
 
+**Wildcard hostnames.** A tunnel whose `hostname` is `*.<your server's
+domain>` serves every otherwise-unregistered name exactly one label under
+that domain, and coexists with exact tunnels — the exact registration
+always wins, the wildcard serves the rest:
+
+```yaml
+tunnels:
+  api:
+    hostname: api.example.com   # exact: always wins over the wildcard
+    proto:
+      http: 3000
+  catchall:
+    hostname: "*.example.com"   # one label deep: anything.example.com,
+    proto:                      # never a.b.example.com, never example.com
+      http: 8080
+```
+
+The base must be the server's own domain (`-domain`/`$VHOST`), and the
+binding is http/https only. An exact name under a live wildcard stays
+independently registerable, and a second auth token's wildcard over the
+same base is refused (pooling's same-owner rule).
+
 **Zero-knowledge TLS (agent-side termination).** With `agent_tls_termination`
 the server routes an https connection by the hostname in the visitor's TLS
 ClientHello (SNI) and relays the bytes unread: it never terminates the TLS,
@@ -224,6 +249,35 @@ before it registers. Two limits to know: visitors must send SNI (a request
 with no hostname answers `421 Misdirected Request`), and `on_http_request` /
 `on_http_response` traffic policies for such tunnels run in the agent rather
 than on the server — the server has only ciphertext.
+
+**Traffic policies.** Each tunnel can carry a policy — CEL-expressed rules
+evaluated per request, response, and TCP connection. The server enforces them
+for edge-terminated tunnels; agent-terminated ones enforce the HTTP phases in
+the agent (the server holds only ciphertext). Request rules can deny, answer
+with a custom response, rewrite headers, or restrict source IPs:
+
+```yaml
+tunnels:
+  guarded:
+    hostname: app.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_tcp_connect:
+        - name: restrict-ips
+          config:
+            cidrs: ["203.0.113.0/24"]     # everyone else: connection refused
+      on_http_request:
+        - name: deny
+          expressions: ['req.url.path.startsWith("/admin")']
+          config:
+            status_code: 403
+```
+
+The full action set (header actions, `custom-response`, `log`, `set-vars`, the
+authentication actions below) with exact config shapes is in the
+[changelog](docs/CHANGELOG.md); policies can also live in their own file via
+`traffic_policy_file:`.
 
 **Traffic-policy authentication.** An `on_http_request` policy can require a
 credential before a request is forwarded at all — the edge answers `401`
@@ -564,15 +618,17 @@ Generate tuning suggestions from production observations:
 ```
 Optionally set `NGROK_ADMIN_TOKEN` for authenticated admin APIs.
 
-## Modernization
+## Benchmarks
 
-This fork has been updated to work with modern Go versions:
-
-- ✅ Updated to Go 1.21+
-- ✅ Migrated to Go modules
-- ✅ Fixed deprecated APIs (`rand.Seed`, `ioutil` functions)
-- ✅ Updated project structure for Go modules
-- ✅ Modernized build system
+`scripts/bench.sh` measures bulk throughput, connection rate, keep-alive rate
+and TLS connection rate through a real tunnel stack, on both carrier legs
+(smux and QUIC) — `BENCH_SCENARIOS="bulk conn-rate keep-alive"` runs a focused
+subset. Two standing caveats the report carries in its own table: loopback has
+no packet loss, so QUIC's head-of-line-blocking win cannot show there (the
+numbers establish parity, not superiority), and on macOS the QUIC bulk rate
+measures well behind smux because quic-go batches UDP syscalls
+(`recvmmsg`/GSO) on Linux only. Run it on your target hardware before quoting
+numbers.
 
 ## License
 
@@ -590,4 +646,4 @@ For release notes/changelog entries, use [docs/CHANGELOG_TEMPLATE.md](docs/CHANG
 
 ## Acknowledgments
 
-This is a modernized fork of the original ngrok v1 codebase developed by [inconshreveable](https://github.com/inconshreveable). The original codebase was actively developed from 2013-2016.
+This fork stands on the original ngrok v1 codebase by [inconshreveable](https://github.com/inconshreveable), actively developed 2013-2016. The port to modern Go and modules, and every feature above, is this project's own work; the design record for each is in [docs/specs/](docs/specs/README.md) and the release history in the [changelog](docs/CHANGELOG.md).

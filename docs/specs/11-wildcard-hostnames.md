@@ -1,6 +1,6 @@
 # Spec 11 — Wildcard hostnames
 
-Status: approved (user: parity items). Recon complete. v1 follows the recon's
+Status: shipped (see the changelog entry for its release; this document is the design record) (user: parity items). Recon complete. v1 follows the recon's
 smallest-safe shape exactly; the bigger ownership questions are non-goals.
 
 ## 1. Objectives

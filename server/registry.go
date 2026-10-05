@@ -7,6 +7,8 @@ import (
 	"net"
 	"ngrok/cache"
 	"ngrok/log"
+	"ngrok/msg"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +98,52 @@ func registryKey(url string, t *Tunnel) string {
 	return url
 }
 
+// wildcardBase is the base of a well-formed wildcard hostname -- "*.base" --
+// and whether the hostname has that shape at all (SPEC 11): exactly one
+// leading "*." label, no "*" anywhere else, a non-empty base. It is the one
+// spelling of the registration grammar validateRequest enforces and the shape
+// wildcardIndexKey keys the index on, so the name the validator accepted and
+// the name the index is keyed by cannot drift apart.
+func wildcardBase(hostname string) (base string, ok bool) {
+	if !strings.HasPrefix(hostname, "*.") {
+		return "", false
+	}
+	base = hostname[len("*."):]
+	if base == "" || strings.IndexByte(base, '*') >= 0 {
+		return "", false
+	}
+	return base, true
+}
+
+// wildcardIndexKey is the key under which a wildcard registration joins the
+// registry's wildcard index, and whether the registry key is a wildcard
+// registration at all: the key "proto://*.base" contributes "proto://base" --
+// exactly the string a one-label-deep match reduces a covered host to, which
+// is what lets Match consult the index with a single lookup.
+//
+// The grammar itself is validated upstream (validateRequest), so this trusts
+// but verifies: a malformed key (a mid-name star, the bare "*.") simply does
+// not index rather than indexing something Match could not mean. The
+// .internal exclusion is unreachable from the public path (validateRequest
+// refuses both a wildcard internal binding and a .internal public hostname)
+// but is repeated here so the index cannot outlive that rule: an internal
+// name must never become wildcard-reachable through whatever registered a
+// bucket behind this function's back.
+func wildcardIndexKey(key string) (string, bool) {
+	proto, host, ok := strings.Cut(key, "://")
+	if !ok || strings.IndexByte(host, '\x00') >= 0 {
+		// the NUL check keeps an owner-namespaced internal key (url + "\x00" +
+		// owner) from ever decomposing into something that parses as a
+		// wildcard: internal keys must stay exact, always
+		return "", false
+	}
+	base, ok := wildcardBase(strings.ToLower(host))
+	if !ok || strings.HasSuffix(base, msg.InternalSuffix) {
+		return "", false
+	}
+	return proto + "://" + base, true
+}
+
 // canonicalForwardURL normalizes a forward_to target so that chain
 // bookkeeping and internal key lookup agree on spelling differences that
 // would otherwise let a loop escape detection: case, surrounding whitespace,
@@ -106,7 +154,17 @@ func canonicalForwardURL(url string) string {
 
 // TunnelRegistry maps a tunnel URL to Tunnel structures
 type TunnelRegistry struct {
-	tunnels  map[string]*bucket
+	tunnels map[string]*bucket
+
+	// wildcards is the wildcard index (SPEC 11): every registered
+	// "proto://*.base" bucket, keyed by "proto://base". It is a second view
+	// of buckets that also live in tunnels under their literal "*.base" key,
+	// consulted only on an exact miss in Match -- never on a hit, so the
+	// exact-hit path stays one map lookup. Entries are created in Register,
+	// removed wherever the bucket itself is removed (Del, DelBucket, Remove),
+	// and guarded by the same lock as tunnels.
+	wildcards map[string]*bucket
+
 	affinity *cache.LRUCache
 	log.Logger
 	sync.RWMutex
@@ -114,9 +172,10 @@ type TunnelRegistry struct {
 
 func NewTunnelRegistry(cacheSize uint64, cacheFile string) *TunnelRegistry {
 	registry := &TunnelRegistry{
-		tunnels:  make(map[string]*bucket),
-		affinity: cache.NewLRUCache(cacheSize),
-		Logger:   log.NewPrefixLogger("registry", "tun"),
+		tunnels:   make(map[string]*bucket),
+		wildcards: make(map[string]*bucket),
+		affinity:  cache.NewLRUCache(cacheSize),
+		Logger:    log.NewPrefixLogger("registry", "tun"),
 	}
 
 	// LRUCache uses Gob encoding. Unfortunately, Gob is fickle and will fail
@@ -199,9 +258,24 @@ func (r *TunnelRegistry) Register(url string, t *Tunnel) error {
 		return nil
 	}
 
-	r.tunnels[key] = &bucket{
+	b := &bucket{
 		tunnels: []*Tunnel{t},
 		owner:   t.owner,
+	}
+	r.tunnels[key] = b
+
+	// A wildcard registration joins the wildcard index alongside its literal
+	// "*.base" key (SPEC 11), so Match can find it on an exact miss. Internal
+	// endpoints never index: their owner-namespaced keys must stay exact and
+	// invisible to the public path. A pooling join never reaches this point
+	// (it takes the bucket-append branch above, and the index entry already
+	// points at the same bucket), so the index holds exactly one entry per
+	// live wildcard bucket for as long as the bucket exists -- and drops it
+	// when the bucket goes, in Del/DelBucket/Remove.
+	if !t.internal() {
+		if idx, ok := wildcardIndexKey(key); ok {
+			r.wildcards[idx] = b
+		}
 	}
 
 	return nil
@@ -272,6 +346,11 @@ func (r *TunnelRegistry) Del(url string) {
 	r.Lock()
 	defer r.Unlock()
 	delete(r.tunnels, url)
+	// the bucket is gone; its wildcard view of it must go with it, or Match
+	// would keep routing misses to a tunnel the registry no longer holds
+	if idx, ok := wildcardIndexKey(url); ok {
+		delete(r.wildcards, idx)
+	}
 }
 
 // DelBucket removes the whole bucket at url and returns the tunnels it held,
@@ -289,6 +368,11 @@ func (r *TunnelRegistry) DelBucket(url string) []*Tunnel {
 		return nil
 	}
 	delete(r.tunnels, url)
+	// same as Del: the cascade takes the bucket down, so the index entry that
+	// made its wildcard reachable on a miss goes down with it
+	if idx, ok := wildcardIndexKey(url); ok {
+		delete(r.wildcards, idx)
+	}
 
 	// the caller shuts the members down, so it gets its own slice: it must not
 	// be holding a view into the bucket while doing so.
@@ -317,6 +401,12 @@ func (r *TunnelRegistry) Remove(url string, t *Tunnel) {
 
 	if len(b.tunnels) == 0 {
 		delete(r.tunnels, key)
+		// the last member is out and the bucket with it: drop the wildcard
+		// view too, so the name stops routing on a miss (SPEC 11 teardown).
+		// A member leaving a bucket that survives keeps the index untouched.
+		if idx, ok := wildcardIndexKey(key); ok {
+			delete(r.wildcards, idx)
+		}
 	}
 }
 
@@ -330,6 +420,65 @@ func (r *TunnelRegistry) Get(url string) *Tunnel {
 	defer r.RUnlock()
 
 	b := r.tunnels[url]
+	if b == nil {
+		return nil
+	}
+	return b.get()
+}
+
+// Match resolves a public host for the two public routing sites -- the SNI
+// lookup and the Host lookup (server/http.go), which share this one matcher
+// so they can never disagree (SPEC 11): the exact url when one is registered,
+// otherwise the one-label wildcard covering it, round-robin over the bucket's
+// members exactly as Get would serve the bucket's own url.
+//
+// The order is the contract: the exact map hit returns without touching the
+// wildcard index, so a hit costs what Get always cost plus one port-suffix
+// comparison, and the wildcard scan is a miss-path tax by construction. The
+// scan itself is one map lookup, not a walk: one-label-deep means a host has
+// exactly one candidate base (the host minus its first label), so "longest
+// base wins" over nested wildcards needs no loop -- walking every suffix
+// instead would implement the deeper matching the spec refuses (*.b must not
+// catch a.b.c when *.a.b is live, or at all).
+//
+// host must be lower-cased -- both routing sites lower-case before calling
+// (hostFromHead, the SNI handler), the same discipline Get's callers keep --
+// and may carry a port: only the protocol's defaultPortMap port is stripped,
+// because that is the port the vhost derivation canonicalizes away at
+// registration; any other port stays part of the name and misses, exactly as
+// it always has.
+//
+// A host under the reserved .internal namespace never takes the wildcard
+// fallback: a wildcard over an internal base cannot be indexed, and the
+// exclusion is pinned here rather than left to that, because the public
+// registry key and the owner-namespaced internal key live in one map and
+// gate 4 of the spec is that .internal NEVER matches a wildcard.
+func (r *TunnelRegistry) Match(proto, host string) *Tunnel {
+	if port, ok := defaultPortMap[proto]; ok {
+		// TrimSuffix is a no-op comparison on the common (no-port) spelling;
+		// building the ":port" needle costs one small allocation that a
+		// request has long since amortized by the time it reaches routing.
+		host = strings.TrimSuffix(host, ":"+strconv.Itoa(port))
+	}
+
+	r.RLock()
+	defer r.RUnlock()
+
+	// exact first: the hit path is one map lookup, wildcard-free
+	if b := r.tunnels[proto+"://"+host]; b != nil {
+		return b.get()
+	}
+
+	if strings.HasSuffix(host, msg.InternalSuffix) {
+		return nil
+	}
+	dot := strings.IndexByte(host, '.')
+	if dot <= 0 {
+		// a single label has no base to sit under, and a leading dot is not
+		// a label either
+		return nil
+	}
+	b := r.wildcards[proto+"://"+host[dot+1:]]
 	if b == nil {
 		return nil
 	}

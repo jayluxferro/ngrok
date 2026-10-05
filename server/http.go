@@ -285,7 +285,11 @@ func httpsConnHandler(c conn.Conn, tlsCfg *tls.Config) {
 		host := strings.ToLower(sni)
 		c.Debug("Found SNI %q in ClientHello", host)
 
-		tunnel := tunnelRegistry.Get(fmt.Sprintf("%s://%s", msg.ProtoHTTPS, host))
+		// The one public matcher, shared with the Host lookup below (SPEC 11):
+		// an exact name resolves as it always did; a miss falls to the
+		// one-label wildcard covering the name, so a wildcard-registered
+		// endpoint routes by SNI exactly as it routes by Host.
+		tunnel := tunnelRegistry.Match(msg.ProtoHTTPS, host)
 		switch {
 		case tunnel == nil:
 			c.Info("No tunnel found for SNI %q; terminating with the server certificate", host)
@@ -630,7 +634,14 @@ func routeHTTP(c conn.Conn, proto string) {
 
 	// multiplex to find the right backend host
 	c.Debug("Found hostname %s in request", host)
-	tunnel := tunnelRegistry.Get(fmt.Sprintf("%s://%s", proto, host))
+	// The one public matcher, shared with the SNI lookup above (SPEC 11):
+	// exact url first, then the one-label wildcard on a miss. The port a Host
+	// may carry is Match's concern (only the protocol's default port is
+	// stripped), not this site's. GetInternal and the listener self-lookups
+	// stay exact by design; this is the only wildcard-reachable lookup on the
+	// Host path, so a name under no wildcard and no exact registration still
+	// misses and 404s below, unchanged.
+	tunnel := tunnelRegistry.Match(proto, host)
 	if tunnel == nil {
 		if strings.HasSuffix(host, msg.InternalSuffix) {
 			// Internal endpoints live under an owner-namespaced key, so a
