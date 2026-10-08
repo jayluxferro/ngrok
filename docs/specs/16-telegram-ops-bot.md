@@ -354,3 +354,23 @@ lane touches `server/`, `client/`, `msg/`, `policy/`, `rewriter/`,
 ## Release
 
 v1.0.20.
+
+## Amendments
+
+### Post-ship: the release shape as built (v1.0.20)
+
+§7's "Asset count stays 176" was written against the design intent —
+bot inside the existing archives only — and the implementation
+diverged, defensibly: the release workflow additionally uploads one
+standalone raw `ngrok-bot-<os>-<arch>` binary per platform (22 new
+assets; the release publishes 198). The bot's operator deploys it
+beside ngrokd and has no need for the tunnel client's archive, and the
+raw-binary-without-per-file-checksum treatment matches what the
+existing raw `ngrok-<platform>` assets already do (the checksummed
+artifacts are the archives, which also carry the bot). The changelog
+entry was corrected in place to state both facts. The review lesson
+recorded with it: a claim about the *published output* ("asset count
+is unchanged") written by the same change that alters the output is a
+claim the architect verifies against the output, not against the diff —
+the workflow glob and the changelog paragraph each looked correct alone
+and contradicted each other in the world.

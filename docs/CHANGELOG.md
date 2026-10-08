@@ -83,8 +83,13 @@ to `***`.
   Env fallback is the honest 80% here.
 - The release archives grow one file each — `ngrok-bot` now rides inside
   the existing per-platform tarballs and zips beside `ngrok` and
-  `ngrokd`. No new archive, no new asset class: the asset count is
-  unchanged.
+  `ngrokd`. It also ships as a standalone raw binary per platform
+  (22 `ngrok-bot-<os>-<arch>` assets; the release is 198 assets, up
+  from 176), because the bot's operator deploys it beside ngrokd and
+  should not have to fetch a full tunnel-client archive for an 8.8 MB
+  companion. The raws follow the existing convention for raw binaries —
+  no per-file checksum; the archives that also carry the bot remain the
+  checksummed artifact.
 
 ### Also in this release
 
