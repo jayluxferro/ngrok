@@ -274,6 +274,16 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		config.HttpProxy = os.Getenv("http_proxy")
 	}
 
+	// -proxy-transport (SPEC-CLUSTER7 5) rides the same pattern: the flag's
+	// empty default leaves the config file's value standing, an explicit
+	// value overrides it, and the proxy_transport switch inside the
+	// extracted body then validates whichever won -- a flag typo is the same
+	// startup error as a file typo, and the workbench road (which has no
+	// flags) checks the key with the same switch (SPEC-CLUSTER19 5).
+	if opts.proxyTransport != "" {
+		config.ProxyTransport = opts.proxyTransport
+	}
+
 	if err = config.applyDefaultsAndValidate(true, true); err != nil {
 		return
 	}
@@ -283,30 +293,6 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	config.Path = configPath
 	if opts.authtoken != "" {
 		config.AuthToken = opts.authtoken
-	}
-
-	// -proxy-transport (SPEC-CLUSTER7 5), like -authtoken, is a client-level
-	// setting rather than a per-tunnel one. The flag's empty default leaves
-	// the config file's value standing; an explicit value overrides it. The
-	// switch below validates whichever won, so a typo is the same startup
-	// error by either road.
-	if opts.proxyTransport != "" {
-		config.ProxyTransport = opts.proxyTransport
-	}
-
-	// Validate proxy_transport now, after the flag had its say and before
-	// anything dials. Case and surrounding space are normalized first, the
-	// way binding is: "QUIC" means "quic", not a startup error about a value
-	// the operator clearly meant.
-	config.ProxyTransport = strings.ToLower(strings.TrimSpace(config.ProxyTransport))
-	switch config.ProxyTransport {
-	case "":
-		config.ProxyTransport = ProxyTransportAuto
-	case ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP:
-	default:
-		err = fmt.Errorf("proxy_transport must be one of '%s', '%s' or '%s', got '%s' (in the config file or via -proxy-transport)",
-			ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP, config.ProxyTransport)
-		return
 	}
 
 	// -remote-port is a uint64 flag feeding a uint16 wire field: reject an
@@ -654,6 +640,26 @@ func (config *Configuration) applyDefaultsAndValidate(loadVaults, loadFileRefs b
 				t.Subdomain = name
 			}
 		}
+	}
+
+	// proxy_transport, validated last -- the position it has always held
+	// relative to the rest of the traversal (the loader ran this switch in
+	// its opts merge, after this whole body; a doc with a bad tunnel AND a
+	// bad carrier word has always heard about the tunnel first, and the
+	// parity corpus pins that it still does). It lives inside the extracted
+	// body so the workbench road refuses a bogus carrier word with the same
+	// error instead of waving it through (SPEC-CLUSTER19 5). Case and
+	// surrounding space are normalized first, the way binding is: "QUIC"
+	// means "quic", not a startup error about a value the operator clearly
+	// meant.
+	config.ProxyTransport = strings.ToLower(strings.TrimSpace(config.ProxyTransport))
+	switch config.ProxyTransport {
+	case "":
+		config.ProxyTransport = ProxyTransportAuto
+	case ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP:
+	default:
+		return fmt.Errorf("proxy_transport must be one of '%s', '%s' or '%s', got '%s' (in the config file or via -proxy-transport)",
+			ProxyTransportAuto, ProxyTransportQuic, ProxyTransportTCP, config.ProxyTransport)
 	}
 
 	return nil

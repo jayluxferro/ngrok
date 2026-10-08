@@ -311,3 +311,34 @@ first). D lands last. No workstream touches `msg/`.
 ## Release
 
 v1.0.19.
+
+## Amendments (post-ship findings)
+
+1. **§5's "a token-only doc is valid" was wrong about the code it
+   described.** The legacy single-token branch sits behind the YAML parse
+   in `LoadConfiguration`, and `yaml.v3` refuses a scalar into the
+   `Configuration` struct — so a bare token has been a parse error on the
+   loader road since the parser swap; the legacy branch is unreachable.
+   `ValidateConfigurationDoc` mirrors the loader (same refusal, same
+   message) rather than becoming the one road that accepts a document the
+   agent rejects. Pinned client-side (`TestValidateConfigurationDocLegacyToken`)
+   and server-side (validate/config on a token-only body answers
+   `{"valid": false}` with the yaml complaint). Found by workstream B at
+   implementation; recorded here because the spec text, not the code, was
+   the error.
+2. **`proxy_transport` joined the extraction in v1.0.20.** At ship time
+   the enum check was opts-entangled in `LoadConfiguration`'s flag merge
+   and therefore absent from `ValidateConfigurationDoc` — a workbench
+   document with `proxy_transport: grpc` validated as good, the one
+   divergence-from-the-loader the workbench could produce. v1.0.20 moves
+   the flag override before the extracted call (the `http_proxy` env
+   pattern) and the switch to the end of `applyDefaultsAndValidate` —
+   last, preserving the loader's error precedence (a bad tunnel has
+   always outranked a bad carrier word) — with two corpus additions
+   pinning both the refusal and the ordering.
+3. **`/static/*` rides the API budget, not the pages budget** (§1's
+   "behind the existing admin auth" resolves to `secureAPI`): the SPA's
+   three files require credentials and spend the 5× `/api/*` limiter,
+   three requests per page load. Coherent — the browser replays
+   credentials — but worth stating, since a bare `curl /static/app.js`
+   answering 401 is by design.

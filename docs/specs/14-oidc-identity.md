@@ -34,6 +34,22 @@ per-request hook machinery the stateless actions share.
   fork's security identity is the opposite trade. Revival bar: a written
   request from a deployment whose IdP cannot front OIDC, plus a library
   choice with its own audit — its own spec cluster, never bundled here.
+  **[Cluster 22 audit, 2026-10-27: the bar was evaluated and cannot
+  currently be met.** `crewjam/saml` is unmaintained (last release
+  Nov 2024) and its last release pins `goxmldsig` v1.4.0 — inside
+  CVE-2026-33487's affected range (a loop-variable-capture signature
+  bypass; the XSW class again). `gosaml2` is active but every fixed
+  version declares go 1.25, which this repo's deliberate 1.23 pin cannot
+  take. Across the three credible libraries: 14 advisories since 2020 —
+  6 signature-validation bypasses, 5 DoS/panic, 2 full auth bypasses —
+  with XML semantics, not crypto, as the root cause. **Verdict: do not
+  build native SAML.** When a deployment with a SAML-only IdP actually
+  appears, the documented answer is a bridge: a Keycloak sidecar brokering
+  SAML→OIDC (first-class feature, real security response behind it —
+  unlike Dex, whose own docs warn its SAML connector is "likely
+  vulnerable to authentication bypass" with deprecation under
+  consideration). The bridge keeps the fork OIDC-only, with zero new
+  modules in the tunnel server's process.]**
 - **No generic OAuth2** (GitHub is not OIDC — it needs nonstandard
   `/user/emails`; that is the 67-provider long tail, a future preset
   cluster if ever).

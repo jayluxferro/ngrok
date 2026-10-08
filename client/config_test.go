@@ -1822,7 +1822,7 @@ func TestLoadConfigurationUpstreamProtocolValidation(t *testing.T) {
 			),
 		},
 		{
-			name: "compression left on composes (contrast with the alpn h2 rules)",
+			name:   "compression left on composes (contrast with the alpn h2 rules)",
 			config: upstreamTunnelYAML("    compression: true"),
 		},
 		{
@@ -2047,9 +2047,9 @@ func TestDefaultTunnelUpstreamProtocolSynthesis(t *testing.T) {
 	// Without the flag, the field stays empty -- the default is resolved at the
 	// config->tunnel boundary, not here.
 	config, err = LoadConfiguration(&Options{
-		config:  configPath,
-		command: "default",
-		args:    []string{"7000"},
+		config:   configPath,
+		command:  "default",
+		args:     []string{"7000"},
 		protocol: "http",
 	})
 	if err != nil {
@@ -2289,6 +2289,33 @@ tunnels:
     subdomain: "*.example.com"
 `,
 		},
+		{
+			// The enum check lives at the end of the extracted traversal
+			// (v1.0.20): both roads must refuse a bogus carrier word with
+			// the loader's exact error.
+			name: "bad proxy_transport",
+			doc: `
+proxy_transport: grpc
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+`,
+		},
+		{
+			// And it must stay LAST: a document with a bad tunnel and a bad
+			// carrier word has always heard about the tunnel first, on both
+			// roads -- the position of the switch inside the extraction is
+			// pinned, not just its existence.
+			name: "bad tunnel outranks bad proxy_transport",
+			doc: `
+proxy_transport: grpc
+tunnels:
+  web:
+    proto:
+      ftp: 127.0.0.1:8080
+`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2319,6 +2346,29 @@ tunnels:
 	if err != nil || ValidateConfigurationDoc([]byte(valid)) != nil {
 		t.Fatalf("expected both roads to accept the valid document, got loader=(%+v, %v) validator=%v",
 			config, err, ValidateConfigurationDoc([]byte(valid)))
+	}
+}
+
+// TestValidateConfigurationDocProxyTransport pins the workbench half of the
+// enum check (v1.0.20): a good carrier word validates (case-normalized the
+// loader's way), a bogus one is refused with the error the agent would print
+// at startup. Before the check moved into applyDefaultsAndValidate, the
+// workbench was the one road that called a `proxy_transport: grpc` document
+// valid -- exactly the divergence the extraction exists to prevent.
+func TestValidateConfigurationDocProxyTransport(t *testing.T) {
+	t.Setenv("http_proxy", "")
+
+	base := "proxy_transport: %s\ntunnels:\n  web:\n    proto:\n      http: 127.0.0.1:8080\n"
+
+	if err := ValidateConfigurationDoc([]byte(fmt.Sprintf(base, "QUIC"))); err != nil {
+		t.Fatalf("a good carrier word refused: %v", err)
+	}
+	err := ValidateConfigurationDoc([]byte(fmt.Sprintf(base, "grpc")))
+	if err == nil {
+		t.Fatal("a bogus carrier word validated; want the loader's refusal")
+	}
+	if !strings.Contains(err.Error(), "proxy_transport must be one of 'auto', 'quic' or 'tcp'") {
+		t.Fatalf("error %q does not name the enum the way the loader does", err.Error())
 	}
 }
 
