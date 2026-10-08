@@ -1727,3 +1727,387 @@ func TestDefaultTunnelAlpnSynthesisRejectsBadValues(t *testing.T) {
 		})
 	}
 }
+
+// Tests for the upstream_protocol tunnel key (SPEC-CLUSTER17 1). What the key
+// DOES -- the h1<->h2c transcoder -- is upstreamh2.go and its tests; these are
+// the load-time contract: what a config may set, what composes with it, and
+// the exact refusal an operator sees when it does not. The messages are
+// user-facing contracts, so the refusals are asserted verbatim:
+// LoadConfiguration returns validateUpstreamProtocol's error unwrapped, which
+// is what makes the equality possible.
+
+// upstreamTunnelYAML builds a one-tunnel config that is a VALID http2-upstream
+// http tunnel: the base every matrix case starts from, so that what a case
+// changes is the thing being tested.
+func upstreamTunnelYAML(extraLines ...string) string {
+	lines := []string{
+		"tunnels:",
+		"  web:",
+		"    proto:",
+		"      http: 127.0.0.1:7000",
+		"    upstream_protocol: http2",
+	}
+	lines = append(lines, extraLines...)
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// asHTTPS swaps the base's http leg for an https one, for the cases that
+// exercise the zk/alpn machinery -- agent_tls_termination (which alpn
+// requires) is refused on an http leg, and that refusal is not what those
+// cases are about.
+func asHTTPS(y string) string {
+	return strings.Replace(y, "http: 127.0.0.1:7000", "https: 127.0.0.1:7000", 1)
+}
+
+func TestLoadConfigurationUpstreamProtocolValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string // the full refusal, verbatim; empty means it loads
+	}{
+		{
+			name:   "the valid base loads",
+			config: upstreamTunnelYAML(),
+		},
+		{
+			name:   "explicit http1 loads",
+			config: strings.Replace(upstreamTunnelYAML(), "upstream_protocol: http2", "upstream_protocol: http1", 1),
+		},
+		{
+			name:   "the empty value is the default, not a refusal",
+			config: strings.Replace(upstreamTunnelYAML(), "upstream_protocol: http2", `upstream_protocol: ""`, 1),
+		},
+		{
+			// The h1-side company composes: everything rewriter- and
+			// policy-driven runs on the visitor leg, which the transcoder
+			// keeps unchanged. This is the contrast the alpn matrix draws --
+			// there compression must be OFF alongside h2; here it may stay on.
+			name: "binding internal composes",
+			config: upstreamTunnelYAML(
+				"    binding: internal",
+				"    hostname: app.internal",
+			),
+		},
+		{
+			// basic-auth for the same reason the e2e uses it: a request-phase
+			// action the engine implements, enforced through the transcode
+			// path (the spec's own composition probe).
+			name: "a traffic policy composes",
+			config: upstreamTunnelYAML(
+				"    traffic_policy:",
+				"      on_http_request:",
+				"        - name: basic-auth",
+				"          config:",
+				"            credentials:",
+				"              - user:pass",
+			),
+		},
+		{
+			name: "request_header composes",
+			config: upstreamTunnelYAML(
+				"    request_header:",
+				"      add:",
+				"        - \"X-Env: staging\"",
+			),
+		},
+		{
+			name: "response_header composes",
+			config: upstreamTunnelYAML(
+				"    response_header:",
+				"      remove:",
+				"        - X-Powered-By",
+			),
+		},
+		{
+			name: "compression left on composes (contrast with the alpn h2 rules)",
+			config: upstreamTunnelYAML("    compression: true"),
+		},
+		{
+			name: "an alpn list of http/1.1 alone composes: every visitor is h1, the transcoder serves them all",
+			config: asHTTPS(upstreamTunnelYAML(
+				"    agent_tls_termination: true",
+				"    alpn:",
+				"      - http/1.1",
+			)),
+		},
+		{
+			// Exact match, no case folding: the token names a behavior of this
+			// agent, and "HTTP2" is a near-miss someone half-remembered, not a
+			// value this agent answers to.
+			name:    "a capitalized value is refused",
+			config:  strings.Replace(upstreamTunnelYAML(), "upstream_protocol: http2", "upstream_protocol: HTTP2", 1),
+			wantErr: `Tunnel web: upstream_protocol value "HTTP2" is not supported: the accepted values are "http1" and "http2"`,
+		},
+		{
+			// "h2" is the ALPN token, a different key's vocabulary; upstream
+			// speaks "http1"/"http2" so that a config file never carries both
+			// spellings of the same idea with different meanings.
+			name:    "the alpn token h2 is refused",
+			config:  strings.Replace(upstreamTunnelYAML(), "upstream_protocol: http2", "upstream_protocol: h2", 1),
+			wantErr: `Tunnel web: upstream_protocol value "h2" is not supported: the accepted values are "http1" and "http2"`,
+		},
+		{
+			name:    "h1 is refused",
+			config:  strings.Replace(upstreamTunnelYAML(), "upstream_protocol: http2", "upstream_protocol: h1", 1),
+			wantErr: `Tunnel web: upstream_protocol value "h1" is not supported: the accepted values are "http1" and "http2"`,
+		},
+		{
+			name: "a tcp tunnel is refused: there is no h1 leg to transcode",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				"      tcp: 127.0.0.1:7000",
+				"    upstream_protocol: http2",
+			}, "\n") + "\n",
+			wantErr: `Tunnel web: upstream_protocol is only supported for http and https tunnels, not tcp`,
+		},
+		{
+			name: "a udp tunnel is refused the same way",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				"      udp: 127.0.0.1:7000",
+				"    upstream_protocol: http2",
+			}, "\n") + "\n",
+			wantErr: `Tunnel web: upstream_protocol is only supported for http and https tunnels, not udp`,
+		},
+		{
+			// A PUBLIC tunnel with forward_to (the forwarding endpoint is the
+			// public one; binding: internal belongs to its target, a different
+			// tunnel) -- so the binding checks stay quiet and the refusal that
+			// fires is the one this case exists to pin.
+			name: "forward_to is refused: the local dial the key would change never happens",
+			config: upstreamTunnelYAML(
+				"    forward_to: https://target.internal",
+			),
+			wantErr: `Tunnel web: upstream_protocol cannot be combined with forward_to: a forwarding endpoint's traffic never reaches this agent's local dial, so there is nothing to transcode`,
+		},
+		{
+			// The two h2 stories own the local leg incompatibly (SPEC-CLUSTER16
+			// passthrough vs SPEC-CLUSTER17 transcode); the refusal says which
+			// tool serves which need. An https leg with zk termination and
+			// compression off is an OTHERWISE-VALID alpn tunnel, so the
+			// refusal that fires is the combination's, not alpn's own.
+			name: "an alpn list containing h2 is refused, with the tool choice spelled out",
+			config: asHTTPS(upstreamTunnelYAML(
+				"    agent_tls_termination: true",
+				"    alpn:",
+				"      - h2",
+				"    compression: false",
+			)),
+			wantErr: `Tunnel web: upstream_protocol cannot be combined with an alpn list containing "h2": the two h2 features own the local leg incompatibly -- alpn passes h2 visitors through raw, so the local service must speak h2c itself, while upstream_protocol keeps the visitor leg h1 and transcodes it to h2c. Use alpn for h2 visitors, upstream_protocol for h1 visitors, never both on one tunnel`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, tt.config)
+
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the config to load, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadConfigurationUpstreamProtocolTunnel pins the value arriving on the
+// loaded tunnel struct, and -- the round-trip reason -- the default staying
+// ABSENT: an unset key must not grow into every config SaveAuthToken rewrites.
+func TestLoadConfigurationUpstreamProtocolTunnel(t *testing.T) {
+	configPath := writeConfig(t, upstreamTunnelYAML())
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if got := config.Tunnels["web"].UpstreamProtocol; got != UpstreamProtocolHTTP2 {
+		t.Fatalf("upstream_protocol arrived as %q, want %q", got, UpstreamProtocolHTTP2)
+	}
+
+	without := writeConfig(t, tunnelYAML())
+	config, err = LoadConfiguration(&Options{config: without, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the key-less config to load, got: %v", err)
+	}
+	if got := config.Tunnels["web"].UpstreamProtocol; got != "" {
+		t.Fatalf("no upstream_protocol key must leave the field empty (the default is resolved at the tunnel boundary), got %q", got)
+	}
+}
+
+// TestUpstreamProtocolConfigYAMLRoundTrip is the SaveAuthToken contract: a
+// configured value survives a marshal/reload cycle unchanged, and a config
+// without the key re-marshals without growing one.
+func TestUpstreamProtocolConfigYAMLRoundTrip(t *testing.T) {
+	config := new(Configuration)
+	if err := yaml.Unmarshal([]byte(upstreamTunnelYAML()), config); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	if !strings.Contains(string(marshaled), "upstream_protocol: http2") {
+		t.Fatalf("marshaled config is missing the configured value:\n%s", marshaled)
+	}
+
+	reloaded := new(Configuration)
+	if err := yaml.Unmarshal(marshaled, reloaded); err != nil {
+		t.Fatalf("failed to re-unmarshal marshaled config: %v", err)
+	}
+	if again := reloaded.Tunnels["web"]; !reflect.DeepEqual(config.Tunnels["web"], again) {
+		t.Fatalf("round trip changed the tunnel:\n before: %+v\nafter: %+v", config.Tunnels["web"], again)
+	}
+
+	without := new(Configuration)
+	if err := yaml.Unmarshal([]byte(tunnelYAML()), without); err != nil {
+		t.Fatalf("failed to unmarshal the key-less config: %v", err)
+	}
+	withoutMarshaled, err := yaml.Marshal(without)
+	if err != nil {
+		t.Fatalf("failed to marshal the key-less config: %v", err)
+	}
+	if strings.Contains(string(withoutMarshaled), "upstream_protocol") {
+		t.Fatalf("no upstream_protocol key should be emitted when none was configured:\n%s", withoutMarshaled)
+	}
+}
+
+// TestUpstreamProtocolFlagParsing: -upstream-protocol carries its raw value,
+// and the flag's default is the empty string the loader reads as "not given".
+func TestUpstreamProtocolFlagParsing(t *testing.T) {
+	opts, _ := parseArgs(t, []string{"ngrok", "-upstream-protocol", "http2", "8080"})
+
+	if opts.upstreamProtocol != "http2" {
+		t.Fatalf("-upstream-protocol arrived as %q, want the raw value \"http2\" (validation happens at load)", opts.upstreamProtocol)
+	}
+	if opts.command != "default" || len(opts.args) != 1 || opts.args[0] != "8080" {
+		t.Fatalf("positional argument handling changed: command=%q args=%v", opts.command, opts.args)
+	}
+}
+
+// TestUpstreamProtocolFlagParsingDefaults guards the other direction: without
+// the flag, nothing is set.
+func TestUpstreamProtocolFlagParsingDefaults(t *testing.T) {
+	opts, _ := parseArgs(t, []string{"ngrok", "8080"})
+
+	if opts.upstreamProtocol != "" {
+		t.Fatalf("upstream-protocol should default to empty, got %q", opts.upstreamProtocol)
+	}
+}
+
+// TestUpstreamProtocolFlagsAreRegistered checks the flag exists and carries
+// help text: a flag nobody can discover in the usage output is as good as
+// missing.
+func TestUpstreamProtocolFlagsAreRegistered(t *testing.T) {
+	_, usage := parseArgs(t, []string{"ngrok", "8080"})
+
+	if !strings.Contains(usage, "-upstream-protocol") {
+		t.Fatalf("flag -upstream-protocol is missing from the usage output:\n%s", usage)
+	}
+	if !strings.Contains(usage, "http1") || !strings.Contains(usage, "h2c") {
+		t.Fatalf("usage output should explain the two values and what http2 does (h2c to the local service):\n%s", usage)
+	}
+}
+
+// TestDefaultTunnelUpstreamProtocolSynthesis covers the config.go wiring: the
+// flag feeds the synthesized "default" tunnel, and the same validator that
+// polices a config-file key polices what the flag produced.
+func TestDefaultTunnelUpstreamProtocolSynthesis(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	config, err := LoadConfiguration(&Options{
+		config:           configPath,
+		command:          "default",
+		args:             []string{"7000"},
+		protocol:         "http",
+		upstreamProtocol: "http2",
+	})
+	if err != nil {
+		t.Fatalf("expected the synthesized tunnel to load, got: %v", err)
+	}
+	if tunnel := config.Tunnels["default"]; tunnel.UpstreamProtocol != UpstreamProtocolHTTP2 {
+		t.Fatalf("expected the flag on the synthesized tunnel, got %q", tunnel.UpstreamProtocol)
+	}
+
+	// Without the flag, the field stays empty -- the default is resolved at the
+	// config->tunnel boundary, not here.
+	config, err = LoadConfiguration(&Options{
+		config:  configPath,
+		command: "default",
+		args:    []string{"7000"},
+		protocol: "http",
+	})
+	if err != nil {
+		t.Fatalf("expected the flag-less default tunnel to load, got: %v", err)
+	}
+	if tunnel := config.Tunnels["default"]; tunnel.UpstreamProtocol != "" {
+		t.Fatalf("no -upstream-protocol flag should leave the field empty, got %q", tunnel.UpstreamProtocol)
+	}
+}
+
+// TestDefaultTunnelUpstreamProtocolSynthesisRejectsBadValues drives the flag
+// road through the same refusals the config-file road uses: same rules, same
+// words, with the synthesized tunnel named.
+func TestDefaultTunnelUpstreamProtocolSynthesisRejectsBadValues(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	tests := []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{
+			name:    "a capitalized value",
+			value:   "HTTP2",
+			wantErr: `Tunnel default: upstream_protocol value "HTTP2" is not supported: the accepted values are "http1" and "http2"`,
+		},
+		{
+			name:    "the alpn token",
+			value:   "h2",
+			wantErr: `Tunnel default: upstream_protocol value "h2" is not supported: the accepted values are "http1" and "http2"`,
+		},
+		{
+			// The feature is the h1 proxy leg's: on tcp there is no leg to
+			// transcode, by flag road as much as by config road.
+			name:    "http2 over tcp",
+			value:   "http2",
+			wantErr: `Tunnel default: upstream_protocol is only supported for http and https tunnels, not tcp`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &Options{
+				config:           configPath,
+				command:          "default",
+				args:             []string{"7000"},
+				protocol:         "http",
+				upstreamProtocol: tt.value,
+			}
+			if tt.name == "http2 over tcp" {
+				opts.protocol = "tcp"
+			}
+
+			_, err := LoadConfiguration(opts)
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

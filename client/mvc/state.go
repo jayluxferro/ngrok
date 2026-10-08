@@ -51,6 +51,14 @@ type Tunnel struct {
 	// package interprets it. Only meaningful for https public URLs -- a tunnel
 	// with both legs carries the flag, but its http leg is still edge-served.
 	AgentTLS bool
+
+	// UpstreamProtocol is what the agent speaks to this tunnel's local service
+	// (SPEC-CLUSTER17): "http1" -- the plain TCP dial -- or "http2", the local
+	// leg's h1<->h2c transcoder. Resolved at the config->tunnel boundary (the
+	// empty config value becomes "http1" here), so the proxy path tests one
+	// definite value. Carried the same way as the header policy above: pure
+	// data from the configuration; nothing in this package interprets it.
+	UpstreamProtocol string
 }
 
 type ConnectionContext struct {

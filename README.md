@@ -10,6 +10,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **UDP tunneling** — datagram-preserving public UDP (DNS, game servers, IoT devices), per-flow admission, same owned ports
 - **Zero-knowledge TLS** — terminate https in the agent; the server routes by SNI and never sees plaintext or your certificates
 - **HTTP/2 visitors** — opt-in `alpn: ["h2", "http/1.1"]` on agent-terminated tunnels serves h2-mandatory clients (gRPC) by raw passthrough; HTTP/1 visitors on the same tunnel keep the fully rewritten path
+- **Upstream HTTP/2** — `upstream_protocol: http2` speaks h2c to the local service (gRPC servers, h2 APIs) while the visitor leg stays HTTP/1.1 with rewriting, policies, compression and XFF intact — the mirror of `alpn` h2 passthrough
 - **Traffic policy engine** — CEL-expressed rules per tunnel: deny, custom responses, header actions, IP restrictions, and request authentication (basic-auth, bearer, API key, JWT via JWKS)
 - **Single sign-on (OIDC)** — an `oidc` policy action redirects unauthenticated visitors through your identity provider (authorization-code + PKCE, HMAC-signed sessions, no server-side state) and forwards the verified identity as `X-Forwarded-*` headers
 - **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported

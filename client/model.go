@@ -779,6 +779,13 @@ func tunnelFromConfig(publicUrl, protocolName string, protocol proto.Protocol, c
 		// public URL actually gets termination (serveProxyConnection checks the
 		// scheme too).
 		AgentTLS: config.AgentTLSTermination,
+
+		// SPEC-CLUSTER17: what the local dial speaks. Resolved here, at the
+		// config->tunnel boundary, so that the proxy path tests one definite
+		// value; the config field itself stays empty for the default (see
+		// TunnelConfiguration.UpstreamProtocol for why the config keeps the
+		// emptiness).
+		UpstreamProtocol: upstreamProtocolOrDefault(config.UpstreamProtocol),
 	}
 }
 
@@ -921,8 +928,20 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 	// completed TLS handshake (step 3), and knowing the dial's outcome before
 	// the handshake is what makes that one message instead of an
 	// alert-after-request.
+	//
+	// SPEC-CLUSTER17: upstream_protocol: http2 substitutes the h1<->h2c
+	// transcoder (client/upstreamh2.go) for the plain dial -- the conn.Conn
+	// this step produces behaves as the local leg either way, so every step
+	// below is unchanged. Explicit http1 and the unset default take the else
+	// branch, which is today's dial verbatim (review gate 1 pins that).
 	start := time.Now()
-	localConn, localErr := conn.Dial(tunnel.LocalAddr, "prv", nil)
+	var localConn conn.Conn
+	var localErr error
+	if tunnel.UpstreamProtocol == UpstreamProtocolHTTP2 {
+		localConn, localErr = dialUpstreamH2(tunnel)
+	} else {
+		localConn, localErr = conn.Dial(tunnel.LocalAddr, "prv", nil)
+	}
 	if localErr != nil {
 		remoteConn.Warn("Failed to open private leg %s: %v", tunnel.LocalAddr, localErr)
 	}

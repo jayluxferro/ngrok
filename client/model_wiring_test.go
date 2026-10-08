@@ -161,6 +161,11 @@ func TestTunnelFromConfig(t *testing.T) {
 		Pooling:   true,
 		ForwardTo: "https://other.internal",
 		Compress:  false,
+
+		// The config's unset key resolves to the explicit default at this
+		// boundary (the config struct itself stays empty -- the round-trip
+		// contract).
+		UpstreamProtocol: "http1",
 	}
 
 	if !reflect.DeepEqual(got, want) {

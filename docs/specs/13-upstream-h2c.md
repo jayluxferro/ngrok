@@ -1,7 +1,6 @@
 # SPEC-CLUSTER17 — Agent-side `upstream_protocol: http2` (h1↔h2c transcoding)
 
-Status: draft (approved at workstream start; implementation begins after
-CLUSTER16 lands — it owns client/config.go and client/model.go until then)
+Status: shipped (v1.0.18)
 
 Builds on SPEC-CLUSTER16's preface guard but solves the opposite leg: there
 the visitor speaks h2 and the local service must too (raw passthrough);

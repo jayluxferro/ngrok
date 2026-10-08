@@ -27,6 +27,7 @@ Examples:
 	ngrok -proto=udp -remote-port=5353 5353
 	ngrok -agent-tls-termination -tls-ca-crt=ca.pem -tls-ca-key=ca.key -hostname=app.example.com 8080
 	ngrok -agent-tls-termination -tls-ca-crt=grpc.crt -tls-ca-key=grpc.key -alpn=h2,http/1.1 -compression=false 7000
+	ngrok -upstream-protocol=http2 -hostname=grpc 9090
 
 
 Advanced usage: ngrok [OPTIONS] <command> [command args] [...]
@@ -103,6 +104,13 @@ type Options struct {
 	// the config-file alpn key are judged by exactly one code path and refused
 	// in the same words.
 	alpn string
+
+	// upstreamProtocol is the value of -upstream-protocol (SPEC-CLUSTER17 1),
+	// kept raw for the same reason as alpn: LoadConfiguration validates
+	// whichever tunnel the flag fed, so a flag and the config-file
+	// upstream_protocol key are refused for the same reasons in the same
+	// words.
+	upstreamProtocol string
 
 	// proxyTransport is the value of -proxy-transport (SPEC-CLUSTER7 5): a
 	// client-level setting like -authtoken, not a per-tunnel one, so it
@@ -277,6 +285,11 @@ func ParseArgs() (opts *Options, err error) {
 		"",
 		"Application protocols to offer in the public TLS handshake of an agent-terminated https tunnel, comma-separated in preference order: 'h2', 'http/1.1', or both. Unset offers no ALPN at all. Requires -agent-tls-termination; offering h2 additionally requires -compression=false and no host-header or request/response-header manipulation, which an h2 connection bypasses. (with -agent-tls-termination) (HTTPS only)")
 
+	upstreamProtocol := flag.String(
+		"upstream-protocol",
+		"",
+		"Protocol this agent speaks to the local service: 'http1' (the default, a plain TCP connection) or 'http2' -- with http2, each request arriving over the tunnel's HTTP/1.1 proxy leg is transcoded to HTTP/2 (h2c, prior knowledge) toward the local address, and the response back to h1. Rewriting, traffic policies, compression and X-Forwarded-For all still run on the visitor leg. Upgrade requests (websockets) are refused on this path. (HTTP only)")
+
 	flag.Parse()
 
 	opts = &Options{
@@ -307,6 +320,7 @@ func ParseArgs() (opts *Options, err error) {
 		tlsCaCrt:             *tlsCaCrt,
 		tlsCaKey:             *tlsCaKey,
 		alpn:                 *alpn,
+		upstreamProtocol:     *upstreamProtocol,
 		command:              flag.Arg(0),
 	}
 

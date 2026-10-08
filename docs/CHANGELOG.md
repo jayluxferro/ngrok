@@ -1,4 +1,84 @@
 # Changelog
+## 1.0.18 - 2026-10-08 - Upstream HTTP/2: `upstream_protocol: http2`
+
+The local leg's parity gap closed: an ordinary edge-terminated tunnel can
+now serve a local service that only speaks h2c — a gRPC server, an h2 API
+— by transcoding in the agent. `upstream_protocol: http2` on an http/
+https tunnel keeps the proxy leg HTTP/1.1, where the rewriter,
+traffic-policy phases, inspector tee, XFF injection and compression all
+run unchanged, and speaks plaintext HTTP/2 (h2c, prior knowledge) to the
+local address. It is the mirror image of v1.0.16's h2 passthrough: there
+the VISITOR speaks h2 and everything is spliced raw; here the visitor
+speaks h1 and the local service receives real h2 with every control's
+output riding the crossing.
+
+### The key
+
+```yaml
+tunnels:
+  grpc-edge:
+    proto:
+      http: 9090
+    hostname: grpc
+    upstream_protocol: http2   # http1 (the default) | http2
+```
+
+CLI twin: `-upstream-protocol http2`. `http1` is the spelled-out default;
+the key's absence changes nothing, and a config without it never grows
+one. The matrix refuses what it cannot honor at load, naming the tunnel:
+tcp/udp tunnels (no h1 proxy leg to transcode), `forward_to` endpoints
+(the local port is never dialed, so there is nothing to transcode), and
+`alpn` lists containing `h2` — the two h2 features own the local leg
+incompatibly (`alpn` splices h2 visitors through raw to an h2c listener;
+`upstream_protocol` parses h1 and transcodes), and the refusal says which
+tool serves which need. Everything rewriter- or policy-driven composes —
+those controls run on the visitor leg, which the transcoder keeps
+unchanged: the deliberate contrast with `alpn` h2's strict company rules.
+
+### The transcoder
+
+The local dial site substitutes an in-process bridge: a one-connection
+`http.Server` over a `net.Pipe` — net/http does every byte of h1 framing;
+this codebase does not hand-roll framing on data paths — feeding a shared
+per-address `http2.Transport` in the h2c prior-knowledge shape. Bodies
+stream in both directions, announced trailers ride the crossing as h1
+chunk trailers, and concurrent proxy connections pool their streams onto
+shared local h2c connections, which is what an h2 service wants.
+
+Two details the implementation earned the hard way:
+
+- The transport's `ConnPool` must be the transcoder's own pool. Left
+  unset, `RoundTrip` consults the transport's internal cache, which never
+  learns of the eagerly-dialed connection — it silently dials its own,
+  one per transport, and strands the dead-service contract (the eager
+  dial is what makes a dead local service fail at the dial site, answered
+  by the existing 502 path instead of inside the first request).
+- The response's `Content-Length` is not copied across the crossing: over
+  h2 it is a framing header, not a claim about the body. The h2 server
+  includes it only when it buffered the whole response before the handler
+  returned; copying it would pin the h1 side to identity framing and
+  silently drop declared trailers whenever the h2 server lost that race.
+
+### Death, silence, and upgrades
+
+A dead local service surfaces exactly as today — the same WARN, the same
+502 page — on all three roads: a cold pool (dial refused), a warm pool
+(the connection's FIN evicts it and the next dial is refused), and death
+mid-request (the stream dies with the connection and the bridge answers
+the same 502). The pool also health-checks its idle connections — a PING
+after 30 seconds of silence, eviction if it goes unanswered — because a
+shared pool can hold a connection whose peer vanished without a FIN, a
+problem a per-request dial doesn't have. Deliberately NOT set: a response
+timeout. A slow local service gets exactly the deal the plain dial gives
+it — the visitor's own patience is the bound, on both roads. Websockets
+and other `Upgrade` requests are refused with a fixed 502 naming the
+rule: h2 has no Upgrade without extended CONNECT, which this release does
+not implement.
+
+`golang.org/x/net` is promoted from indirect to direct (the
+`x/net/http2` transport is the local leg). The server and the wire
+protocol are untouched — an old server pairs fine.
+
 ## 1.0.17 - 2026-10-08 - Single sign-on: the oidc action
 
 An `oidc` action in an `on_http_request` policy makes an endpoint a real

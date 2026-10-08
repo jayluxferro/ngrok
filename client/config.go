@@ -115,6 +115,20 @@ type TunnelConfiguration struct {
 	RequestHeader  *HeaderConfig `yaml:"request_header,omitempty"`
 	ResponseHeader *HeaderConfig `yaml:"response_header,omitempty"`
 
+	// UpstreamProtocol selects what this agent speaks to the tunnel's local
+	// service (SPEC-CLUSTER17 1): "http1" -- the default, today's plain TCP
+	// dial -- or "http2", which puts the h1<->h2c transcoder (client/
+	// upstreamh2.go) in the dial's place: the proxy leg stays h1, where the
+	// rewriter, policy hooks, tee and XFF injection live, and the local
+	// service receives real h2c. The value is a config enum, not a wire
+	// advertisement (the server never learns it), so it is matched exactly,
+	// no case folding -- but a misspelling fails loudly at load. Empty is the
+	// default, and the default is deliberately not written back into the
+	// field: LoadConfiguration leaving it empty is what keeps a config
+	// round-trip (SaveAuthToken) from growing the key into every tunnel that
+	// did not have it. validateUpstreamProtocol owns the rules.
+	UpstreamProtocol string `yaml:"upstream_protocol,omitempty"`
+
 	// Endpoint settings (SPEC 3.2/3.3/3.4). Binding is normalized at load time
 	// ("public" becomes the empty string the wire protocol uses) and, together
 	// with ForwardTo, validated by validateEndpointPolicy; Pooling is carried
@@ -175,6 +189,21 @@ const (
 	// carries, and validateEndpointPolicy normalizes the alias to it, so the
 	// server sees exactly one spelling per binding and never sees this one.
 	bindingPublicAlias = "public"
+
+	// The upstream_protocol vocabulary (SPEC-CLUSTER17 1). This is client-side
+	// configuration, not wire vocabulary -- the server never sees the value --
+	// so the consts live here rather than in package msg, next to the
+	// validation that enforces them. The tokens are spelled out ("http1", not
+	// "h1"; "http2", not "h2") so that the default reads honestly in a config
+	// file, and they are matched exactly: the token names a behavior of this
+	// agent, so "HTTP2" or the ALPN token "h2" would be a near-miss someone
+	// half-remembered from another key, and it is refused rather than guessed
+	// at.
+	UpstreamProtocolHTTP1 = "http1"
+
+	// UpstreamProtocolHTTP2 selects the h1<->h2c transcoder for the tunnel's
+	// local leg (client/upstreamh2.go).
+	UpstreamProtocolHTTP2 = "http2"
 
 	// msg.BindingInternal and the .internal namespace are the server's values: both
 	// live in package msg with the rest of the wire vocabulary
@@ -374,6 +403,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
+		// upstream_protocol is judged after alpn on purpose: its one
+		// cross-key rule is the alpn combination, and judging second means the
+		// refusal fires only against an alpn list that is otherwise valid --
+		// an invalid list is alpn's refusal to give, about alpn.
+		if err = validateUpstreamProtocol(name, t); err != nil {
+			return
+		}
+
 		// use the name of the tunnel as the subdomain if none is specified.
 		// Port-routed protocols (tcp, udp) never take a name -- the server
 		// refuses hostname/subdomain on them because their url is the bound
@@ -463,14 +500,16 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			TrafficPolicy: filePolicy,
 
 			// Fixed remote port and agent TLS termination (SPEC-CLUSTER5),
-			// and the tunnel's alpn list (SPEC-CLUSTER16 1), wired exactly
-			// like the proto options above: the flags feed the synthesized
-			// tunnel, and the same validators that police a config-file
-			// tunnel police what the flags produced.
+			// the tunnel's alpn list (SPEC-CLUSTER16 1), and the upstream
+			// protocol (SPEC-CLUSTER17 1), wired exactly like the proto
+			// options above: the flags feed the synthesized tunnel, and the
+			// same validators that police a config-file tunnel police what
+			// the flags produced.
 			RemotePort:          uint16(opts.remotePort),
 			AgentTLSTermination: opts.agentTLSTermination,
 			TLS:                 newTLSConfig(opts.tlsCrt, opts.tlsKey, opts.tlsCaCrt, opts.tlsCaKey),
 			Alpn:                parseAlpnFlag(opts.alpn),
+			UpstreamProtocol:    opts.upstreamProtocol,
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -522,6 +561,12 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		// policy has been resolved, so the h2 refusals judge the policy that
 		// will actually run.
 		if err = validateAlpn("default", config.Tunnels["default"]); err != nil {
+			return
+		}
+
+		// Same position as in the config-file loop: after alpn, so the
+		// combined refusal judges a list alpn itself has accepted.
+		if err = validateUpstreamProtocol("default", config.Tunnels["default"]); err != nil {
 			return
 		}
 
@@ -1187,6 +1232,65 @@ func validateAlpn(tunnelName string, t *TunnelConfiguration) error {
 	// off is refused the same way one that turned it on is.
 	if t.Compress() {
 		return fmt.Errorf("Tunnel %s: alpn offers h2 but compression is not explicitly false: compression defaults on and is rewriter-driven, which an h2 visitor bypasses -- set compression: false alongside the h2 alpn value", tunnelName)
+	}
+
+	return nil
+}
+
+// validateUpstreamProtocol checks a tunnel's upstream_protocol key
+// (SPEC-CLUSTER17 1): what this agent speaks to the tunnel's local service.
+// Like the validators around it, it runs for config-file tunnels and for the
+// CLI-synthesized "default" tunnel, and everything it rejects is a startup
+// error naming the tunnel and the rule.
+//
+// What it deliberately does NOT refuse is the company the key keeps on the h1
+// side: binding internal (an internal terminus is dialed like any local
+// service), traffic policies, header settings and compression all compose,
+// because they all run on the visitor leg -- the leg the transcoder keeps
+// unchanged. That contrast with the alpn matrix is the point.
+func validateUpstreamProtocol(tunnelName string, t *TunnelConfiguration) error {
+	switch t.UpstreamProtocol {
+	case "":
+		// The key's absence is the default. It is deliberately not normalized
+		// to the default here: see TunnelConfiguration.UpstreamProtocol.
+		return nil
+	case UpstreamProtocolHTTP1, UpstreamProtocolHTTP2:
+	default:
+		return fmt.Errorf("Tunnel %s: upstream_protocol value %q is not supported: the accepted values are %q and %q",
+			tunnelName, t.UpstreamProtocol, UpstreamProtocolHTTP1, UpstreamProtocolHTTP2)
+	}
+
+	// The feature is the h1 proxy leg's: a transcoder needs an h1 request to
+	// transcode, and the two port-routed protocols are raw byte pipes with no
+	// h1 leg at all. Same family of refusal as remote_port's, for the same
+	// reason: the key names a control on a protocol that has nothing for it to
+	// control.
+	for proto := range t.Protocols {
+		if !isHttpProtocol(proto) {
+			return fmt.Errorf("Tunnel %s: upstream_protocol is only supported for http and https tunnels, not %s", tunnelName, proto)
+		}
+	}
+
+	// A forwarding endpoint's traffic is handed to another internal endpoint
+	// upstream of this agent entirely: this client never dials a local port
+	// for it, so there is no local leg for a transcoder to own. The dial the
+	// key would change does not happen.
+	if t.ForwardTo != "" {
+		return fmt.Errorf("Tunnel %s: upstream_protocol cannot be combined with forward_to: a forwarding endpoint's traffic never reaches this agent's local dial, so there is nothing to transcode",
+			tunnelName)
+	}
+
+	// The two h2 stories own the local leg incompatibly (SPEC-CLUSTER16 vs
+	// SPEC-CLUSTER17): alpn's h2 visitors are raw passthrough -- their bytes
+	// must reach an h2c listener unmodified -- while upstream_protocol's local
+	// leg expects to parse h1 and transcode it. One tunnel, one local-leg
+	// shape. An alpn list of ["http/1.1"] alone composes freely: every visitor
+	// is h1, and the transcoder serves them all.
+	for _, offered := range t.Alpn {
+		if offered == alpnH2 {
+			return fmt.Errorf("Tunnel %s: upstream_protocol cannot be combined with an alpn list containing %q: the two h2 features own the local leg incompatibly -- alpn passes h2 visitors through raw, so the local service must speak h2c itself, while upstream_protocol keeps the visitor leg h1 and transcodes it to h2c. Use alpn for h2 visitors, upstream_protocol for h1 visitors, never both on one tunnel",
+				tunnelName, alpnH2)
+		}
 	}
 
 	return nil
