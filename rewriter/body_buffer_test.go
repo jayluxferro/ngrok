@@ -445,6 +445,13 @@ func TestBodyBufferMidCaptureCloseReleasesSlabsExactlyOnce(t *testing.T) {
 	pool := testPool()
 	gets, puts := map[*byte]int{}, map[*byte]int{}
 
+	// The two put paths run CONCURRENTLY by design in this test -- the
+	// closer's release races the reading goroutine's abandon -- so the
+	// counters the hooks bump are guarded. putRecorder (pooled_test.go)
+	// locks for the same reason; the production pool is internally
+	// synchronized and cares not at all.
+	var hookMu sync.Mutex
+
 	var gotNil bool
 	term := &SyntheticResponse{StatusCode: http.StatusForbidden, Body: "no body, no verdict\n"}
 	p := bufferingPolicy(1<<20, func(req *http.Request) *RequestVerdict {
@@ -453,8 +460,8 @@ func TestBodyBufferMidCaptureCloseReleasesSlabsExactlyOnce(t *testing.T) {
 	})
 
 	withPool(t, pool, func() {
-		testGetHook = func(b []byte) { gets[&b[0]]++ }
-		testPutHook = func(b []byte) { puts[&b[0]]++ }
+		testGetHook = func(b []byte) { hookMu.Lock(); gets[&b[0]]++; hookMu.Unlock() }
+		testPutHook = func(b []byte) { hookMu.Lock(); puts[&b[0]]++; hookMu.Unlock() }
 		defer func() { testGetHook, testPutHook = nil, nil }()
 
 		public := newCaptureConn(prefix)
@@ -523,9 +530,13 @@ func TestBodyBufferCompleteCaptureReleasesSlabsExactlyOnce(t *testing.T) {
 	pool := testPool()
 	gets, puts := map[*byte]int{}, map[*byte]int{}
 
+	// Same discipline as the mid-capture test above: the hooks can fire from
+	// the pair's goroutines and the test's own Closes at once.
+	var hookMu sync.Mutex
+
 	withPool(t, pool, func() {
-		testGetHook = func(b []byte) { gets[&b[0]]++ }
-		testPutHook = func(b []byte) { puts[&b[0]]++ }
+		testGetHook = func(b []byte) { hookMu.Lock(); gets[&b[0]]++; hookMu.Unlock() }
+		testPutHook = func(b []byte) { hookMu.Lock(); puts[&b[0]]++; hookMu.Unlock() }
 		defer func() { testGetHook, testPutHook = nil, nil }()
 
 		public := &fakeConn{src: strings.NewReader(reqIn), id: "caprelease:public"}
