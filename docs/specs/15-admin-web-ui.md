@@ -1,6 +1,6 @@
 # SPEC-CLUSTER19 — ngrokd admin web UI: the config workbench + observability SPA
 
-Status: draft (handed to workstreams A/B/C/D)
+Status: shipped (v1.0.19)
 
 The admin listener is 70% of a control plane already: three-mode auth with
 browser sessions, a CSP, a per-IP rate limiter, `/metrics` with a 1s sampler,
@@ -154,27 +154,30 @@ every summary names a matrix action.
 ### 5. `ValidateConfigurationDoc` — extraction, not duplication
 
 `LoadConfiguration`'s post-parse body splits into
-`(*Configuration).applyDefaultsAndValidate(loadFileRefs bool) error`:
+`(*Configuration).applyDefaultsAndValidate(loadVaults, loadFileRefs bool) error`:
 
 - **Moves in** (verbatim, same order, same error strings): defaults
   (`server_addr`, `inspect_addr`), the loud negative-value refusals and
   zero-defaults (`inspect_max_body_bytes`, `proxy_max_concurrency`),
-  address normalization, the `http_proxy` URL-shape check, `inspect_auth`
-  form, the size ceiling, and the whole per-tunnel loop —
+  `loadVaults()` (gated on `loadVaults`, in its exact current position
+  between the defaults block and address normalization), address
+  normalization, the `http_proxy` URL-shape check, `inspect_auth` form,
+  the size ceiling, and the whole per-tunnel loop —
   `validateEndpointPolicy`, protocol normalization/validation,
   `validateRemotePort`, `validateAgentTLS`, `validateHeaderPolicy`,
-  `traffic_policy_file` resolution, `validateTrafficPolicy`, the `alpn`
-  rules, and cluster 17's `upstream_protocol` validation.
+  `traffic_policy_file` resolution (gated on `loadFileRefs`; when false, a
+  doc naming the key is refused with "inline the policy (or resolve the
+  file) to validate it here" — the workbench never reads operator-named
+  paths; cert *paths* under `tls:` are shape-checked only, as today),
+  `validateTrafficPolicy`, the `alpn` rules, and cluster 17's
+  `upstream_protocol` validation.
 - **Stays in `LoadConfiguration`**: file reading, the old single-token
   format check (the workbench runs it too — a token-only doc is valid),
-  the `http_proxy` *environment* fallback (a workbench answers questions
-  about the document, not this process's env), and `loadVaults()` (§3).
-- **`loadFileRefs`**: true from `LoadConfiguration`. False from
-  `ValidateConfigurationDoc`, which refuses a doc naming
-  `traffic_policy_file` with "inline the policy (or resolve the file) to
-  validate it here" — the workbench never reads operator-named paths.
-  (Cert *paths* under `tls:` are shape-checked only, as today; contents are
-  read at model start, which the workbench is not.)
+  and the `http_proxy` *environment* fallback, which moves *before* the
+  call — order-invisible, since no default touches `HttpProxy` and the
+  fallback only fills it when empty.
+- `LoadConfiguration` calls `applyDefaultsAndValidate(true, true)`;
+  `ValidateConfigurationDoc` calls `applyDefaultsAndValidate(false, false)`.
 
 Then:
 

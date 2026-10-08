@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ngrok/server/assets"
 	"ngrok/util"
 )
 
@@ -25,6 +26,32 @@ var (
 )
 
 const adminSessionCookie = "ngrok_admin_session"
+
+// adminContentSecurityPolicy is the CSP every admin route answers with. The
+// dashboard is a static SPA (SPEC-CLUSTER19 §6): every script it loads is an
+// external file under /static/, so script-src no longer carries
+// 'unsafe-inline' -- the inline dashboard HTML was the only reason the
+// allowance existed, and dropping it means an injected inline <script> does
+// not run. style-src keeps 'unsafe-inline' because the SPA uses a few inline
+// style attributes; a future cluster can tighten that. Pinned verbatim by a
+// test: this header is the review gate, and a header that drifts silently is
+// a gate that no longer gates.
+const adminContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
+
+// apiRateFor derives the /api/* rate budget from -adminRate (SPEC-CLUSTER19
+// §2). The workbench validates on keystroke-idle plus an explicit button, so
+// a fast editor pasting sections can outrun the pages budget (default
+// 120/min) and lock themselves out of their own dashboard mid-edit; the API
+// gets its own limiter at five times the pages budget. 0 -- off -- propagates
+// exactly when -adminRate 0 unthrottles the whole admin surface: an operator
+// who deliberately sets a tight -adminRate gets a proportionally tight API
+// budget, never a surprise floor.
+func apiRateFor(adminRate int) int {
+	if adminRate <= 0 {
+		return 0
+	}
+	return 5 * adminRate
+}
 
 type adminAuth struct {
 	User         string
@@ -85,20 +112,28 @@ func startAdminServer(addr string, enablePprof bool, auth *adminAuth, rate int) 
 func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 	mux := http.NewServeMux()
 	adminLimiter := newIPRateLimiter(rate, time.Minute)
+	apiLimiter := newIPRateLimiter(apiRateFor(rate), time.Minute)
 
-	secure := func(allowMethods string, requireAuth bool, h http.HandlerFunc) http.HandlerFunc {
+	// secured is the one wrapper both route families go through: the security
+	// headers, the method pin, the limiter and the auth check, in that order.
+	// The two families differ only in which limiter answers -- /api/* has its
+	// own budget (apiRateFor) so workbench keystrokes cannot exhaust the
+	// pages one -- and everything else (headers, auth semantics, the 405 and
+	// 429 bodies) is shared, because a difference the wrapper does not carry
+	// is a difference half the routes would quietly grow out of.
+	secured := func(limiter *ipRateLimiter, allowMethods string, requireAuth bool, h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+			w.Header().Set("Content-Security-Policy", adminContentSecurityPolicy)
 
 			if allowMethods != "" && !strings.Contains(allowMethods, r.Method) {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			if !adminLimiter.allow(remoteIPFromReq(r)) {
+			if !limiter.allow(remoteIPFromReq(r)) {
 				http.Error(w, "too many requests", http.StatusTooManyRequests)
 				return
 			}
@@ -108,11 +143,33 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 			h(w, r)
 		}
 	}
+	secure := func(allowMethods string, requireAuth bool, h http.HandlerFunc) http.HandlerFunc {
+		return secured(adminLimiter, allowMethods, requireAuth, h)
+	}
+	// secureAPI is the API sibling: same wrapper, the api limiter, and auth
+	// always required -- the workbench reads and validates operator
+	// documents, which is not something the unauthenticated public gets to
+	// ask about.
+	secureAPI := func(allowMethods string, h http.HandlerFunc) http.HandlerFunc {
+		return secured(apiLimiter, allowMethods, true, h)
+	}
 
 	mux.HandleFunc("/", secure(http.MethodGet, true, func(w http.ResponseWriter, r *http.Request) {
+		// The SPA's entry document, served from the embedded assets
+		// (SPEC-CLUSTER19 §6) -- ngrokd's first import of the package the
+		// server-assets make target already packages. The wrapper has already
+		// set no-store and the CSP; the entry doc loads its scripts and
+		// styles from /static/.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(adminDashboardHTML))
+		_, _ = w.Write(assets.MustAsset(dashboardIndexAsset))
 	}))
+
+	// The SPA's scripts and styles (SPEC-CLUSTER19 §6): exactly the three
+	// names below, by fixed lookup -- never a path join. A name is taken from
+	// the request path, and the only names that resolve are the three the
+	// dashboard ships, so there is no traversal to have: anything else 404s
+	// before any filesystem-shaped idea enters the picture.
+	mux.HandleFunc("/static/", secureAPI(http.MethodGet, serveDashboardStatic))
 
 	mux.HandleFunc("/login", secure(http.MethodGet+http.MethodPost, false, func(w http.ResponseWriter, r *http.Request) {
 		if auth == nil || (auth.User == "" && auth.Pass == "") {
@@ -283,6 +340,15 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 		}
 	}))
 
+	// The workbench API (SPEC-CLUSTER19 §1): auth'd, method-pinned, own rate
+	// budget, bodies capped at 1 MiB inside the handlers. The handlers live
+	// in admin_api.go; every error path answers JSON because the SPA parses
+	// JSON.
+	mux.HandleFunc("/api/schema", secureAPI(http.MethodGet, handleAPISchema))
+	mux.HandleFunc("/api/validate/config", secureAPI(http.MethodPost, handleAPIValidateConfig))
+	mux.HandleFunc("/api/validate/policy", secureAPI(http.MethodPost, handleAPIValidatePolicy))
+	mux.HandleFunc("/api/render", secureAPI(http.MethodPost, handleAPIRender))
+
 	if enablePprof {
 		mux.HandleFunc("/debug/pprof/", secure(http.MethodGet, true, pprof.Index))
 		mux.HandleFunc("/debug/pprof/cmdline", secure(http.MethodGet, true, pprof.Cmdline))
@@ -334,45 +400,43 @@ func remoteIPFromReq(r *http.Request) string {
 	return host
 }
 
+// dashboardIndexAsset is the embedded entry document "/" serves; the names
+// below are the go-bindata spellings (assets_debug.go / the release twin).
+const dashboardIndexAsset = "assets/server/dashboard/index.html"
+
+// dashboardStaticAssets is the whole /static/ namespace: the three files the
+// SPA loads, keyed by the URL name each is requested under. The values are
+// the asset-package name and the Content-Type each answers with. The route is
+// a lookup in this table and nothing else -- no path join, no directory
+// listing, no fallback -- so a request path that is not exactly one of these
+// names ("../", a subdirectory, an unknown file) misses and 404s.
+var dashboardStaticAssets = map[string]struct {
+	asset string
+	mime  string
+}{
+	"index.html": {"assets/server/dashboard/index.html", "text/html"},
+	"style.css":  {"assets/server/dashboard/style.css", "text/css"},
+	"app.js":     {"assets/server/dashboard/app.js", "text/javascript"},
+}
+
+// serveDashboardStatic answers GET /static/<name> from the embedded assets.
+// The wrapper has already set the security headers, including no-store: the
+// dashboard is three small files and correctness (an operator seeing today's
+// SPA, not yesterday's) beats caching them.
+func serveDashboardStatic(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/static/")
+	entry, ok := dashboardStaticAssets[name]
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", entry.mime)
+	_, _ = w.Write(assets.MustAsset(entry.asset))
+}
+
 const loginHTML = `<!doctype html><html><head><meta charset="utf-8"><title>Admin Login</title>
 <style>body{font:14px/1.4 ui-sans-serif;background:#0f172a;color:#e2e8f0;display:flex;justify-content:center;padding-top:60px}.box{background:#111827;border:1px solid #334155;padding:16px;border-radius:8px}input{display:block;width:260px;margin:8px 0;padding:8px}</style></head>
 <body><form class="box" method="post" action="/login"><h3>ngrokd admin login</h3><input name="username" placeholder="username"/><input type="password" name="password" placeholder="password"/><button type="submit">Sign in</button></form></body></html>`
-
-const adminDashboardHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>ngrokd admin</title>
-<style>
-body{font:14px/1.4 ui-monospace,Menlo,monospace;background:#0f172a;color:#e2e8f0;margin:0;padding:20px}
-h1{margin:0 0 12px}.card{border:1px solid #334155;padding:10px;margin:10px 0;border-radius:8px;background:#111827}
-table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #334155;padding:6px;text-align:left}
-#events{max-height:260px;overflow:auto;white-space:pre}
-</style></head><body>
-<h1>ngrokd observability <a href="/logout" style="color:#93c5fd">logout</a></h1>
-<div class="card">
-  <label>Window:
-    <select id="window"><option value="60">1m</option><option value="300" selected>5m</option><option value="900">15m</option></select>
-  </label>
-  <label>Refresh:
-    <select id="refresh"><option value="2000" selected>2s</option><option value="5000">5s</option><option value="10000">10s</option></select>
-  </label>
-</div>
-<div class="card"><pre id="metrics"></pre></div>
-<div class="card"><pre id="reco"></pre></div>
-<div class="card"><table id="tunnels"><thead><tr><th>URL</th><th>Proto</th><th>Active</th><th>Total</th><th>Bytes In</th><th>Bytes Out</th></tr></thead><tbody></tbody></table></div>
-<div class="card"><div>Events</div><div id="events"></div></div>
-<script>
-async function refresh(){
-  const w=document.getElementById('window').value;
-  const m=await fetch('/metrics?window='+w).then(r=>r.json()); document.getElementById('metrics').textContent=JSON.stringify(m,null,2);
-  const rec=await fetch('/recommendations?window='+w).then(r=>r.json()); document.getElementById('reco').textContent=JSON.stringify(rec,null,2);
-  const t=await fetch('/tunnels').then(r=>r.json()); const tb=document.querySelector('#tunnels tbody'); tb.innerHTML='';
-  (t.tunnels||[]).forEach(x=>{const tr=document.createElement('tr'); tr.innerHTML='<td>'+x.url+'</td><td>'+x.protocol+'</td><td>'+x.active_connections+'</td><td>'+x.total_connections+'</td><td>'+x.bytes_in+'</td><td>'+x.bytes_out+'</td>'; tb.appendChild(tr);});
-}
-let timer=null; function setTimer(){ if(timer) clearInterval(timer); timer=setInterval(refresh, parseInt(document.getElementById('refresh').value)); }
-document.getElementById('refresh').addEventListener('change', setTimer);
-document.getElementById('window').addEventListener('change', refresh);
-refresh(); setTimer();
-const ev=document.getElementById('events'); const es=new EventSource('/events'); es.onmessage=(e)=>{ev.textContent=e.data+'\n'+ev.textContent; if(ev.textContent.length>20000){ev.textContent=ev.textContent.slice(0,20000);} };
-</script></body></html>`
 
 func parseInt64Query(r *http.Request, key string, def int64) int64 {
 	raw := strings.TrimSpace(r.URL.Query().Get(key))

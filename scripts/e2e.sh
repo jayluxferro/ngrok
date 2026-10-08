@@ -4256,4 +4256,447 @@ if ! grep -q 'forward_to' "$TMPDIR/ngrok-up-bad3.out"; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The ngrokd admin workbench (SPEC-CLUSTER19): the /api/ JSON surface (schema,
+# validate config, validate policy, render), the static SPA, the tightened
+# CSP, and the enriched /tunnels snapshots -- the WRITE-shaped half of the
+# admin listener, proved against a live server rather than httptest.
+#
+# The seventh ngrokd, because the workbench's auth shape (-adminAuth) differs
+# from every earlier group's unauthenticated admin listener and because the
+# API budget (-adminRate) is this group's own arithmetic. Everything it
+# serves is admin-listener-only: no public traffic flows here, so the one
+# http tunnel exists purely to give /tunnels a row (its local port points at
+# the opening group's upstream -- still running, never dialed by this group).
+#
+# Ports grepped across the whole file before picking: the other six ngrokds
+# sit on admin :19090-:19097, public http :18080-:18086, https :18443-:18446,
+# tunnel :14443-:14451; local upstreams on :19001-:19019. This group takes
+# admin :19100, public http :18087, tunnel :14452 -- none of which appear
+# anywhere else in the file.
+#
+# Logs go to /tmp/ngrok-e2e-admin2/ -- deliberately OUTSIDE the
+# /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks, so a failed run's
+# server log survives the next run's clean slate -- and the group clears its
+# own directory before starting the client, for the same O_APPEND reason the
+# opening rm exists for (a stale "Tunnel established" would satisfy
+# wait_for_tunnel before this group's client has connected).
+# ---------------------------------------------------------------------------
+
+mkdir -p /tmp/ngrok-e2e-admin2
+rm -f /tmp/ngrok-e2e-admin2/*.log
+
+# a2_curl echoes the response's status code (000 when curl never got one) and
+# leaves the body in the -o file the caller named, exactly like policy_curl:
+# authenticated against the admin2 listener, bounded so a hung handler is a
+# wrong-status failure instead of a wedged script.
+A2_ADMIN=127.0.0.1:19100
+a2_curl() {
+  curl -sS --max-time 15 -u admin:s3cret -w '%{http_code}' "$@" || true
+}
+
+# a2_envelope <document file> <out json file> [kind]: wrap a document in the
+# {"content": ...} envelope every POST /api/* endpoint takes. The quoting is
+# python's job -- a YAML document is newlines and quotes, exactly the bytes
+# shell quoting is worst at -- and kind is only meaningful to /api/render.
+a2_envelope() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+doc = {"content": open(sys.argv[1]).read()}
+if sys.argv[3]:
+    doc["kind"] = sys.argv[3]
+open(sys.argv[2], "w").write(json.dumps(doc))
+PY
+}
+
+# a2_verdict <verdict json file> <label>: a 200-body assertion shared by the
+# validate scenarios -- valid must be the boolean true. The false-with-error
+# cases assert more (the message) and do it inline.
+a2_assert_valid() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is True, f"{sys.argv[2]}: expected valid:true, got {v}"
+PY
+}
+
+echo "[e2e] starting the admin2 ngrokd (workbench API + -adminAuth)"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18087 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14452 -adminAddr=127.0.0.1:19100 \
+  -adminAuth=admin:s3cret -adminRate=1200 \
+  >/tmp/ngrok-e2e-admin2/ngrokd.log 2>&1 &
+for i in {1..40}; do
+  if grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-admin2/ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for control and proxy connections" /tmp/ngrok-e2e-admin2/ngrokd.log 2>/dev/null; then
+  echo "[e2e] the admin2 ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-admin2/ngrokd.log || true
+  exit 1
+fi
+
+echo "[e2e] starting the admin2 client (one http tunnel, so /tunnels has a row)"
+cat > "$TMPDIR/ngrok-admin2.yml" <<'YAML'
+server_addr: 127.0.0.1:14452
+trust_host_root_certs: true
+tunnels:
+  wb:
+    hostname: wb-admin2
+    proto:
+      http: 19001
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-admin2.yml" -log=/tmp/ngrok-e2e-admin2/client.log \
+  start wb >/tmp/ngrok-e2e-admin2/client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-admin2/client.log "wb (admin2)"
+
+echo "[e2e] admin2 1: /api/schema serves the config tables and the policy matrix"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-schema.json" "http://$A2_ADMIN/api/schema")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] /api/schema answered $A2_CODE, want 200"
+  exit 1
+fi
+if ! python3 - "$TMPDIR/a2-schema.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+top = s["config"]["top_level"]
+tun = s["config"]["tunnel"]
+assert len(top) > 5, f"top_level table has {len(top)} rows"
+assert len(tun) > 5, f"tunnel table has {len(tun)} rows"
+assert any(r["key"] == "server_addr" for r in top), "top_level has no server_addr row"
+phases = s["policy"]["phases"]
+for p in ("on_tcp_connect", "on_http_request", "on_http_response"):
+    assert p in phases, f"phases is missing {p}: {sorted(phases)}"
+actions = {a["name"]: a for a in s["policy"]["actions"]}
+assert "deny" in actions, f"actions does not list deny: {sorted(actions)}"
+assert actions["deny"]["phases"], "deny lists no phases"
+empty = sorted(n for n, a in actions.items() if not a.get("summary"))
+assert not empty, f"actions without a summary: {empty}"
+print(f"    schema: {len(top)} top-level rows, {len(tun)} tunnel rows, {len(actions)} actions")
+PY
+then
+  echo "[e2e] /api/schema payload failed its shape checks"
+  exit 1
+fi
+
+echo "[e2e] admin2 2: /tunnels snapshots carry owner and pooling (the enrichment)"
+# Poll rather than trust the agent's log line: the assertion is about the
+# snapshot the server keeps, and the log line is only a proxy for it.
+A2_TUNNELS_OK=0
+for i in {1..40}; do
+  a2_curl -o "$TMPDIR/a2-tunnels.json" "http://$A2_ADMIN/tunnels" >/dev/null
+  if python3 - "$TMPDIR/a2-tunnels.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+rows = s.get("tunnels") or []
+assert rows, "no tunnel rows yet"
+row = rows[0]
+owner = row.get("owner")
+assert isinstance(owner, str) and owner, f"owner missing or empty: {row}"
+assert "pooling" in row and isinstance(row["pooling"], bool), \
+    f"pooling not a boolean field: {row}"
+print(f"    tunnels[0]: url={row.get('url')} owner={owner} pooling={row['pooling']}")
+PY
+  then
+    A2_TUNNELS_OK=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$A2_TUNNELS_OK" != "1" ]]; then
+  echo "[e2e] /tunnels never showed an enriched row:"
+  cat "$TMPDIR/a2-tunnels.json" 2>/dev/null || true
+  exit 1
+fi
+
+echo "[e2e] admin2 3: validate/config accepts a minimal valid document (200 valid:true)"
+cat > "$TMPDIR/a2-good.yml" <<'YAML'
+server_addr: 127.0.0.1:14452
+trust_host_root_certs: true
+tunnels:
+  wb:
+    hostname: wb-admin2
+    proto:
+      http: 19001
+YAML
+a2_envelope "$TMPDIR/a2-good.yml" "$TMPDIR/a2-good.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-good.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-good.json" "http://$A2_ADMIN/api/validate/config")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] validate/config answered $A2_CODE for a valid document, want 200:"
+  cat "$TMPDIR/a2-good.out"
+  exit 1
+fi
+if ! a2_assert_valid "$TMPDIR/a2-good.out" "valid config"; then
+  echo "[e2e] the valid document did not come back valid:true:"
+  cat "$TMPDIR/a2-good.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 4: validate/config reports a bad protocol as valid:false, naming the tunnel"
+cat > "$TMPDIR/a2-bad.yml" <<'YAML'
+server_addr: 127.0.0.1:14452
+tunnels:
+  badproto:
+    hostname: wb-admin2
+    proto:
+      gopher: 19001
+YAML
+a2_envelope "$TMPDIR/a2-bad.yml" "$TMPDIR/a2-bad.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-bad.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-bad.json" "http://$A2_ADMIN/api/validate/config")"
+# A bad DOCUMENT is not a transport fault: the endpoint succeeded, so the
+# verdict is a 200 with valid:false -- the SPEC §1 rule this scenario exists
+# to pin.
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] validate/config answered $A2_CODE for an invalid document, want 200 valid:false"
+  cat "$TMPDIR/a2-bad.out"
+  exit 1
+fi
+if ! python3 - "$TMPDIR/a2-bad.out" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is False, f"expected valid:false, got {v}"
+err = v.get("error", "")
+assert "badproto" in err or "gopher" in err, \
+    f"the error does not name the tunnel or the protocol: {err}"
+PY
+then
+  echo "[e2e] the bad protocol did not come back as a verdict naming the tunnel:"
+  cat "$TMPDIR/a2-bad.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 5: validate/config refuses a vaults: block with 422"
+# The vault safety rule (SPEC §3), end to end: the workbench has no vault set
+# and will not guess, so the document is refused before parsing -- the 422,
+# not a verdict, because the refusal is about the caller's situation, not the
+# document's validity.
+cat > "$TMPDIR/a2-vault.yml" <<'YAML'
+server_addr: 127.0.0.1:14452
+vaults:
+  main:
+    file: /tmp/ngrok-e2e-admin2/vault.yml
+tunnels:
+  wb:
+    hostname: wb-admin2
+    proto:
+      http: 19001
+YAML
+a2_envelope "$TMPDIR/a2-vault.yml" "$TMPDIR/a2-vault.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-vault.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-vault.json" "http://$A2_ADMIN/api/validate/config")"
+if [[ "$A2_CODE" != "422" ]]; then
+  echo "[e2e] validate/config answered $A2_CODE for a vaults: document, want 422:"
+  cat "$TMPDIR/a2-vault.out"
+  exit 1
+fi
+if ! grep -qi 'vault' "$TMPDIR/a2-vault.out"; then
+  echo "[e2e] the 422 body does not mention vault:"
+  cat "$TMPDIR/a2-vault.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 6: validate/policy accepts the log action with its metadata (200 valid:true)"
+# log's only config field is metadata, and it is required (policy/validate.go
+# buildMetadata) -- the doc below is the smallest document the engine accepts.
+cat > "$TMPDIR/a2-policy-good.yml" <<'YAML'
+on_http_request:
+  - name: log
+    config:
+      metadata:
+        group: admin2
+YAML
+a2_envelope "$TMPDIR/a2-policy-good.yml" "$TMPDIR/a2-policy-good.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-policy-good.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-policy-good.json" "http://$A2_ADMIN/api/validate/policy")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] validate/policy answered $A2_CODE for a valid policy, want 200:"
+  cat "$TMPDIR/a2-policy-good.out"
+  exit 1
+fi
+if ! a2_assert_valid "$TMPDIR/a2-policy-good.out" "valid policy"; then
+  echo "[e2e] the valid policy did not come back valid:true:"
+  cat "$TMPDIR/a2-policy-good.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 7: validate/policy reports an unknown action as valid:false, naming the rule"
+cat > "$TMPDIR/a2-policy-bad.yml" <<'YAML'
+on_http_request:
+  - name: vanish
+    config: {}
+YAML
+a2_envelope "$TMPDIR/a2-policy-bad.yml" "$TMPDIR/a2-policy-bad.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-policy-bad.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-policy-bad.json" "http://$A2_ADMIN/api/validate/policy")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] validate/policy answered $A2_CODE for an unknown action, want 200 valid:false"
+  cat "$TMPDIR/a2-policy-bad.out"
+  exit 1
+fi
+if ! python3 - "$TMPDIR/a2-policy-bad.out" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is False, f"expected valid:false, got {v}"
+err = v.get("error", "")
+assert "vanish" in err, f"the error does not name the rule: {err}"
+PY
+then
+  echo "[e2e] the unknown action did not come back as a verdict naming the rule:"
+  cat "$TMPDIR/a2-policy-bad.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 8: validate/policy refuses secret( with 422 (the raw scan, before parsing)"
+cat > "$TMPDIR/a2-policy-secret.yml" <<'YAML'
+on_http_request:
+  - name: add-headers
+    config:
+      headers:
+        x-token: secret("main/x")
+YAML
+a2_envelope "$TMPDIR/a2-policy-secret.yml" "$TMPDIR/a2-policy-secret.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-policy-secret.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-policy-secret.json" "http://$A2_ADMIN/api/validate/policy")"
+if [[ "$A2_CODE" != "422" ]]; then
+  echo "[e2e] validate/policy answered $A2_CODE for a secret( document, want 422:"
+  cat "$TMPDIR/a2-policy-secret.out"
+  exit 1
+fi
+if ! grep -qi 'vault' "$TMPDIR/a2-policy-secret.out"; then
+  echo "[e2e] the 422 body does not mention vault:"
+  cat "$TMPDIR/a2-policy-secret.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 9: render round trip -- the canonical form re-validates as valid"
+a2_envelope "$TMPDIR/a2-good.yml" "$TMPDIR/a2-render-req.json" config
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-render.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-render-req.json" "http://$A2_ADMIN/api/render")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] /api/render answered $A2_CODE, want 200:"
+  cat "$TMPDIR/a2-render.out"
+  exit 1
+fi
+if ! python3 - "$TMPDIR/a2-render.out" "$TMPDIR/a2-rendered.yml" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is True, f"render said valid:false: {v}"
+rendered = v.get("rendered", "")
+assert rendered.strip(), "render returned an empty document"
+open(sys.argv[2], "w").write(rendered)
+print(f"    rendered {len(rendered)} bytes of canonical YAML")
+PY
+then
+  echo "[e2e] /api/render did not produce a rendered document:"
+  cat "$TMPDIR/a2-render.out"
+  exit 1
+fi
+# The canonical re-marshal must not break what the agent's validator accepts:
+# quoted port strings, dropped empties, 2-space indent -- all of it has to
+# survive a second trip through LoadConfiguration's own traversal.
+a2_envelope "$TMPDIR/a2-rendered.yml" "$TMPDIR/a2-rendered.json"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-rendered.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-rendered.json" "http://$A2_ADMIN/api/validate/config")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] validate/config answered $A2_CODE for the rendered document, want 200:"
+  cat "$TMPDIR/a2-rendered.out"
+  exit 1
+fi
+if ! a2_assert_valid "$TMPDIR/a2-rendered.out" "rendered config"; then
+  echo "[e2e] the rendered document did not re-validate:"
+  cat "$TMPDIR/a2-rendered.out"
+  exit 1
+fi
+
+echo "[e2e] admin2 10: /static/ serves exactly the three SPA files, by fixed lookup"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-appjs.body" -D "$TMPDIR/a2-appjs.headers" "http://$A2_ADMIN/static/app.js")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] /static/app.js answered $A2_CODE, want 200"
+  exit 1
+fi
+if ! grep -qi '^Content-Type: text/javascript' "$TMPDIR/a2-appjs.headers"; then
+  echo "[e2e] /static/app.js does not serve text/javascript:"
+  grep -i '^Content-Type:' "$TMPDIR/a2-appjs.headers" || true
+  exit 1
+fi
+if ! grep -q 'ngrok' "$TMPDIR/a2-appjs.body"; then
+  echo "[e2e] /static/app.js served a body that does not look like the SPA"
+  exit 1
+fi
+A2_CODE="$(a2_curl -o /dev/null "http://$A2_ADMIN/static/nope")"
+if [[ "$A2_CODE" != "404" ]]; then
+  echo "[e2e] /static/nope answered $A2_CODE, want 404"
+  exit 1
+fi
+# Traversal: the route is a table lookup, never a path join, so the dot-segment
+# cannot reach the filesystem. --path-as-is is what sends the raw dots (curl
+# squashes them by default and would land on /Makefile, the mux's cleaning, not
+# file service); the mux then 301s the cleaned path away before any handler
+# runs. The assertion is the honest one for both shapes: not 200, and never the
+# file's content.
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-traverse.body" --path-as-is "http://$A2_ADMIN/static/../Makefile")"
+if [[ "$A2_CODE" == "200" ]] || grep -q '^all:' "$TMPDIR/a2-traverse.body" 2>/dev/null; then
+  echo "[e2e] /static/../Makefile answered $A2_CODE with body:"
+  head -c 200 "$TMPDIR/a2-traverse.body" || true
+  exit 1
+fi
+echo "    traversal answered $A2_CODE (mux path-cleaning redirect or 404), never the file"
+
+echo "[e2e] admin2 11: / serves the SPA with the tightened CSP (no unsafe-inline in script-src)"
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-root.body" -D "$TMPDIR/a2-root.headers" "http://$A2_ADMIN/")"
+if [[ "$A2_CODE" != "200" ]]; then
+  echo "[e2e] / answered $A2_CODE, want 200"
+  exit 1
+fi
+if ! grep -qi '^Content-Type: text/html' "$TMPDIR/a2-root.headers"; then
+  echo "[e2e] / does not serve text/html:"
+  grep -i '^Content-Type:' "$TMPDIR/a2-root.headers" || true
+  exit 1
+fi
+# Match the header PRECISELY: style-src legitimately keeps 'unsafe-inline' (the
+# SPA's inline style attributes), so a bare grep for unsafe-inline would
+# false-fail. Extract the script-src directive up to its terminating ';' and
+# require it to be exactly the self-only spelling.
+if ! grep -qi "script-src 'self'" "$TMPDIR/a2-root.headers"; then
+  echo "[e2e] the CSP has no script-src 'self' directive:"
+  grep -i '^Content-Security-Policy:' "$TMPDIR/a2-root.headers" || true
+  exit 1
+fi
+A2_SCRIPT_SRC="$(grep -io "script-src '[^;]*'" "$TMPDIR/a2-root.headers" | head -n 1)"
+if [[ "$A2_SCRIPT_SRC" != "script-src 'self'" ]]; then
+  echo "[e2e] the script-src directive is not exactly self-only: \"$A2_SCRIPT_SRC\""
+  grep -i '^Content-Security-Policy:' "$TMPDIR/a2-root.headers" || true
+  exit 1
+fi
+
+echo "[e2e] admin2 12: the API is behind the admin auth (no credentials -> 401)"
+A2_CODE="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "http://$A2_ADMIN/api/schema" || true)"
+if [[ "$A2_CODE" != "401" ]]; then
+  echo "[e2e] /api/schema without credentials answered $A2_CODE, want 401"
+  exit 1
+fi
+
+echo "[e2e] admin2 13: a body past the 1 MiB cap answers 413"
+python3 - "$TMPDIR/a2-big.json" <<'PY'
+import json, sys
+# One megabyte of body: the cap trips in the transport layer (MaxBytesReader)
+# before the document is ever parsed, so the content need not be valid YAML.
+open(sys.argv[1], "w").write(json.dumps({"content": "a" * (1 << 20)}))
+PY
+A2_CODE="$(a2_curl -o "$TMPDIR/a2-big.out" -H 'Content-Type: application/json' \
+  --data-binary @"$TMPDIR/a2-big.json" "http://$A2_ADMIN/api/validate/config")"
+if [[ "$A2_CODE" != "413" ]]; then
+  echo "[e2e] the oversize body answered $A2_CODE, want 413:"
+  head -c 200 "$TMPDIR/a2-big.out" || true
+  exit 1
+fi
+if ! grep -q '1048576' "$TMPDIR/a2-big.out"; then
+  echo "[e2e] the 413 body does not name the cap:"
+  cat "$TMPDIR/a2-big.out"
+  exit 1
+fi
+
 echo "[e2e] PASS"

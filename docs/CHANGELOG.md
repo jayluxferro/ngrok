@@ -1,4 +1,90 @@
 # Changelog
+## 1.0.19 - 2026-10-08 - ngrokd admin web UI: the config workbench
+
+The admin listener becomes a control plane you can actually use from a
+browser. The dashboard is no longer an inline HTML constant but a static
+single-page app served from ngrokd's own embedded assets — same visual
+language, now with tabs for the live metrics, the tunnel table, the event
+stream, and a new **workbench** where you validate and render the exact
+documents the agent and the policy engine consume, against the exact code
+that consumes them.
+
+### The API
+
+Four endpoints under `/api/`, every one behind the admin authentication,
+method-pinned, `no-store`, and rate-limited with its own budget:
+
+- `GET /api/schema` — every configuration key (top-level and per-tunnel)
+  with type, default and a one-line summary, plus the policy action
+  matrix: which actions are legal in which phase, derived from the same
+  `actionPhases` map the engine enforces, so the schema cannot disagree
+  with the build.
+- `POST /api/validate/config` — `{"content": "<yaml>"}` validated by the
+  agent's own traversal. `LoadConfiguration`'s validation core was
+  extracted (not duplicated) into `client.ValidateConfigurationDoc`; a
+  parity test drives a 17-document corpus of bad configs through both
+  roads and requires byte-identical error strings, so the workbench's
+  verdict is the loader's verdict, provably.
+- `POST /api/validate/policy` — one traffic-policy document, validated by
+  `TrafficPolicy.Validate()` itself.
+- `POST /api/render` — parse and canonical re-marshal (YAML, 2-space
+  indent) of either kind; the SPA turns the answer into a download. The
+  server never writes a file, and the workbench never reads one: a config
+  naming `traffic_policy_file` is told to inline the policy instead.
+
+Validation verdicts are 200s (`{"valid": true}` or
+`{"valid": false, "error": ...}` with the validator's message verbatim);
+4xx stays for transport faults — malformed envelope 400, over the 1 MiB
+body cap 413, and the vault refusal 422.
+
+### Vaults are refused, not resolved
+
+A document naming a `vaults:` block or any `secret("vault/key")`
+reference is refused before parsing, on both validate endpoints and
+render. Vault state is process-global: each process installs and resolves
+against its own configured set, and ngrokd's set feeds real tunnel
+registrations. A workbench validation must not mutate it, and validating
+an agent's document against the server's set would answer the wrong
+question. The scan is deliberately crude (a header value that merely
+contains `secret(` is refused too) — fail-closed with an explanation
+beats a parse that might miss a spelling.
+
+### Rate budget, CSP, and the tunnel table
+
+- `/api/*` gets its own limiter at **5× `-adminRate`** (0 stays 0): the
+  workbench validates on keystroke-idle, and a fast editor would
+  otherwise lock themselves out of their own dashboard mid-edit.
+- The CSP drops `'unsafe-inline'` from `script-src` — every script is now
+  an external file, and an injected inline `<script>` no longer runs.
+  The SPA renders every dynamic value with `textContent`, never
+  `innerHTML`: tunnel URLs and validator errors are displayed, never
+  parsed as HTML.
+- `/tunnels` snapshots carry the registration facts: `owner`, `internal`,
+  `agent_tls`, `forward_to`, `claimed_port`, `pooling`, `policy_attached`
+  — additive JSON, filled once at registration.
+
+### The honest costs
+
+- ngrokd links the agent's config validators (`ngrok/client` import in a
+  single module): the release binary grows **+644 KiB (+3.1%)**, 21.35 →
+  22.01 MB. The alternative — duplicating the validators into a shared
+  package — trades a one-time refactor for no behavior change, and was
+  rejected; the parity test is what keeps the single source honest.
+- The workbench editor is ephemeral by design: no localStorage (a config
+  in localStorage is a credential in a less-audited store), no server-side
+  state, nothing persisted anywhere.
+- Debug builds read dashboard assets from disk via absolute paths baked at
+  generation (dev machine only, same as the client's assets); release
+  builds embed them — verified by booting the release binary and serving
+  `/static/` from the embedded copy.
+
+Non-goals held: no remote agent control (no server→agent wire message
+exists by design; an authenticated endpoint starting processes on user
+machines is an RCE surface with its own threat model owed first), no
+server-side traffic inspector (the tee is agent-local by architecture),
+no multi-user admin, no live-policy editing. Design record:
+[spec 15](specs/15-admin-web-ui.md).
+
 ## 1.0.18 - 2026-10-08 - Upstream HTTP/2: `upstream_protocol: http2`
 
 The local leg's parity gap closed: an ordinary edge-terminated tunnel can

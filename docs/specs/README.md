@@ -43,7 +43,7 @@ rounds with no feature spec — their record is the changelog.
 | [12-h2-passthrough.md](12-h2-passthrough.md) | Opt-in `h2` ALPN on agent-terminated tunnels; the rewriter's HTTP/2 preface fail-open guard | v1.0.16 | shipped |
 | [13-upstream-h2c.md](13-upstream-h2c.md) | Agent-side `upstream_protocol: http2` — h1↔h2c transcoder on the local leg | shipped | v1.0.18 |
 | [14-oidc-identity.md](14-oidc-identity.md) | `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | v1.0.17 | shipped |
-| [15-admin-web-ui.md](15-admin-web-ui.md) | ngrokd admin web UI: config workbench + observability SPA, `/api` validate/schema/render, snapshot enrichment | next | draft |
+| [15-admin-web-ui.md](15-admin-web-ui.md) | ngrokd admin web UI: config workbench + observability SPA, `/api` validate/schema/render, snapshot enrichment | v1.0.19 | shipped |
 
 ## Not specced here
 

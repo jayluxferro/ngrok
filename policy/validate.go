@@ -97,6 +97,23 @@ func phaseActions(p phase) []string {
 	return out
 }
 
+// PhaseActionMatrix returns, keyed by phase name ("on_tcp_connect",
+// "on_http_request", "on_http_response" -- the YAML spellings, via
+// phase.String), the sorted action names that phase implements.
+//
+// It is derived from actionPhases -- the same map the engine enforces -- by
+// way of phaseActions, so a consumer of this table (the admin workbench's
+// schema endpoint is the one that motivated it) cannot disagree with the build
+// about what is legal where. An action added to the matrix lands here
+// automatically; the next UI change for a new action is none at all.
+func PhaseActionMatrix() map[string][]string {
+	out := make(map[string][]string, 3)
+	for _, p := range []phase{phaseConnect, phaseRequest, phaseResponse} {
+		out[p.String()] = phaseActions(p)
+	}
+	return out
+}
+
 func (p phase) supports(action string) bool {
 	for _, ph := range actionPhases[action] {
 		if ph == p {

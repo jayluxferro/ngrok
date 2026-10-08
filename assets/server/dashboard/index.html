@@ -1,0 +1,121 @@
+<!doctype html>
+<!-- ngrokd admin SPA (spec 15 §8). This file is a static skeleton only:
+     every dynamic node is built by app.js with createElement/textContent, so
+     no server- or operator-supplied string is ever parsed as HTML anywhere in
+     this page. The CSP drops 'unsafe-inline' from script-src; there is no
+     inline script or event-handler attribute here by construction. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ngrokd admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>ngrokd admin</h1>
+  <nav id="tabbar" role="tablist" aria-label="sections">
+    <button class="tabbtn" data-tab="overview" role="tab" type="button">Overview</button>
+    <button class="tabbtn" data-tab="tunnels" role="tab" type="button">Tunnels</button>
+    <button class="tabbtn" data-tab="events" role="tab" type="button">Events</button>
+    <button class="tabbtn" data-tab="workbench" role="tab" type="button">Workbench</button>
+  </nav>
+  <a class="logout" href="/logout">logout</a>
+</header>
+
+<!-- Latched by app.js on the first 401: the session cookie is not refreshed
+     mid-session, so once it is dead every later call dies with it. -->
+<div id="session-expired" hidden>
+  session expired — <a href="/">reload to log in</a>
+</div>
+
+<main>
+  <section id="tab-overview" class="tab" role="tabpanel" hidden>
+    <div class="card controls">
+      <label>Window:
+        <select id="ov-window">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+          <option value="900">15m</option>
+        </select>
+      </label>
+      <span id="ov-status" class="muted"></span>
+      <span class="muted">polls every 2s while visible</span>
+    </div>
+    <div id="ov-cards" class="cards"></div>
+    <div class="card">
+      <h2>Rates <span id="ov-window-note" class="muted"></span></h2>
+      <table><tbody id="ov-rates"></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-tunnels" class="tab" role="tabpanel" hidden>
+    <div class="card">
+      <h2>Tunnels <span id="tn-count" class="muted"></span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>URL</th><th>Proto</th><th>Owner</th><th>Flags</th>
+            <th class="num">Active</th><th class="num">Total</th>
+            <th class="num">In</th><th class="num">Out</th><th>Age</th>
+          </tr></thead>
+          <tbody id="tn-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-events" class="tab" role="tabpanel" hidden>
+    <div class="card">
+      <h2>Events <span id="ev-status" class="muted"></span></h2>
+      <div class="evbar">
+        <span id="ev-count" class="muted"></span>
+        <button id="ev-clear" type="button">clear</button>
+      </div>
+      <div id="ev-list" class="evlist"></div>
+    </div>
+  </section>
+
+  <section id="tab-workbench" class="tab" role="tabpanel" hidden>
+    <div class="wbgrid">
+      <div class="wbcol">
+        <div class="card editor">
+          <h2>Config</h2>
+          <textarea id="cfg-text" spellcheck="false"
+            placeholder="agent config YAML — validated by the same traversal LoadConfiguration runs"></textarea>
+          <div class="btnrow">
+            <button id="cfg-validate" type="button">Validate</button>
+            <button id="cfg-render" type="button">Render + download</button>
+          </div>
+          <pre id="cfg-verdict" class="verdict" hidden></pre>
+        </div>
+        <div class="card editor">
+          <h2>Policy</h2>
+          <textarea id="pol-text" spellcheck="false"
+            placeholder="traffic policy YAML — on_tcp_connect / on_http_request / on_http_response root"></textarea>
+          <div class="btnrow">
+            <button id="pol-validate" type="button">Validate</button>
+            <button id="pol-render" type="button">Render + download</button>
+          </div>
+          <pre id="pol-verdict" class="verdict" hidden></pre>
+        </div>
+        <p class="footnote">Ephemeral by design: nothing you type here is
+        stored — no localStorage, no server-side files, nothing sent anywhere
+        but this admin endpoint's validate/render calls. Render hands the
+        canonical document back as a download.</p>
+      </div>
+      <aside class="card wbside">
+        <button id="schema-toggle" type="button" aria-expanded="false">Schema &#9656;</button>
+        <div id="schema-body" hidden></div>
+      </aside>
+    </div>
+  </section>
+</main>
+
+<noscript><p class="footnote">This dashboard is a JavaScript application.
+The CSP allows scripts only from this same origin (no CDNs); enable JS to
+use it.</p></noscript>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

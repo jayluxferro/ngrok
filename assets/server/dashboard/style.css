@@ -1,0 +1,119 @@
+/* ngrokd admin SPA (spec 15 §8). The visual language is the old inline
+   dashboard's — dark #0f172a, #e2e8f0 monospace text, #111827 cards with
+   #334155 borders and 8px radius — kept so the page still reads as the same
+   admin surface it replaced. Custom properties exist so that palette lives
+   in exactly one place. */
+
+:root {
+  --bg: #0f172a;
+  --panel: #111827;
+  --line: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #93c5fd;
+  --ok: #4ade80;
+  --bad: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 16px 20px 40px;
+}
+
+header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+h1 { margin: 0; font-size: 18px; }
+h2 { margin: 0 0 8px; font-size: 14px; font-weight: bold; }
+.logout { color: var(--accent); margin-left: auto; }
+
+#tabbar { display: flex; gap: 4px; flex-wrap: wrap; }
+.tabbtn {
+  font: inherit; background: transparent; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer;
+}
+.tabbtn:hover { color: var(--text); }
+.tabbtn.on { color: var(--text); background: var(--panel); }
+
+select, button {
+  font: inherit; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+
+.card { border: 1px solid var(--line); padding: 10px; margin: 10px 0; border-radius: 8px; background: var(--panel); }
+.muted { color: var(--muted); font-weight: normal; }
+.controls label { margin-right: 16px; }
+.controls .muted { margin-right: 12px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin: 10px 0; }
+.stat { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 8px 10px; }
+.statlabel { color: var(--muted); font-size: 12px; }
+.statvalue { font-size: 17px; margin-top: 2px; overflow-wrap: anywhere; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px 6px 0; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: normal; }
+th.num, td.num { text-align: right; }
+.tablewrap { overflow-x: auto; }
+code { color: var(--accent); overflow-wrap: anywhere; }
+
+.badge {
+  display: inline-block; border: 1px solid var(--line); border-radius: 6px;
+  padding: 0 6px; font-size: 12px; color: var(--accent); white-space: nowrap;
+}
+/* Flags are the small registration facts (internal, agent-tls, pool, ...):
+   smaller and dimmer than a badge, packed into the Flags cell. */
+.tag {
+  display: inline-block; border: 1px solid var(--line); border-radius: 6px;
+  padding: 0 5px; font-size: 11px; color: var(--muted); margin: 1px 2px 1px 0;
+  white-space: nowrap;
+}
+
+#session-expired {
+  border: 1px solid var(--bad); border-radius: 8px; background: var(--panel);
+  color: var(--bad); padding: 10px; margin: 0 0 12px;
+}
+#session-expired a { color: var(--accent); }
+
+.evbar { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.evlist { max-height: 420px; overflow: auto; }
+.evrow { display: flex; gap: 10px; padding: 3px 0; border-bottom: 1px solid rgba(51, 65, 85, 0.5); }
+.evtime { color: var(--muted); flex: none; }
+.evrow .badge { flex: none; }
+.evdetail { overflow-wrap: anywhere; white-space: pre-wrap; min-width: 0; }
+/* Type classes are the color code: opens green (something came online),
+   closes neutral, rejects/drops red. Unknown types fall back to neutral. */
+.ev-open .badge { color: var(--ok); border-color: var(--ok); }
+.ev-reject .badge { color: var(--bad); border-color: var(--bad); }
+.ev-close .badge { color: var(--muted); }
+
+.wbgrid { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+.wbcol { flex: 2 1 480px; min-width: 300px; }
+.wbside { flex: 1 1 260px; min-width: 250px; }
+.editor textarea {
+  display: block; width: 100%; font: inherit;
+  min-height: 22.5em; /* ~16 lines at the body's 1.4 line-height */
+  resize: vertical;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+}
+.btnrow { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.footnote { color: var(--muted); font-size: 12px; margin: 12px 2px; }
+
+.verdict {
+  margin: 8px 0 0; padding: 8px; border-radius: 6px;
+  white-space: pre-wrap; overflow-wrap: anywhere; /* validator errors are multi-line and quote the document */
+}
+.verdict.ok { color: var(--ok); border: 1px solid var(--ok); }
+.verdict.bad { color: var(--bad); border: 1px solid var(--bad); }
+.verdict.pending { color: var(--muted); border: 1px solid var(--line); }
+
+#schema-toggle { width: 100%; text-align: left; }
+#schema-body h3 { font-size: 13px; margin: 12px 0 4px; }
+#schema-body table { font-size: 12px; }
+#schema-body td { padding: 4px 8px 4px 0; }

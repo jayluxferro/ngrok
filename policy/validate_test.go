@@ -142,3 +142,77 @@ func TestUnknownActionMessageNamesThePhase(t *testing.T) {
 		t.Errorf("expected the message to name the rule and the phase, got: %v", err)
 	}
 }
+
+// TestPhaseActionMatrixMatchesActionPhases pins the exported matrix
+// (SPEC-CLUSTER19 §4) to the map the engine enforces, in both directions:
+// every actionPhases row appears under exactly the phases it names, nothing
+// else appears at all, the keys are the three YAML spellings, and every list
+// is sorted. This is the table the admin workbench's schema endpoint serves,
+// so a divergence here is a UI promising what the build refuses (or hiding
+// what it accepts).
+func TestPhaseActionMatrixMatchesActionPhases(t *testing.T) {
+	m := PhaseActionMatrix()
+
+	wantKeys := []string{phaseConnect.String(), phaseRequest.String(), phaseResponse.String()}
+	if len(m) != len(wantKeys) {
+		t.Fatalf("PhaseActionMatrix has %d phases, want %d: %v", len(m), len(wantKeys), m)
+	}
+	for _, k := range wantKeys {
+		if _, ok := m[k]; !ok {
+			t.Errorf("PhaseActionMatrix is missing the %q key (the YAML spelling)", k)
+		}
+	}
+
+	seen := make(map[string]int)
+	for name, phases := range actionPhases {
+		for _, key := range wantKeys {
+			inMatrix := false
+			for _, ph := range phases {
+				if ph.String() == key {
+					inMatrix = true
+					break
+				}
+			}
+			inExported := contains(m[key], name)
+			if inMatrix != inExported {
+				t.Errorf("action %q: actionPhases says %v, but the exported matrix %s %q",
+					name, phases,
+					map[bool]string{true: "is missing from", false: "lists under"}[inMatrix],
+					key)
+			}
+			if inExported {
+				seen[name]++
+			}
+		}
+	}
+
+	// Every action appears at least once (an action listed under no phase
+	// could not have been checked above) and no more than once per phase --
+	// summed, the exported lists carry exactly one entry per (action, phase)
+	// pair in the engine's map.
+	total := 0
+	for _, list := range m {
+		total += len(list)
+		if !sort.StringsAreSorted(list) {
+			t.Errorf("PhaseActionMatrix list %v is not sorted", list)
+		}
+		for i := 1; i < len(list); i++ {
+			if list[i] == list[i-1] {
+				t.Errorf("PhaseActionMatrix lists %q twice under %v", list[i], list)
+			}
+		}
+	}
+	// Entries summed over the three phases must equal the (action, phase)
+	// pairs the engine's map holds: combined with the per-pair check above,
+	// this leaves no room for a gap or a duplicate anywhere.
+	wantTotal := 0
+	for _, phases := range actionPhases {
+		wantTotal += len(phases)
+	}
+	if total != wantTotal {
+		t.Errorf("PhaseActionMatrix carries %d entries; actionPhases holds %d (action, phase) pairs", total, wantTotal)
+	}
+	if len(seen) != len(actionPhases) {
+		t.Errorf("PhaseActionMatrix covers %d actions; actionPhases has %d", len(seen), len(actionPhases))
+	}
+}

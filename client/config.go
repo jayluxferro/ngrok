@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"net"
@@ -265,171 +266,16 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		config = &Configuration{AuthToken: content}
 	}
 
-	// set configuration defaults
-	if config.ServerAddr == "" {
-		config.ServerAddr = defaultServerAddr
-	}
-
-	if config.InspectAddr == "" {
-		config.InspectAddr = defaultInspectAddr
-	}
-
-	// Zero means "the key is absent", which is what a missing YAML key decodes
-	// to, and keeps the default. A negative value is a mistake in the file: it
-	// used to be clamped to the default in silence, so a typo (or a number past
-	// MaxInt64 that the decoder produced a negative for) configured something
-	// the operator never asked for and nothing ever said so. Both of these are
-	// limits -- one on how much body the inspector captures, one on how many
-	// proxied connections run at once -- and a limit that is not what the file
-	// says is exactly the kind of thing that is only noticed under load.
-	if config.InspectMaxBodySize < 0 {
-		return nil, fmt.Errorf("inspect_max_body_bytes must not be negative, got %d (omit the key to keep the default)", config.InspectMaxBodySize)
-	}
-	if config.InspectMaxBodySize == 0 {
-		config.InspectMaxBodySize = 1 * 1024 * 1024
-	}
-	if config.ProxyMaxConcurrent < 0 {
-		return nil, fmt.Errorf("proxy_max_concurrency must not be negative, got %d (omit the key to keep the default)", config.ProxyMaxConcurrent)
-	}
-	if config.ProxyMaxConcurrent == 0 {
-		config.ProxyMaxConcurrent = 64
-	}
-
+	// The http_proxy environment fallback runs before applyDefaultsAndValidate,
+	// out of the extracted body. This is order-invisible: no default touches
+	// HttpProxy and the fallback only fills the value when empty, so the
+	// extracted traversal observes the same document either way.
 	if config.HttpProxy == "" {
 		config.HttpProxy = os.Getenv("http_proxy")
 	}
 
-	// The vaults block is loaded before any tunnel is validated, so that
-	// policy validation -- which resolves secret("vault/key") references
-	// through the installed set -- sees exactly this configuration's vaults.
-	// The call is unconditional: a config without vaults installs the empty
-	// set, which both resets whatever a previous load in this process
-	// installed and makes an unresolvable reference the loud load error it
-	// must be rather than a stale hit.
-	if err = config.loadVaults(); err != nil {
+	if err = config.applyDefaultsAndValidate(true, true); err != nil {
 		return
-	}
-
-	// validate and normalize configuration
-	if config.InspectAddr != "disabled" {
-		if config.InspectAddr, err = normalizeAddress(config.InspectAddr, "inspect_addr"); err != nil {
-			return
-		}
-	}
-
-	if config.ServerAddr, err = normalizeAddress(config.ServerAddr, "server_addr"); err != nil {
-		return
-	}
-
-	if config.HttpProxy != "" {
-		var proxyUrl *url.URL
-		if proxyUrl, err = url.Parse(config.HttpProxy); err != nil {
-			return
-		} else {
-			if proxyUrl.Scheme != msg.ProtoHTTP && proxyUrl.Scheme != msg.ProtoHTTPS {
-				err = fmt.Errorf("Proxy url scheme must be 'http' or 'https', got %v", proxyUrl.Scheme)
-				return
-			}
-		}
-	}
-
-	if config.InspectAuth != "" && !strings.Contains(config.InspectAuth, ":") {
-		return nil, fmt.Errorf("inspect_auth must be formatted as username:password")
-	}
-	if config.InspectMaxBodySize > 64*1024*1024 {
-		return nil, fmt.Errorf("inspect_max_body_bytes too large (max 67108864)")
-	}
-
-	for name, t := range config.Tunnels {
-		if t == nil || t.Protocols == nil || len(t.Protocols) == 0 {
-			err = fmt.Errorf("Tunnel %s does not specify any protocols to tunnel.", name)
-			return
-		}
-		// Before the protocol loop, and for the CLI-synthesized tunnel further
-		// down: the endpoint rules -- binding, the internal namespace, forward_to,
-		// and hostname/subdomain versus port-routed protocols -- live in exactly
-		// one function, validateEndpointPolicy, so a config key and a command-line
-		// flag are refused for the same reasons in the same words.
-		if err = validateEndpointPolicy(name, t); err != nil {
-			return
-		}
-
-		for k, addr := range t.Protocols {
-			tunnelName := fmt.Sprintf("for tunnel %s[%s]", name, k)
-			if t.Protocols[k], err = normalizeAddress(addr, tunnelName); err != nil {
-				return
-			}
-
-			if err = validateProtocol(k, tunnelName); err != nil {
-				return
-			}
-		}
-
-		if err = validateRemotePort(name, t); err != nil {
-			return
-		}
-
-		if err = validateAgentTLS(name, t); err != nil {
-			return
-		}
-
-		if err = validateHeaderPolicy(name, t); err != nil {
-			return
-		}
-
-		// traffic_policy_file is resolved here, before validateTrafficPolicy,
-		// so the validation below polices one policy however it was sourced:
-		// a malformed document in the file produces the same loud load-time
-		// error an inline one does, naming the tunnel and the file.
-		if t.TrafficPolicyFile != "" {
-			if t.TrafficPolicy != nil {
-				err = fmt.Errorf("Tunnel %s: traffic_policy and traffic_policy_file are alternatives -- choose one, not both", name)
-				return
-			}
-			if t.TrafficPolicy, err = loadTrafficPolicyFile(t.TrafficPolicyFile); err != nil {
-				err = fmt.Errorf("Tunnel %s: %v", name, err)
-				return
-			}
-		}
-
-		if err = validateTrafficPolicy(name, t); err != nil {
-			return
-		}
-
-		// alpn is judged last on purpose: its h2 rules read the policy and the
-		// header settings the validators above have already normalized (see
-		// validateAlpn).
-		if err = validateAlpn(name, t); err != nil {
-			return
-		}
-
-		// upstream_protocol is judged after alpn on purpose: its one
-		// cross-key rule is the alpn combination, and judging second means the
-		// refusal fires only against an alpn list that is otherwise valid --
-		// an invalid list is alpn's refusal to give, about alpn.
-		if err = validateUpstreamProtocol(name, t); err != nil {
-			return
-		}
-
-		// use the name of the tunnel as the subdomain if none is specified.
-		// Port-routed protocols (tcp, udp) never take a name -- the server
-		// refuses hostname/subdomain on them because their url is the bound
-		// port -- so a tunnel whose every protocol is port-routed must not
-		// have its name turned into a subdomain it cannot register with.
-		// (tcp endpoints used to tolerate the ignored subdomain; udp's
-		// refusal is the honest spelling of the same rule, and skipping the
-		// assignment changes nothing a tcp tunnel ever saw. Mixed
-		// http+nameless-port tunnels keep the assignment: their http leg uses
-		// it and the tcp leg always ignored it.)
-		if t.Hostname == "" && t.Subdomain == "" && tunnelHasNameRoutedProto(t) {
-			// XXX: a crude heuristic, really we should be checking if the last part
-			// is a TLD
-			if len(strings.Split(name, ".")) > 1 {
-				t.Hostname = name
-			} else {
-				t.Subdomain = name
-			}
-		}
 	}
 
 	// override configuration with command-line options
@@ -609,6 +455,266 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 	}
 
 	return
+}
+
+// applyDefaultsAndValidate is LoadConfiguration's post-parse body: the
+// defaults and the whole validation traversal, in the order and with the
+// error strings LoadConfiguration has always used. It exists so that
+// ValidateConfigurationDoc can run the exact same traversal over a document
+// that arrived without a file behind it (SPEC-CLUSTER19 5) -- extraction, not
+// duplication, because a second copy of the rules is a second set of rules
+// free to disagree; the parity corpus in config_test.go is what keeps the
+// extraction honest.
+//
+// loadVaults gates installing the vaults block into package policy's
+// process-global set, and loadFileRefs gates reading operator-named files
+// (traffic_policy_file). LoadConfiguration passes (true, true); the workbench
+// path passes (false, false) and reads no file and touches no process-global
+// state.
+func (config *Configuration) applyDefaultsAndValidate(loadVaults, loadFileRefs bool) (err error) {
+	// set configuration defaults
+	if config.ServerAddr == "" {
+		config.ServerAddr = defaultServerAddr
+	}
+
+	if config.InspectAddr == "" {
+		config.InspectAddr = defaultInspectAddr
+	}
+
+	// Zero means "the key is absent", which is what a missing YAML key decodes
+	// to, and keeps the default. A negative value is a mistake in the file: it
+	// used to be clamped to the default in silence, so a typo (or a number past
+	// MaxInt64 that the decoder produced a negative for) configured something
+	// the operator never asked for and nothing ever said so. Both of these are
+	// limits -- one on how much body the inspector captures, one on how many
+	// proxied connections run at once -- and a limit that is not what the file
+	// says is exactly the kind of thing that is only noticed under load.
+	if config.InspectMaxBodySize < 0 {
+		return fmt.Errorf("inspect_max_body_bytes must not be negative, got %d (omit the key to keep the default)", config.InspectMaxBodySize)
+	}
+	if config.InspectMaxBodySize == 0 {
+		config.InspectMaxBodySize = 1 * 1024 * 1024
+	}
+	if config.ProxyMaxConcurrent < 0 {
+		return fmt.Errorf("proxy_max_concurrency must not be negative, got %d (omit the key to keep the default)", config.ProxyMaxConcurrent)
+	}
+	if config.ProxyMaxConcurrent == 0 {
+		config.ProxyMaxConcurrent = 64
+	}
+
+	// The vaults block is loaded before any tunnel is validated, so that
+	// policy validation -- which resolves secret("vault/key") references
+	// through the installed set -- sees exactly this configuration's vaults.
+	// The call is unconditional: a config without vaults installs the empty
+	// set, which both resets whatever a previous load in this process
+	// installed and makes an unresolvable reference the loud load error it
+	// must be rather than a stale hit.
+	//
+	// Gated on loadVaults: the workbench path (loadVaults=false, i.e.
+	// ValidateConfigurationDoc) never touches process-global vault state
+	// (SPEC-CLUSTER19 3). Mutating the process's installed set to answer a UI
+	// question would feed garbage to real tunnel registrations, and validating
+	// against it would answer a question about the agent's vaults with the
+	// server's set. Documents naming vaults are refused before this point
+	// (ValidateConfigurationDoc's raw scan); the gate is what keeps every other
+	// caller honest too.
+	if loadVaults {
+		if err = config.loadVaults(); err != nil {
+			return
+		}
+	}
+
+	// validate and normalize configuration
+	if config.InspectAddr != "disabled" {
+		if config.InspectAddr, err = normalizeAddress(config.InspectAddr, "inspect_addr"); err != nil {
+			return
+		}
+	}
+
+	if config.ServerAddr, err = normalizeAddress(config.ServerAddr, "server_addr"); err != nil {
+		return
+	}
+
+	if config.HttpProxy != "" {
+		var proxyUrl *url.URL
+		if proxyUrl, err = url.Parse(config.HttpProxy); err != nil {
+			return
+		} else {
+			if proxyUrl.Scheme != msg.ProtoHTTP && proxyUrl.Scheme != msg.ProtoHTTPS {
+				err = fmt.Errorf("Proxy url scheme must be 'http' or 'https', got %v", proxyUrl.Scheme)
+				return
+			}
+		}
+	}
+
+	if config.InspectAuth != "" && !strings.Contains(config.InspectAuth, ":") {
+		return fmt.Errorf("inspect_auth must be formatted as username:password")
+	}
+	if config.InspectMaxBodySize > 64*1024*1024 {
+		return fmt.Errorf("inspect_max_body_bytes too large (max 67108864)")
+	}
+
+	for name, t := range config.Tunnels {
+		if t == nil || t.Protocols == nil || len(t.Protocols) == 0 {
+			err = fmt.Errorf("Tunnel %s does not specify any protocols to tunnel.", name)
+			return
+		}
+		// Before the protocol loop, and for the CLI-synthesized tunnel further
+		// down: the endpoint rules -- binding, the internal namespace, forward_to,
+		// and hostname/subdomain versus port-routed protocols -- live in exactly
+		// one function, validateEndpointPolicy, so a config key and a command-line
+		// flag are refused for the same reasons in the same words.
+		if err = validateEndpointPolicy(name, t); err != nil {
+			return
+		}
+
+		for k, addr := range t.Protocols {
+			tunnelName := fmt.Sprintf("for tunnel %s[%s]", name, k)
+			if t.Protocols[k], err = normalizeAddress(addr, tunnelName); err != nil {
+				return
+			}
+
+			if err = validateProtocol(k, tunnelName); err != nil {
+				return
+			}
+		}
+
+		if err = validateRemotePort(name, t); err != nil {
+			return
+		}
+
+		if err = validateAgentTLS(name, t); err != nil {
+			return
+		}
+
+		if err = validateHeaderPolicy(name, t); err != nil {
+			return
+		}
+
+		// traffic_policy_file is resolved here, before validateTrafficPolicy,
+		// so the validation below polices one policy however it was sourced:
+		// a malformed document in the file produces the same loud load-time
+		// error an inline one does, naming the tunnel and the file.
+		//
+		// Gated on loadFileRefs: the workbench never reads operator-named
+		// paths (SPEC-CLUSTER19 5), so a document naming the key is refused,
+		// with the way out named, exactly where the file would have been
+		// opened. The mutual-exclusion check below is skipped with it -- the
+		// refusal is the whole behavior on this road.
+		if t.TrafficPolicyFile != "" {
+			if !loadFileRefs {
+				err = fmt.Errorf("Tunnel %s: traffic_policy_file cannot be resolved here -- inline the policy (traffic_policy) to validate it in the workbench", name)
+				return
+			}
+			if t.TrafficPolicy != nil {
+				err = fmt.Errorf("Tunnel %s: traffic_policy and traffic_policy_file are alternatives -- choose one, not both", name)
+				return
+			}
+			if t.TrafficPolicy, err = loadTrafficPolicyFile(t.TrafficPolicyFile); err != nil {
+				err = fmt.Errorf("Tunnel %s: %v", name, err)
+				return
+			}
+		}
+
+		if err = validateTrafficPolicy(name, t); err != nil {
+			return
+		}
+
+		// alpn is judged last on purpose: its h2 rules read the policy and the
+		// header settings the validators above have already normalized (see
+		// validateAlpn).
+		if err = validateAlpn(name, t); err != nil {
+			return
+		}
+
+		// upstream_protocol is judged after alpn on purpose: its one
+		// cross-key rule is the alpn combination, and judging second means the
+		// refusal fires only against an alpn list that is otherwise valid --
+		// an invalid list is alpn's refusal to give, about alpn.
+		if err = validateUpstreamProtocol(name, t); err != nil {
+			return
+		}
+
+		// use the name of the tunnel as the subdomain if none is specified.
+		// Port-routed protocols (tcp, udp) never take a name -- the server
+		// refuses hostname/subdomain on them because their url is the bound
+		// port -- so a tunnel whose every protocol is port-routed must not
+		// have its name turned into a subdomain it cannot register with.
+		// (tcp endpoints used to tolerate the ignored subdomain; udp's
+		// refusal is the honest spelling of the same rule, and skipping the
+		// assignment changes nothing a tcp tunnel ever saw. Mixed
+		// http+nameless-port tunnels keep the assignment: their http leg uses
+		// it and the tcp leg always ignored it.)
+		if t.Hostname == "" && t.Subdomain == "" && tunnelHasNameRoutedProto(t) {
+			// XXX: a crude heuristic, really we should be checking if the last part
+			// is a TLD
+			if len(strings.Split(name, ".")) > 1 {
+				t.Hostname = name
+			} else {
+				t.Subdomain = name
+			}
+		}
+	}
+
+	return nil
+}
+
+// ErrVaultRefused is the sentinel ValidateConfigurationDoc refuses a
+// vault-bearing document with. Vault resolution is process-global state
+// (policy.SetVaults): each process -- the agent, ngrokd -- installs and
+// resolves against its own configured set, and a validation that runs without
+// a process's set has none and will not guess. The sentinel lives here rather
+// than in any HTTP layer, so every caller inherits the refusal and can match
+// it with errors.Is to give it its own answer (the workbench's 422).
+var ErrVaultRefused = errors.New("vault references cannot be resolved here: vaults resolve against each process's own configured set, and this validation has none and will not guess -- remove the vaults block and secret() references to validate the rest of the document")
+
+// ValidateConfigurationDoc parses and validates a client configuration
+// document exactly as LoadConfiguration would, without reading files,
+// consulting the environment, or touching process-global vault state. It is
+// the workbench's validator (SPEC-CLUSTER19 5): the same traversal -- the very
+// applyDefaultsAndValidate LoadConfiguration runs -- over a document that
+// arrived as bytes, with the two things a file-backed load may do that a
+// workbench must not (loading vaults, resolving traffic_policy_file) gated
+// off.
+//
+// A document naming a top-level vaults: block or any secret("vault/key")
+// reference is refused with ErrVaultRefused before parsing. The scan runs over
+// the raw text on purpose: vault references can sit anywhere a policy can, and
+// a structural scan would have to re-implement the YAML grammar to be sure it
+// had seen every placement -- crude and fail-closed beats clever and
+// occasionally wrong (SPEC-CLUSTER19 3). A header value that merely contains
+// "secret(" is refused too, with the explanation.
+func ValidateConfigurationDoc(buf []byte) error {
+	// The raw scan runs before any parsing, so the refusal cannot be outrun by
+	// placement or nesting.
+	s := string(buf)
+	if strings.Contains(s, "secret(") {
+		return fmt.Errorf(`%w: the document contains a secret("vault/key") reference`, ErrVaultRefused)
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "vaults:") {
+			return fmt.Errorf("%w: the document contains a top-level vaults: block", ErrVaultRefused)
+		}
+	}
+
+	// deserialize/parse the document. The wording mirrors LoadConfiguration's
+	// parse step; there is no file to name.
+	config := new(Configuration)
+	if err := yaml.Unmarshal(buf, &config); err != nil {
+		return fmt.Errorf("Error parsing configuration document: %v", err)
+	}
+
+	// try to parse the old .ngrok format for backwards compatibility, exactly
+	// as LoadConfiguration does (same regexp, same place behind the parse).
+	content := strings.TrimSpace(s)
+	matched, err := regexp.MatchString("^[0-9a-zA-Z_\\-!]+$", content)
+	if err != nil {
+		return err
+	} else if matched {
+		config = &Configuration{AuthToken: content}
+	}
+
+	return config.applyDefaultsAndValidate(false, false)
 }
 
 func defaultPath() string {

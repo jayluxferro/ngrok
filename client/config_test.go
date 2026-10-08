@@ -1,7 +1,9 @@
 package client
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2109,5 +2111,407 @@ func TestDefaultTunnelUpstreamProtocolSynthesisRejectsBadValues(t *testing.T) {
 				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// Tests for ValidateConfigurationDoc and the applyDefaultsAndValidate
+// extraction behind it (SPEC-CLUSTER19 5). The organizing property is parity:
+// the workbench's validator and the agent's loader must answer every document
+// with the same verdict in the same words, because they are the same traversal
+// -- applyDefaultsAndValidate, called with (true, true) from LoadConfiguration
+// and (false, false) from ValidateConfigurationDoc. The corpus below is what
+// keeps the extraction honest: drift fails the build.
+
+// TestValidateConfigurationDocParityIsLoadConfiguration is the parity proof.
+// Every document in the corpus is bad-but-parseable, and each one goes down
+// both roads -- written to a file for LoadConfiguration, and handed as the
+// same bytes to ValidateConfigurationDoc -- with the two error strings
+// required to match byte-for-byte.
+//
+// The corpus deliberately holds only documents that fail VALIDATION. A
+// document that fails to parse gets the filename-prefixed parse error on the
+// loader road, and parse-error parity is not the claim: there is no filename
+// on the workbench road, so the prefixes differ and should.
+//
+// Every document is single-tunnel (or tunnel-free): both roads range over the
+// Tunnels map in random order, and a document with two refusals could name
+// either one first.
+func TestValidateConfigurationDocParityIsLoadConfiguration(t *testing.T) {
+	// The loader's http_proxy environment fallback is the one deliberate
+	// difference between the roads. Pin it out of the way so the corpus
+	// measures the document, not the machine the test ran on.
+	t.Setenv("http_proxy", "")
+
+	tests := []struct {
+		name string
+		doc  string
+	}{
+		{
+			name: "bad protocol",
+			doc: `
+tunnels:
+  web:
+    proto:
+      ftp: 127.0.0.1:8080
+`,
+		},
+		{
+			name: "negative inspect_max_body_bytes",
+			doc:  "inspect_max_body_bytes: -5\n",
+		},
+		{
+			name: "negative proxy_max_concurrency",
+			doc:  "proxy_max_concurrency: -2\n",
+		},
+		{
+			name: "oversize inspect_max_body_bytes",
+			doc:  "inspect_max_body_bytes: 134217728\n",
+		},
+		{
+			name: "inspect_auth without a colon",
+			doc:  "inspect_auth: no-colon-here\n",
+		},
+		{
+			name: "tunnel with no protocols",
+			doc: `
+tunnels:
+  web: {}
+`,
+		},
+		{
+			name: "unknown traffic policy action name",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    traffic_policy:
+      on_http_request:
+        - name: no-such-action
+`,
+		},
+		{
+			name: "alpn without agent_tls_termination",
+			doc: `
+tunnels:
+  web:
+    proto:
+      https: 127.0.0.1:7000
+    alpn:
+      - h2
+    compression: false
+`,
+		},
+		{
+			name: "upstream_protocol: h2 near-miss",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    upstream_protocol: h2
+`,
+		},
+		{
+			name: "remote_port on an http tunnel",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    remote_port: 8080
+`,
+		},
+		{
+			name: "hostname on a tcp tunnel",
+			doc: `
+tunnels:
+  web:
+    proto:
+      tcp: 127.0.0.1:22
+    hostname: example.com
+`,
+		},
+		{
+			name: "user-agent in request_header.add",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    request_header:
+      add:
+        - "User-Agent: not-a-real-client"
+`,
+		},
+		{
+			name: "forward_to on a tcp tunnel",
+			doc: `
+tunnels:
+  web:
+    proto:
+      tcp: 127.0.0.1:22
+    forward_to: https://svc.internal
+`,
+		},
+		{
+			name: "internal binding without an internal hostname",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    binding: internal
+    hostname: myapp.example.com
+`,
+		},
+		{
+			// The refusal names the shape before any file is read, so the
+			// paths need not exist -- through either road.
+			name: "tls block without agent_tls_termination",
+			doc: `
+tunnels:
+  web:
+    proto:
+      https: 127.0.0.1:7000
+    tls:
+      crt: /does/not/exist.pem
+      key: /does/not/exist.key
+`,
+		},
+		{
+			name: "wildcard in subdomain",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    subdomain: "*.example.com"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, tt.doc)
+
+			_, loadErr := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+			docErr := ValidateConfigurationDoc([]byte(tt.doc))
+
+			if loadErr == nil || docErr == nil {
+				t.Fatalf("expected both roads to refuse the document, got loader=%v validator=%v", loadErr, docErr)
+			}
+			if loadErr.Error() != docErr.Error() {
+				t.Fatalf("the two validators disagree:\nloader:    %s\nvalidator: %s", loadErr, docErr)
+			}
+		})
+	}
+
+	// The one valid document: both roads accept it.
+	valid := `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+`
+	configPath := writeConfig(t, valid)
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if err != nil || ValidateConfigurationDoc([]byte(valid)) != nil {
+		t.Fatalf("expected both roads to accept the valid document, got loader=(%+v, %v) validator=%v",
+			config, err, ValidateConfigurationDoc([]byte(valid)))
+	}
+}
+
+// TestValidateConfigurationDocVaultRefused pins the raw-text refusal
+// (SPEC-CLUSTER19 3): a document that names a vaults: block or a
+// secret("vault/key") reference is refused with ErrVaultRefused before
+// parsing, so the refusal cannot be outrun by placement or nesting. The scan
+// is deliberately crude -- a header value that merely contains "secret(" is
+// refused too -- because fail-closed with an explanation beats a clever parse
+// that might miss a spelling.
+func TestValidateConfigurationDocVaultRefused(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+	}{
+		{
+			name: "top-level vaults block",
+			doc: `
+vaults:
+  main:
+    source: env
+    prefix: NGROK_VAULT_MAIN_
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+`,
+		},
+		{
+			name: "secret reference inside a policy action",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    traffic_policy:
+      on_http_request:
+        - name: add-auth
+          config:
+            headers:
+              Authorization: secret("main/basic-auth")
+`,
+		},
+		{
+			// Indented under a tunnel, not at the top level: semantically an
+			// unknown key the decoder would silently drop, which is exactly
+			// why the refusal is a raw scan and not a struct check.
+			name: "nested vaults: block",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    vaults:
+      main:
+        source: env
+`,
+		},
+		{
+			name: "secret( merely contained in a header value",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    request_header:
+      add:
+        - "X-Note: secret(vault/key)"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateConfigurationDoc([]byte(tt.doc))
+			if err == nil {
+				t.Fatalf("expected %s to be refused", tt.name)
+			}
+			if !errors.Is(err, ErrVaultRefused) {
+				t.Fatalf("expected ErrVaultRefused, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "each process's own configured set") {
+				t.Fatalf("the refusal should explain why vaults cannot resolve here, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateConfigurationDocTrafficPolicyFileRefused pins the other
+// workbench gate: a document naming traffic_policy_file is refused with the
+// inline guidance, at the same place the loader would have opened the file.
+// The path below does not exist on purpose -- a read would announce itself as
+// the loader's missing-file error, so the error's wording is the proof that
+// no read happened.
+func TestValidateConfigurationDocTrafficPolicyFileRefused(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.yml")
+	doc := fmt.Sprintf(`
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    traffic_policy_file: %s
+`, missing)
+
+	err := ValidateConfigurationDoc([]byte(doc))
+	if err == nil {
+		t.Fatalf("expected traffic_policy_file to be refused in the workbench")
+	}
+	if !strings.Contains(err.Error(), "inline the policy") {
+		t.Fatalf("the refusal should say to inline the policy, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "web") {
+		t.Fatalf("the refusal should name the tunnel, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "Failed to read") {
+		t.Fatalf("the refusal must not be a file read -- the path does not exist, yet the error reads like one: %v", err)
+	}
+
+	// The contrast, deliberate: the same document through the loader road
+	// DOES read the file and fails with its missing-file error. The two roads
+	// disagree here by design, which is why this document is kept out of the
+	// parity corpus above.
+	_, loadErr := LoadConfiguration(&Options{config: writeConfig(t, doc), command: "start-all"})
+	if loadErr == nil || !strings.Contains(loadErr.Error(), "Failed to read") {
+		t.Fatalf("expected the loader to try the file and fail on the read, got: %v", loadErr)
+	}
+}
+
+// TestValidateConfigurationDocLegacyToken pins what the old single-token
+// .ngrok format does through the workbench validator -- which is NOT what
+// SPEC-CLUSTER19 5 says. The spec line ("the workbench runs it too -- a
+// token-only doc is valid") is contradicted by the loader's own reality: the
+// legacy branch sits behind the YAML parse in LoadConfiguration, and yaml.v3
+// refuses to decode a scalar document into the Configuration struct at all,
+// so a bare token has been a parse error on the loader road since the parser
+// swap. The validator mirrors the loader -- same regexp, same place behind
+// the parse -- rather than becoming the one road that accepts a document the
+// agent itself refuses; the workbench answering "valid" to a config the
+// loader then rejects would be the exact drift this extraction exists to
+// prevent. The spec line needs amending, not the code.
+func TestValidateConfigurationDocLegacyToken(t *testing.T) {
+	doc := "josh-token-abc123"
+
+	docErr := ValidateConfigurationDoc([]byte(doc))
+	if docErr == nil || !strings.Contains(docErr.Error(), "cannot unmarshal !!str") {
+		t.Fatalf("expected the yaml.v3 scalar refusal, got: %v", docErr)
+	}
+
+	configPath := writeConfig(t, doc)
+	_, loadErr := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if loadErr == nil {
+		t.Fatalf("expected the loader to refuse a bare token the same way, got none")
+	}
+	if !strings.Contains(loadErr.Error(), "cannot unmarshal !!str") {
+		t.Fatalf("expected the same yaml.v3 scalar refusal from the loader, got: %v", loadErr)
+	}
+	if !strings.Contains(loadErr.Error(), "Error parsing configuration file") {
+		t.Fatalf("expected the loader's parse-error prefix, got: %v", loadErr)
+	}
+}
+
+// TestLoadConfigurationDefaultsSurviveExtraction is the spot check against
+// the extraction's one real hazard: that the defaults get left behind in
+// LoadConfiguration. A document that says nothing about server_addr validates
+// on both roads, and the loader's returned configuration carries the defaults
+// the extracted method applied to it.
+func TestLoadConfigurationDefaultsSurviveExtraction(t *testing.T) {
+	doc := `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+`
+
+	if err := ValidateConfigurationDoc([]byte(doc)); err != nil {
+		t.Fatalf("expected the doc to validate, got: %v", err)
+	}
+
+	configPath := writeConfig(t, doc)
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if config.ServerAddr != defaultServerAddr {
+		t.Errorf("ServerAddr: expected the default %q, got %q", defaultServerAddr, config.ServerAddr)
+	}
+	if config.InspectAddr != defaultInspectAddr {
+		t.Errorf("InspectAddr: expected the default %q, got %q", defaultInspectAddr, config.InspectAddr)
+	}
+	if config.InspectMaxBodySize != 1*1024*1024 {
+		t.Errorf("InspectMaxBodySize: expected the default %d, got %d", int64(1*1024*1024), config.InspectMaxBodySize)
+	}
+	if config.ProxyMaxConcurrent != 64 {
+		t.Errorf("ProxyMaxConcurrent: expected the default 64, got %d", config.ProxyMaxConcurrent)
 	}
 }

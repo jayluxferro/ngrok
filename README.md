@@ -16,6 +16,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported
 - **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting
 - **QUIC agent transport** — the agent↔server multiplexed connection rides QUIC when enabled (no TCP head-of-line blocking across streams), with automatic smux fallback
+- **Admin web UI** — ngrokd's admin listener serves a dashboard with live metrics, the tunnel table and the event stream, plus a workbench that validates and renders agent configs and traffic policies against the same code that consumes them
 - **Endpoint pooling & compression** — share one public endpoint across agents; gzip response compression
 - **Web inspector & terminal UI** — inspect HTTP traffic in real time
 
@@ -654,14 +655,26 @@ Generate token digests with:
 ```
 
 Admin endpoints:
-- `/` dashboard (live metrics/tunnels/events)
+- `/` dashboard (live metrics/tunnels/events + the config workbench)
+- `/static/*` the dashboard's scripts and styles
 - `/healthz` health check
 - `/metrics` JSON counters
 - `/metrics/prometheus` Prometheus text format
 - `/recommendations` observed-traffic-based flag tuning suggestions
-- `/tunnels` per-tunnel stats
+- `/tunnels` per-tunnel stats, with the registration facts (owner, pooling, policy, claimed port)
 - `/events` SSE event stream
+- `/api/schema` the config key table + policy action matrix (what is legal where)
+- `/api/validate/config` validate an agent config YAML — the agent's own validators, same errors as at load
+- `/api/validate/policy` validate one traffic-policy document
+- `/api/render` canonicalize either document kind; the response is a download, nothing is written server-side
 - `/debug/pprof/*` if `-pprof` is enabled
+
+The workbench refuses documents naming vaults or `secret()` references
+(vaults resolve against each process's own configured set; a validation
+without one will not guess), never reads operator-named files, and keeps
+nothing — the editor is ephemeral by design. `/api/*` has its own rate
+budget at five times `-adminRate` so keystroke validation cannot exhaust
+the pages budget.
 
 ## Protocol
 

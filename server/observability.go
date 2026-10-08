@@ -15,6 +15,21 @@ type tunnelSnapshot struct {
 	TotalConnections  int64     `json:"total_connections"`
 	BytesIn           int64     `json:"bytes_in"`
 	BytesOut          int64     `json:"bytes_out"`
+
+	// The registration facts (SPEC-CLUSTER19 §7): what an operator debugging
+	// a live endpoint asks first -- who registered it, is it reachable only
+	// through forward_to, who terminates its TLS, what it forwards to, which
+	// fixed port it holds, whether it shares its url with other agents, and
+	// whether a traffic policy governs it. Filled once in onTunnelOpen, like
+	// the fields above: a registration does not change under a snapshot, so
+	// unlike the connection counters below these are never mutated again.
+	Owner          string `json:"owner"`
+	Internal       bool   `json:"internal"`
+	AgentTLS       bool   `json:"agent_tls"`
+	ForwardTo      string `json:"forward_to"`
+	ClaimedPort    int    `json:"claimed_port"`
+	Pooling        bool   `json:"pooling"`
+	PolicyAttached bool   `json:"policy_attached"`
 }
 
 type observabilityStore struct {
@@ -319,6 +334,14 @@ func (o *observabilityStore) onTunnelOpen(t *Tunnel) {
 		URL:       t.url,
 		Protocol:  t.req.Protocol,
 		StartedAt: time.Now().UTC(),
+
+		Owner:          t.owner,
+		Internal:       t.internal(),
+		AgentTLS:       t.agentTLS(),
+		ForwardTo:      t.forwardTo(),
+		ClaimedPort:    t.claimedPort,
+		Pooling:        t.req.Pooling,
+		PolicyAttached: t.policy != nil,
 	}
 	o.mu.Unlock()
 	o.events.publishTunnelOpen(t.url, t.req.Protocol)
