@@ -44,6 +44,7 @@ rounds with no feature spec — their record is the changelog.
 | [13-upstream-h2c.md](13-upstream-h2c.md) | Agent-side `upstream_protocol: http2` — h1↔h2c transcoder on the local leg | shipped | v1.0.18 |
 | [14-oidc-identity.md](14-oidc-identity.md) | `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | v1.0.17 | shipped |
 | [15-admin-web-ui.md](15-admin-web-ui.md) | ngrokd admin web UI: config workbench + observability SPA, `/api` validate/schema/render, snapshot enrichment | v1.0.19 | shipped |
+| [16-telegram-ops-bot.md](16-telegram-ops-bot.md) | `ngrok-bot`: read-only Telegram commands + event alerts over the admin API | v1.0.20 | draft |
 
 ## Not specced here
 
