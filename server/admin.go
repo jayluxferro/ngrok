@@ -160,8 +160,19 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 		// server-assets make target already packages. The wrapper has already
 		// set no-store and the CSP; the entry doc loads its scripts and
 		// styles from /static/.
+		//
+		// Asset, deliberately not MustAsset: the generated package's exact
+		// function set varies with the go-bindata build that made it (the
+		// Makefile bootstrap installs @latest), while Asset is the one name
+		// every generation has exported. A missing entry document is a build
+		// integrity failure, answered 500 -- not a panic in a handler.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(assets.MustAsset(dashboardIndexAsset))
+		doc, err := assets.Asset(dashboardIndexAsset)
+		if err != nil {
+			http.Error(w, "dashboard asset missing from this build: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(doc)
 	}))
 
 	// The SPA's scripts and styles (SPEC-CLUSTER19 §6): exactly the three
@@ -430,8 +441,15 @@ func serveDashboardStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	// See the "/" handler for Asset vs MustAsset: the stable name every
+	// go-bindata generation exports, and a missing file is a 500, not a panic.
+	body, err := assets.Asset(entry.asset)
+	if err != nil {
+		http.Error(w, "dashboard asset missing from this build: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", entry.mime)
-	_, _ = w.Write(assets.MustAsset(entry.asset))
+	_, _ = w.Write(body)
 }
 
 const loginHTML = `<!doctype html><html><head><meta charset="utf-8"><title>Admin Login</title>
