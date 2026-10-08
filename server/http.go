@@ -630,6 +630,12 @@ func routeHTTP(c conn.Conn, proto string) {
 	// We need to read from the replay conn from here on, since the head has
 	// already been taken off the stream and has to reach the agent with the
 	// rest of the request.
+	//
+	// headConn stays the conn the head was read FROM. The oidc action below
+	// re-splices the head (the verified identity in, any client-supplied
+	// identity out) and needs a fresh replay over the original stream: a
+	// replay conn already carrying the old head cannot be given a second one.
+	headConn := c
 	c = newReplayConn(c, head, rest)
 
 	// multiplex to find the right backend host
@@ -712,8 +718,243 @@ func routeHTTP(c conn.Conn, proto string) {
 		return
 	}
 
+	// The endpoint's oidc action is consumed HERE, pre-dispatch
+	// (SPEC-CLUSTER18), in the seam the legacy HttpAuth check and the connect
+	// verdict already own: after the tunnel is known, before a proxy
+	// connection is touched. The per-request hook layer is the wrong place for
+	// this one action -- hook enforcement burns a proxy connection per
+	// redirect (HandlePublicConnection pulls one before any policy runs), and
+	// the flow's callback needs routing-layer interception, which the
+	// rewriter cannot do -- so it is the only action with a verdict that
+	// survives a connection boundary.
+	//
+	// This branch runs exactly ONCE per public connection, and that is the
+	// granularity by design: routeHTTP parses the one head a connection leads
+	// with (for Host routing) and hands the joined stream to the tunnel, so
+	// the first request is the only one this code can ever see. Keep-alive
+	// and pipelined requests ride whatever the first request decided -- the
+	// same granularity Host routing and the legacy HttpAuth have. The hook
+	// the join installs still runs for the policy's OTHER request-phase
+	// actions; the oidc one is skipped there by construction (evalRequest has
+	// no case for it).
+	if s := pol.OIDC(); s != nil {
+		v := s.DecideHook(c)(oidcRequestFromHead(head, proto))
+		switch v.Kind {
+		case policy.OIDCDispatch:
+			// Authenticated: the head is replayed with the identity in it.
+			// The re-splice goes over headConn (not c) -- c's replay already
+			// carries the unauthenticated head -- and over rest, so the
+			// request's own body bytes stay queued behind the head.
+			spliced, ok := spliceIdentityHeaders(head, v.Headers)
+			if !ok {
+				// The verdict's lines are P's to shape and ours to put on the
+				// wire; one that is not a usable header line is a wiring bug,
+				// and a dispatch that cannot say who it authenticated is not
+				// a dispatch to fall back to.
+				c.Error("oidc: the verdict's identity headers are not usable header lines; refusing the dispatch")
+				return
+			}
+			c = newReplayConn(headConn, spliced, rest)
+		case policy.OIDCClose:
+			// The head was unusable; the reason is already on this conn's
+			// log (the hook logs it -- lg is this conn). The caller closes.
+			return
+		default:
+			// Redirect, 403 or 503: the connection is answered at the edge
+			// and ends with the response, as every synthetic answer does.
+			// No proxy connection is pulled for it, so an unauthenticated
+			// visit costs the pool nothing. The hook logged the why.
+			if v.Response == nil {
+				c.Error("oidc: verdict %v carries no response; closing rather than dispatching", v.Kind)
+				return
+			}
+			c.Info("oidc: the first request is answered with %s and no proxy connection is spent on it", v.Kind)
+			c.Write(v.Response.Render())
+			return
+		}
+	}
+
 	// let the tunnel handle the connection now
 	target.HandlePublicConnection(c, pol)
+}
+
+// oidcRequestFromHead lifts the fields the oidc action's contract names out
+// of a head the routing half already read. It parses no more of the head
+// than routing does -- the Host field, via hostFromHead -- plus the request
+// line's target and the Cookie fields, and it hands the result over in the
+// shapes the contract fixes: Host lower-cased with any port (the value the
+// tunnel was matched by), Path with its leading slash, Query without its
+// "?", Cookie the raw field value.
+//
+// The scheme is the listener's (proto), not a guess from the head: this
+// function only ever runs on connections this server terminated, so the
+// protocol it served the connection under IS the scheme the visitor used.
+func oidcRequestFromHead(head []byte, scheme string) policy.OIDCRequest {
+	method, path, query := requestTarget(head)
+	return policy.OIDCRequest{
+		Method: method,
+		Path:   path,
+		Query:  query,
+		Cookie: cookieHeader(head),
+		Scheme: scheme,
+		Host:   hostFromHead(head),
+	}
+}
+
+// requestTarget splits the request line's target into the path and query the
+// oidc flow needs, returning the method with them because the line is
+// already in hand. The request line is otherwise not parsed on this path
+// (hostFromHead records why -- routing reads the Host field), and that
+// narrowness is kept here: the target is read because the flow binds the
+// original URL and the callback lives on a path, nothing else.
+//
+// origin-form ("/x/y?a=b") is the shape a browser sends. absolute-form
+// ("GET http://svc/x HTTP/1.1", sent by proxies) is normalized to its path;
+// the authority it names is deliberately not consulted, because routing
+// happened by the Host field and the flow must describe the same request the
+// tunnel will serve. Anything else -- asterisk-form ("OPTIONS *"),
+// authority-form (CONNECT) -- has no path, and an empty Path is the
+// contract's unusable head: the action closes on it rather than guessing.
+func requestTarget(head []byte) (method, path, query string) {
+	line := head
+	if i := bytes.IndexByte(head, '\n'); i >= 0 {
+		line = head[:i]
+	}
+	fields := strings.Fields(string(line))
+	if len(fields) < 2 {
+		if len(fields) == 1 {
+			return fields[0], "", ""
+		}
+		return "", "", ""
+	}
+	method, target := fields[0], fields[1]
+
+	if !strings.HasPrefix(target, "/") {
+		if i := strings.Index(target, "://"); i >= 0 {
+			rest := target[i+3:]
+			if j := strings.Index(rest, "/"); j >= 0 {
+				target = rest[j:]
+			} else {
+				target = ""
+			}
+		}
+	}
+	if !strings.HasPrefix(target, "/") {
+		target = ""
+	}
+	path, query, _ = strings.Cut(target, "?")
+	return method, path, query
+}
+
+// cookieHeader returns the head's Cookie fields joined the way net/http's
+// parser would present them: one value, "; "-separated. A browser sends one
+// Cookie field, but nothing stops a client from sending several, and a
+// session cookie in the second is as good as one in the first -- reading
+// only the first would turn a valid session into a spurious redirect to the
+// provider. The agent still receives the fields verbatim (the splice below
+// is the only thing that edits a head, and it edits only identity fields);
+// only this decision reads the joined form.
+func cookieHeader(head []byte) string {
+	var parts []string
+	for _, line := range bytes.Split(head, []byte("\n")) {
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(string(line[:colon])), "Cookie") {
+			continue
+		}
+		parts = append(parts, strings.TrimSpace(string(bytes.TrimRight(line[colon+1:], "\r"))))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// spliceIdentityHeaders rebuilds a dispatched request head: the verdict's
+// identity lines go in ahead of the head's blank terminator, and every
+// client-supplied field with an injected name comes out.
+//
+// The removal is the half that matters. The injected fields are the identity
+// this connection authenticated with; a client that ALSO sent the same field
+// -- "X-Forwarded-User: admin", no cookie, plus a stolen session -- would
+// otherwise leave two of it on the wire, and an upstream reading the first
+// (or joining naively) reads the attacker's claim, not the token's. What
+// reaches the local service is exactly the identity the flow verified.
+//
+// Every other byte is preserved: lines are dropped and inserted whole, never
+// re-rendered, so the head the agent sees differs from the client's by
+// exactly the identity fields. The one resize risk this carries -- a head
+// within a few hundred bytes of the rewriter's own 64 KiB cap -- fails
+// closed there (the rewriter answers an over-cap head with 431), so the
+// splice never turns a parseable head into an unparsable one.
+//
+// ok=false means a verdict line is not a usable header field (no colon, or a
+// CR/LF hiding in it -- a head-splitting primitive); the caller refuses the
+// dispatch rather than ship it.
+func spliceIdentityHeaders(head []byte, headers []string) (spliced []byte, ok bool) {
+	names := make([]string, 0, len(headers))
+	for _, h := range headers {
+		name, _, hasColon := strings.Cut(h, ":")
+		if !hasColon || strings.TrimSpace(name) == "" || strings.ContainsAny(h, "\r\n") {
+			return nil, false
+		}
+		names = append(names, strings.TrimSpace(name))
+	}
+	strips := func(field []byte) bool {
+		colon := bytes.IndexByte(field, ':')
+		if colon <= 0 {
+			return false
+		}
+		name := strings.TrimSpace(string(field[:colon]))
+		for _, n := range names {
+			if strings.EqualFold(name, n) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The head ends with its blank terminator line -- "\r\n" or "\n",
+	// readRequestHead's guarantee -- so the fields end where that line
+	// begins. Lines are walked by hand rather than re-split and re-joined so
+	// that a head written with bare LFs leaves this function with bare LFs.
+	termStart := len(head) - 1
+	if len(head) >= 2 && head[len(head)-2] == '\r' {
+		termStart = len(head) - 2
+	}
+	body := head[:termStart]
+
+	out := make([]byte, 0, len(head)+256)
+	dropCont := false
+	for len(body) > 0 {
+		line := body
+		if i := bytes.IndexByte(body, '\n'); i >= 0 {
+			line = body[:i+1]
+			body = body[i+1:]
+		} else {
+			body = nil
+		}
+		trimmed := bytes.TrimRight(line, "\r\n")
+		if len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+			// obs-fold: a continuation of the field before it. It follows
+			// that field's fate -- RFC 7230 tells servers to refuse folds,
+			// headField reads the first line alone, and a continuation
+			// surviving a dropped field would be a line no field owns.
+			if !dropCont {
+				out = append(out, line...)
+			}
+			continue
+		}
+		dropCont = strips(trimmed)
+		if !dropCont {
+			out = append(out, line...)
+		}
+	}
+
+	for _, h := range headers {
+		out = append(out, h...)
+		out = append(out, '\r', '\n')
+	}
+	return append(out, head[termStart:]...), true
 }
 
 // respondPolicyDeny answers a connection the traffic policy refused. An HTTP

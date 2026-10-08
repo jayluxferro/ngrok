@@ -302,6 +302,25 @@ func NewTunnel(m *msg.ReqTunnel, ctl *Control) (t *Tunnel, err error) {
 			err = fmt.Errorf("invalid traffic policy: %w", err)
 			return
 		}
+		// An oidc action on an agent-terminated endpoint is the one
+		// enforcement this server cannot even attempt (SPEC-CLUSTER18): the
+		// public leg is TLS whose keys it does not hold, so there is no Host
+		// to route the callback by, no Cookie to read the session from, and
+		// no plaintext a 302 could be written onto. The hook-side enforcement
+		// the other request-phase actions get on zero-knowledge tunnels (the
+		// agent runs them where the plaintext lives) cannot rescue this one:
+		// the flow IS redirects and cookies, and it would have to run in the
+		// agent, which is a different cluster with its own secret storage.
+		// An endpoint that looks logged-in but lets everyone through is not a
+		// state this fork ships, so the registration fails before the url is
+		// claimed -- and the refusal names both facts, because the fix is
+		// "edge termination" and the operator has to be told which of the
+		// two settings to change.
+		if t.policy.OIDC() != nil && t.agentTLS() {
+			err = fmt.Errorf("%s: the oidc action cannot be enforced on an agent-terminated endpoint (TLSTermination: %s): over a zero-knowledge tunnel the server holds only ciphertext -- no Host, no Cookie, no plaintext to redirect -- so the login flow has nothing to run on; register the endpoint with server-side TLS termination instead (drop the agent-termination setting, which is not the default)",
+				endpointName(m), m.TLSTermination)
+			return
+		}
 	}
 
 	if err = t.register(); err != nil {
@@ -1038,7 +1057,7 @@ func (t *Tunnel) join(publicConn, proxyConn conn.Conn, pol *policy.Compiled) (by
 	}
 
 	toUpstream, fromUpstream := rewriter.NewConnPair(publicConn, proxyConn, &rewriter.Policy{
-		RequestHook: reqHook,
+		RequestHook:  reqHook,
 		ResponseHook: respHook,
 		// The one-line bridge to the webhook body buffering (SPEC 10 §3):
 		// when the compiled request phase contains a body-consuming action,

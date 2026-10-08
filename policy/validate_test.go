@@ -36,6 +36,10 @@ var minimalConfig = map[string]map[string]interface{}{
 	// fields. The secret is inline here; the vault round-trip is
 	// webhook_test.go's.
 	ActionWebhookVerification: {"provider": "stripe", "secrets": []interface{}{"probe"}},
+	// The oidc action (SPEC-CLUSTER18): its three required fields. Like
+	// jwks_uri, the issuer is only shape-checked here; nothing is fetched at
+	// compile, and the flow is oidc_test.go's.
+	ActionOIDC: {"issuer": "https://idp.example", "client_id": "probe", "client_secret": "probe"},
 }
 
 // TestPhaseActionsMatchesTheMatrix is the first half: the list the message

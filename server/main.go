@@ -8,6 +8,7 @@ import (
 	"ngrok/conn"
 	log "ngrok/log"
 	"ngrok/msg"
+	"ngrok/policy"
 	"ngrok/util"
 	"os"
 	"os/signal"
@@ -152,6 +153,20 @@ func tunnelListener(addr string, tlsConfig *tls.Config) *conn.Listener {
 	return listener
 }
 
+// installOIDCSessionKey installs the configured oidc_session_key, if the
+// operator set one (SPEC-CLUSTER18 4). An empty value is "not configured"
+// and is a no-op: the policy package then generates a random key at first
+// use and logs that itself, which is the zero-config default (sessions die
+// with the process). A configured key shorter than the package's floor is a
+// startup error naming the minimum -- a weak signing key is not something to
+// default into serving.
+func installOIDCSessionKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	return policy.SetOIDCSessionKey([]byte(key))
+}
+
 func Main() {
 	// parse options
 	opts = parseArgs()
@@ -162,6 +177,14 @@ func Main() {
 
 	// init logging
 	log.LogTo(opts.logto, opts.loglevel, opts.logformat)
+
+	// The oidc session key installs before any listener (and so before any
+	// tunnel registration): a key installed later would invalidate every
+	// flow and session cookie an endpoint had already minted under the
+	// generated one.
+	if err := installOIDCSessionKey(opts.oidcSessionKey); err != nil {
+		panic(err)
+	}
 
 	// seed random number generator
 	seed, err := util.RandomSeed()

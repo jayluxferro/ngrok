@@ -33,6 +33,20 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   go build -tags debug -o bin/ngrokd ./main/ngrokd
 fi
 
+# The ignore-tagged Go helpers (the h2c upstream, the fake IdP) are built to
+# binaries and run DIRECTLY, never via `go run`. A `go run` that becomes a
+# listening server puts the real listener one generation below this script:
+# the cleanup trap kills only direct children (`pkill -P $$`), so a killed
+# `go run` orphans its compiled child with the port still held. The 1.0.16
+# runs left exactly such an orphan on 19016, and the next run's h2 group
+# then passed against the STALE server rather than its own -- the fresh
+# `go run` died of EADDRINUSE into its log while the readiness probe found
+# the orphan's port open. A direct binary is a PID the trap can reach.
+HELPER_BIN="$TMPDIR/helpers"
+mkdir -p "$HELPER_BIN"
+go build -o "$HELPER_BIN/h2c_upstream" scripts/h2c_upstream.go
+go build -o "$HELPER_BIN/oidc_fake_idp" scripts/oidc_fake_idp.go
+
 echo "[e2e] starting local upstream app"
 cat > "$TMPDIR/app.py" <<'PY'
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -3377,13 +3391,31 @@ WH_CODE="$(policy_curl -o "$TMPDIR/wh-overcap.body" "${WH_HDRS[@]}" -H 'Host: wh
   -H 'Expect:' \
   --data-binary @"$TMPDIR/wh-big.bin" http://127.0.0.1:18085/hook)"
 if [[ "$WH_CODE" != "403" ]]; then
-  echo "[e2e] expected a declared CL over the 1 MiB cap to answer 403, got $WH_CODE"
-  exit 1
+  # curl can lose this one response to TCP mechanics, not to anything the
+  # server did: the edge answers the HEAD of a 1 MiB upload with the 403,
+  # drains, and closes -- and a close that lands while curl is still
+  # writing can RST away the 403 still unread in curl's receive buffer
+  # (observed once in three runs, under load; twice the same curl saw the
+  # 403 fine). The server's own log is the direct evidence of what was
+  # answered, so a 000 is accepted ONLY with both refusal lines in it.
+  if [[ "$WH_CODE" == "000" ]] && \
+     grep -q 'the request body could not be buffered; refusing' /tmp/ngrok-e2e-wh-ngrokd.log && \
+     grep -q 'refused with status 403' /tmp/ngrok-e2e-wh-ngrokd.log; then
+    echo "[e2e] wh 4 over-cap: curl lost the 403 to the upload/close race (000); the server log confirms the refusal"
+    WH_CODE=403
+  else
+    echo "[e2e] expected a declared CL over the 1 MiB cap to answer 403, got $WH_CODE"
+    exit 1
+  fi
 fi
 if ! grep -qF 'the request failed stripe signature verification' "$TMPDIR/wh-overcap.body"; then
-  echo "[e2e] the over-cap 403 is not the action's fixed stripe body:"
-  cat "$TMPDIR/wh-overcap.body"
-  exit 1
+  # In the 000 arm above the body never reached curl; the body check is
+  # the 403 arm's assertion (the fixed stripe refusal text).
+  if [[ -s "$TMPDIR/wh-overcap.body" ]]; then
+    echo "[e2e] the over-cap 403 is not the action's fixed stripe body:"
+    cat "$TMPDIR/wh-overcap.body"
+    exit 1
+  fi
 fi
 
 # A malformed signature header is the same 403 -- never a 400 that would tell
@@ -3548,8 +3580,9 @@ echo "[e2e] h2 1: the h2c upstream serves both protocols on one port"
 # prior-knowledge h2c must round-trip before anything points a tunnel at it,
 # because a helper that silently serves h1-only would turn every later h2
 # assertion into a confusing failure. The poll loop is long on purpose:
-# go run pays compile time on a cold cache before the port opens.
-go run scripts/h2c_upstream.go 127.0.0.1:19016 >/tmp/ngrok-e2e-h2c-upstream.log 2>&1 &
+# the helper is prebuilt at the top of this run, but a cold cache paid for
+# that build is paid before the port opens here.
+"$HELPER_BIN/h2c_upstream" 127.0.0.1:19016 >/tmp/ngrok-e2e-h2c-upstream.log 2>&1 &
 for i in {1..60}; do
   H2C_SELF="$(curl -sS --http2-prior-knowledge http://127.0.0.1:19016/ 2>/dev/null || true)"
   if [[ "$H2C_SELF" == "h2served proto=HTTP/2.0 xff=absent" ]]; then
@@ -3723,6 +3756,503 @@ H2_RESP="$(curl -fsS --http2 --cacert "$TMPDIR/zk-ca.crt" \
   --resolve h2flag:18446:127.0.0.1 -H 'Host: h2flag' https://h2flag:18446/)"
 if [[ "$H2_RESP" != "h2served proto=HTTP/2.0 xff=absent" ]]; then
   echo "[e2e] the flag-built alpn tunnel did not serve h2: got \"$H2_RESP\""
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# OIDC identity (SPEC-CLUSTER18). The first action whose verdict survives
+# three connections and two external round trips, so it is enforced
+# PRE-DISPATCH at the routing layer, not in the rewriter hook: an
+# unauthenticated visitor's proxy stream is never spent. This group drives
+# the complete authorization-code + PKCE loop through a real tunnel with
+# curl and a cookie jar -- visitor to edge (302 out), visitor to IdP (fake,
+# below), IdP's 302 back to the reserved callback path, the server's
+# backchannel token exchange, the session-minting 302 to the original URL,
+# and the dispatched request carrying the identity headers.
+#
+# The IdP is scripts/oidc_fake_idp.go (build-ignored Go, the h2c helper's
+# pattern): real RSA-signed ID tokens over the server's whole discovery ->
+# JWKS -> signature path, PKCE shape enforcement, single-use codes,
+# client_secret demanded, redirect_uri binding -- loose enough to be a
+# fixture, strict enough that a wiring which drops any field the flow is
+# load-bearing on fails the loop loudly. Its one user is alice.
+#
+# An EIGHTH ngrokd, for the standing reason (every group keeps the server it
+# was written against), and because this group's server carries a config the
+# others lack: oidc_session_key, the optional startup key that keeps
+# sessions valid across restarts -- setting it here proves the main.go
+# wiring end to end, and the unset default (random per process, one INFO
+# line) is the server unit suite's assertion, not this group's.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] starting the identity echo upstream (answers with the X-Forwarded-* identity headers it received)"
+cat > "$TMPDIR/oidc_upstream.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        def h(name):
+            v = self.headers.get(name)
+            return v if v else "absent"
+        resp = ("xfuser=%s xfemail=%s xflogin=%s" % (
+            h("X-Forwarded-User"), h("X-Forwarded-Email"),
+            h("X-Forwarded-Preferred-Username"))).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+    def log_message(self, *_): pass
+HTTPServer(("127.0.0.1", 19018), H).serve_forever()
+PY
+python3 "$TMPDIR/oidc_upstream.py" >/tmp/ngrok-e2e-oidc-app.log 2>&1 &
+
+echo "[e2e] starting the fake IdP (discovery, JWKS, authorize, token -- RSA-signed ID tokens)"
+"$HELPER_BIN/oidc_fake_idp" 127.0.0.1:27120 >/tmp/ngrok-e2e-oidc-idp.log 2>&1 &
+for i in {1..40}; do
+  if curl -fsS -o /dev/null http://127.0.0.1:27120/.well-known/openid-configuration 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! curl -fsS -o /dev/null http://127.0.0.1:27120/.well-known/openid-configuration 2>/dev/null; then
+  echo "[e2e] the fake IdP never came up"
+  tail -n 20 /tmp/ngrok-e2e-oidc-idp.log || true
+  exit 1
+fi
+
+echo "[e2e] starting the oidc ngrokd (eighth server, oidc_session_key in the config)"
+# Two things about this server's shape, both load-bearing for the loop:
+#
+# - oidc_session_key is spelled in the config so the startup wiring under
+#   test is the REAL one: a short key here would fail the server's own
+#   startup check, a missing one would exercise the random default instead
+#   of the install path.
+# - The http listener is on 18086, a port no other group in this file uses
+#   (the quic group owns 18081; grep before picking -- there is no port
+#   allocator, and the first oidc draft collided exactly this way),
+#   with the loop's legs driven there under a "Host: <tunnel>" override
+#   (the wait_for_public_at dialect). This group was first written around
+#   port 80 -- the scheme's default, so curl omits it from Host and -L
+#   walks the whole dance unattended -- but that needs an unprivileged
+#   bind below 1024, which macOS denies outright (EPERM, measured; the
+#   "allowed since 10.14" note the draft carried was wrong), and the
+#   registry strips only default ports from a Host (1.0.14), so a bare
+#   high port would not route at all. The override puts the bare name back
+#   on every request; the legs run explicitly instead of via -L. Nothing
+#   the dance exists to prove is lost: three real connections, two real
+#   round trips to the IdP, real cookies in curl's jar (which keys on the
+#   URL host -- 127.0.0.1 for every tunnel leg -- so its scoping holds),
+#   and every redirect asserted verbatim rather than followed blindly.
+cat > "$TMPDIR/ngrokd-oidc.yml" <<'YAML'
+oidc_session_key: e2e-oidc-session-key-0123456789abcdef
+YAML
+./bin/ngrokd -config="$TMPDIR/ngrokd-oidc.yml" -domain=localhost \
+  -httpAddr=127.0.0.1:18086 \
+  -tunnelAddr=127.0.0.1:14451 -adminAddr=127.0.0.1:19097 \
+  >/tmp/ngrok-e2e-oidc-ngrokd.log 2>&1 &
+for i in {1..40}; do
+  if grep -q "Listening for public http connections" /tmp/ngrok-e2e-oidc-ngrokd.log 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for public http connections" /tmp/ngrok-e2e-oidc-ngrokd.log 2>/dev/null; then
+  echo "[e2e] the oidc ngrokd never came up"
+  tail -n 40 /tmp/ngrok-e2e-oidc-ngrokd.log || true
+  exit 1
+fi
+
+echo "[e2e] starting the oidc tunnels (oidce2e, oidccomp; the zk one starts per-scenario)"
+# oidce2e is the plain loop; oidccomp stacks basic-auth BEHIND oidc to pin
+# the compose property: the pre-dispatch action admits, then the hook's
+# actions run in document order on the authenticated connection.
+cat > "$TMPDIR/ngrok-oidc.yml" <<'YAML'
+server_addr: 127.0.0.1:14451
+trust_host_root_certs: true
+tunnels:
+  oidce2e:
+    hostname: oidce2e
+    proto: {http: 19018}
+    traffic_policy:
+      on_http_request:
+        - name: oidc
+          config:
+            issuer: http://127.0.0.1:27120
+            client_id: cid-e2e
+            client_secret: e2e-fake-client-secret
+            scopes: [openid, email]
+            callback_path: /oauth2/callback
+            session_duration_seconds: 3600
+  oidccomp:
+    hostname: oidccomp
+    proto: {http: 19018}
+    traffic_policy:
+      on_http_request:
+        - name: oidc
+          config:
+            issuer: http://127.0.0.1:27120
+            client_id: cid-e2e
+            client_secret: e2e-fake-client-secret
+            scopes: [openid, email]
+            callback_path: /oauth2/callback
+            session_duration_seconds: 3600
+        - name: basic-auth
+          config:
+            realm: compose
+            credentials:
+              - testuser:testpass
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-oidc.yml" -log=/tmp/ngrok-e2e-oidc-client.log \
+  start oidce2e oidccomp >/tmp/ngrok-e2e-oidc-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-oidc-client.log "oidce2e (the oidc loop tunnel)"
+wait_for_tunnel /tmp/ngrok-e2e-oidc-client.log "oidccomp (the oidc+basic-auth compose tunnel)"
+wait_for_public_at 18086 oidce2e
+wait_for_public_at 18086 oidccomp
+
+# oidc_login <tunnel> <jar> <body-out>: walk the complete authorization-code
+# + PKCE loop against <tunnel> as a browser would, one explicit curl per leg,
+# banking the minted session cookie into <jar> and the first dispatched
+# response into <body-out>. Leg by leg: the cookieless visit (302 to the
+# IdP, flow cookie set), the IdP hop (its 302 back carrying the code and
+# state), the callback (the server's backchannel exchange, the minting 302
+# to the original URL, session cookie set, flow cookie retired), and the
+# admitted visit. The redirects are NOT followed blindly: each leg asserts
+# its own status, and the IdP's redirect is checked to point home before it
+# is mapped onto this server's port -- the browser equivalent of what a
+# port-80 --resolve would have done (see the group's header comment).
+oidc_login() {
+  # Trailing args, when given, ride the final admitted visit only (the
+  # dance's legs never need them): scenario 5's compose tunnel runs
+  # basic-auth AFTER oidc admits, so its login passes -u here -- a bare
+  # final visit would correctly answer the 401 that scenario then asserts
+  # on its own bare curl.
+  local tunnel="$1" jar="$2" body_out="$3"; shift 3
+  local -a final_args=("$@")
+  local hdrs loc cb_path mint
+  rm -f "$jar"
+  hdrs="$(curl -sS -o /dev/null -D - -c "$jar" -H "Host: $tunnel" http://127.0.0.1:18086/)" || return 1
+  echo "$hdrs" | grep -qi '^HTTP.* 302' || {
+    echo "[e2e] $tunnel: a cookieless visitor was not redirected to the IdP:"; echo "$hdrs"; return 1; }
+  loc="$(echo "$hdrs" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
+
+  # The IdP hop carries no cookies: a browser sends none to a different
+  # origin, and the jar -- host-keyed for 127.0.0.1, where the IdP also
+  # lives -- must not leak the flow cookie to it.
+  hdrs="$(curl -sS -o /dev/null -D - "$loc")" || return 1
+  echo "$hdrs" | grep -qi '^HTTP.* 302' || {
+    echo "[e2e] $tunnel: the IdP did not send the visitor back with a code:"; echo "$hdrs"; return 1; }
+  loc="$(echo "$hdrs" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
+  [[ "$loc" == http://$tunnel/* ]] || {
+    echo "[e2e] $tunnel: the IdP's redirect does not point back at the tunnel: $loc"; return 1; }
+  cb_path="${loc#http://$tunnel}"
+
+  hdrs="$(curl -sS -o /dev/null -D - -b "$jar" -c "$jar" -H "Host: $tunnel" "http://127.0.0.1:18086$cb_path")" || return 1
+  echo "$hdrs" | grep -qi '^HTTP.* 302' || {
+    echo "[e2e] $tunnel: the callback did not answer with the minting redirect:"; echo "$hdrs"; return 1; }
+  mint="$(echo "$hdrs" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
+  [[ "$mint" == "http://$tunnel/" ]] || {
+    echo "[e2e] $tunnel: the minting redirect does not return the visitor to where they started: $mint"; return 1; }
+  grep -q 'ngrok_oidc_session' "$jar" || {
+    echo "[e2e] $tunnel: no session cookie was minted:"; cat "$jar"; return 1; }
+
+  curl -fsS -b "$jar" ${final_args[@]+"${final_args[@]}"} -H "Host: $tunnel" http://127.0.0.1:18086/ > "$body_out" || return 1
+}
+
+echo "[e2e] oidc 1: a visitor with no session is redirected to the IdP, not dispatched"
+# The whole first half of the flow in one response: the 302 to the
+# authorization endpoint (PKCE challenge and state in the query), the flow
+# cookie scoped to the callback path, and no-store so no intermediary ever
+# answers for the dance. The upstream must not have been asked anything --
+# which the body being a redirect, not the identity echo, stands in for.
+OIDC_HDRS="$(curl -sS -o /dev/null -D - \
+  -H 'Host: oidce2e' http://127.0.0.1:18086/ 2>&1)"
+echo "$OIDC_HDRS" | grep -qi '^HTTP.* 302' || {
+  echo "[e2e] a cookieless visitor was not redirected:"; echo "$OIDC_HDRS"; exit 1; }
+echo "$OIDC_HDRS" | grep -qi "^location: http://127.0.0.1:27120/authorize" || {
+  echo "[e2e] the redirect does not go to the IdP's authorize endpoint:"; echo "$OIDC_HDRS"; exit 1; }
+OIDC_LOC="$(echo "$OIDC_HDRS" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
+python3 -c "
+from urllib.parse import urlparse, parse_qs
+import sys
+q = parse_qs(urlparse('$OIDC_LOC').query)
+for f in ('client_id', 'redirect_uri', 'state', 'nonce', 'code_challenge', 'code_challenge_method'):
+    assert f in q, 'the authorize redirect lacks %s: %s' % (f, '$OIDC_LOC')
+assert q['client_id'] == ['cid-e2e'], q['client_id']
+assert q['code_challenge_method'] == ['S256'], q['code_challenge_method']
+assert q['redirect_uri'] == ['http://oidce2e/oauth2/callback'], q['redirect_uri']
+" || exit 1
+echo "$OIDC_HDRS" | grep -qi '^set-cookie: ngrok_oidc_flow=' || {
+  echo "[e2e] no flow cookie was set:"; echo "$OIDC_HDRS"; exit 1; }
+echo "$OIDC_HDRS" | grep -qi '^cache-control: no-store' || {
+  echo "[e2e] the redirect is cacheable:"; echo "$OIDC_HDRS"; exit 1; }
+
+echo "[e2e] oidc 2: the complete three-connection loop mints a session and forwards the identity"
+# oidc_login walks the dance leg by leg (tunnel 302 -> IdP authorize and its
+# 302 back -> the callback's exchange and minting redirect -> the upstream),
+# and the jar keeps the flow cookie (callback-path scoped) and the session
+# cookie (path /) straight the way a browser would: both bank on the URL
+# host 127.0.0.1, so curl's scoping is doing real work on every leg.
+oidc_login oidce2e "$TMPDIR/oidc-jar.txt" "$TMPDIR/oidc-body.txt" || exit 1
+OIDC_BODY="$(cat "$TMPDIR/oidc-body.txt")"
+if [[ "$OIDC_BODY" != "xfuser=alice-1234 xfemail=alice@example.com xflogin=alice" ]]; then
+  echo "[e2e] the full loop did not end in an authenticated dispatch with identity headers: got \"$OIDC_BODY\""
+  exit 1
+fi
+
+echo "[e2e] oidc 3: an established session rides -- no IdP, no flow, a direct dispatch"
+OIDC_BODY="$(curl -fsS -b "$TMPDIR/oidc-jar.txt" \
+  -H 'Host: oidce2e' http://127.0.0.1:18086/)"
+if [[ "$OIDC_BODY" != "xfuser=alice-1234 xfemail=alice@example.com xflogin=alice" ]]; then
+  echo "[e2e] the session cookie did not ride a fresh connection: got \"$OIDC_BODY\""
+  exit 1
+fi
+
+echo "[e2e] oidc 4: a tampered session cookie starts a new flow, never a dispatch"
+# A session cookie that fails its MAC is indistinguishable from a stale one
+# (the operator rotated oidc_session_key, say), so the flow treats it as NO
+# session: a 302 back to the provider, who sorts the visitor out. That is
+# deliberate, and it is access-safe the same way the 403 is -- the identity
+# the cookie claims is not believed, nothing is dispatched, the upstream
+# never hears of it (the second curl). The 403 belongs to the DANCE's
+# failures (state tamper, nonce mismatch, token exchange), where re-running
+# the flow would not help.
+sed 's/\(ngrok_oidc_session[[:space:]]*\)\(.\)/\1X/' "$TMPDIR/oidc-jar.txt" > "$TMPDIR/oidc-jar-bad.txt"
+OIDC_HDRS="$(curl -sS -o /dev/null -D - -b "$TMPDIR/oidc-jar-bad.txt" \
+  -H 'Host: oidce2e' http://127.0.0.1:18086/)"
+echo "$OIDC_HDRS" | grep -qi '^HTTP.* 302' || {
+  echo "[e2e] a forged session answered something other than the new-flow redirect:"; echo "$OIDC_HDRS"; exit 1; }
+echo "$OIDC_HDRS" | grep -qi "^location: http://127.0.0.1:27120/authorize" || {
+  echo "[e2e] the forged session's redirect does not go to the IdP:"; echo "$OIDC_HDRS"; exit 1; }
+OIDC_BODY="$(curl -sS -b "$TMPDIR/oidc-jar-bad.txt" \
+  -H 'Host: oidce2e' http://127.0.0.1:18086/)"
+if [[ "$OIDC_BODY" == *xfuser=* ]]; then
+  echo "[e2e] a forged session reached the upstream: \"$OIDC_BODY\""
+  exit 1
+fi
+
+echo "[e2e] oidc 5: the compose tunnel runs basic-auth AFTER oidc admits"
+# Same loop once against oidccomp to bank a session there, then: no basic
+# credentials -> the hook's 401 (oidc admitted, basic-auth refused); with
+# credentials -> the identity echo. The login itself carries the
+# credentials on its final leg (see oidc_login) -- without them that visit
+# is the 401 this scenario asserts next. Pre-dispatch ordering means an
+# UNAUTHENTICATED visitor never sees the 401 (oidc's 302 comes first) --
+# asserted here too, one curl, no jar.
+oidc_login oidccomp "$TMPDIR/oidc-jar2.txt" "$TMPDIR/oidc-body2.txt" -u testuser:testpass || exit 1
+OIDC_HDRS="$(curl -sS -o /dev/null -D - -b "$TMPDIR/oidc-jar2.txt" \
+  -H 'Host: oidccomp' http://127.0.0.1:18086/ 2>&1)"
+echo "$OIDC_HDRS" | grep -qi '^HTTP.* 401' || {
+  echo "[e2e] an authenticated visitor without basic credentials was not asked for them:"; echo "$OIDC_HDRS"; exit 1; }
+echo "$OIDC_HDRS" | grep -qi '^www-authenticate: basic realm="compose"' || {
+  echo "[e2e] the 401 lacks the configured challenge:"; echo "$OIDC_HDRS"; exit 1; }
+OIDC_HDRS="$(curl -sS -o /dev/null -D - -u testuser:testpass -b "$TMPDIR/oidc-jar2.txt" \
+  -H 'Host: oidccomp' http://127.0.0.1:18086/ 2>&1)"
+echo "$OIDC_HDRS" | grep -qi '^HTTP.* 200' || {
+  echo "[e2e] session + basic credentials did not pass both actions:"; echo "$OIDC_HDRS"; exit 1; }
+OIDC_HDRS="$(curl -sS -o /dev/null -D - \
+  -H 'Host: oidccomp' http://127.0.0.1:18086/ 2>&1)"
+echo "$OIDC_HDRS" | grep -qi '^HTTP.* 302' || {
+  echo "[e2e] an unauthenticated visitor saw basic-auth's 401 instead of oidc's redirect (pre-dispatch ordering):"; echo "$OIDC_HDRS"; exit 1; }
+
+echo "[e2e] oidc 6: a zero-knowledge tunnel cannot carry oidc -- refused at registration"
+# The server holds only ciphertext on these tunnels: no Host, no cookie,
+# nothing to 302 from -- an endpoint that looked protected and could not be
+# is refused before the URL is claimed, naming both facts (the action and
+# the termination mode; the exact wording is the server workstream's, so
+# this asserts both words appear, not their sentence).
+cat > "$TMPDIR/ngrok-oidc-zk.yml" <<'YAML'
+server_addr: 127.0.0.1:14451
+trust_host_root_certs: true
+tunnels:
+  oidczk:
+    hostname: oidczk
+    proto: {https: 19018}
+    agent_tls_termination: true
+    traffic_policy:
+      on_http_request:
+        - name: oidc
+          config:
+            issuer: http://127.0.0.1:27120
+            client_id: cid-e2e
+            client_secret: e2e-fake-client-secret
+            scopes: [openid, email]
+            session_duration_seconds: 3600
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-oidc-zk.yml" -log=/tmp/ngrok-e2e-oidc-zk-client.log \
+  start oidczk >/tmp/ngrok-e2e-oidc-zk-stdout.log 2>&1 &
+sleep 3
+if ! grep -qi 'oidc' /tmp/ngrok-e2e-oidc-zk-client.log; then
+  echo "[e2e] the zk+oidc registration was not refused (or not named):"
+  tail -n 20 /tmp/ngrok-e2e-oidc-zk-client.log
+  exit 1
+fi
+if ! grep -qiE 'agent.tls|zero.knowledge|agent.terminated' /tmp/ngrok-e2e-oidc-zk-client.log; then
+  echo "[e2e] the refusal does not name the termination mode:"
+  tail -n 20 /tmp/ngrok-e2e-oidc-zk-client.log
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Agent-side h2c transcoding (SPEC-CLUSTER17). The mirror of the h2 group:
+# there the VISITOR speaks h2 and the local service must too (raw
+# passthrough, nothing injected); here the visitor speaks h1 -- the leg
+# where the rewriter, policy hooks, XFF and compression live -- and the
+# LOCAL service speaks h2c, through a transcoder on the agent's local dial.
+# The whole two-cluster story is two assertion strings:
+#   h2 group:  h2served proto=HTTP/2.0 xff=absent   (h2 visitor, raw)
+#   this group: h2served proto=HTTP/2.0 xff=present  (h1 visitor, transcoded)
+# The upstream the local leg speaks is REAL h2 either way; what differs is
+# whether a byte of the visitor's protocol survived to it.
+#
+# No new server: the feature is agent-local (the server never learns
+# upstream_protocol), so this group registers against the webhook group's
+# ngrokd exactly as the h2 group does, and reuses the same h2c helper
+# (scripts/h2c_upstream.go) on a fresh port -- one upstream serving both
+# protocols is the fixture's whole design.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] starting the transcode upstream (h2c helper on a fresh port)"
+"$HELPER_BIN/h2c_upstream" 127.0.0.1:19019 >/tmp/ngrok-e2e-up-h2c.log 2>&1 &
+sleep 1
+
+echo "[e2e] starting the upstream_protocol tunnels (uph2, uph1)"
+# uph2 transcodes; uph1 is the spelled-out default on the same upstream --
+# the control that proves the transcoder changes only what it is told to.
+cat > "$TMPDIR/ngrok-upstream.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  uph2:
+    hostname: uph2
+    proto: {http: 19019}
+    upstream_protocol: http2
+  uph1:
+    hostname: uph1
+    proto: {http: 19019}
+    upstream_protocol: http1
+  upauth:
+    hostname: upauth
+    proto: {http: 19019}
+    upstream_protocol: http2
+    traffic_policy:
+      on_http_request:
+        - name: basic-auth
+          config:
+            realm: transcode
+            credentials:
+              - upuser:uppass
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-upstream.yml" -log=/tmp/ngrok-e2e-up-client.log \
+  start uph2 uph1 upauth >/tmp/ngrok-e2e-up-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-up-client.log "upstream_protocol group (3 tunnels)"
+wait_for_public_at 18085 uph2
+wait_for_public_at 18085 uph1
+wait_for_public_at 18085 upauth
+
+echo "[e2e] up 1: an h1 visitor is transcoded to h2c with the controls intact"
+# THE assertion of the cluster, in the upstream's own vocabulary: the request
+# arrived as real h2 (proto=HTTP/2.0) AND the rewriter's XFF injection
+# survived the crossing (xff=present) -- the controls run on the leg the
+# transcoder keeps h1, which is the entire design.
+UP_RESP="$(curl -fsS -H 'Host: uph2' http://127.0.0.1:18085/)"
+if [[ "$UP_RESP" != "h2served proto=HTTP/2.0 xff=present" ]]; then
+  echo "[e2e] the transcoded request did not arrive as h2 with XFF: got \"$UP_RESP\""
+  exit 1
+fi
+
+echo "[e2e] up 2: the same upstream through the default tunnel stays h1"
+UP_RESP="$(curl -fsS -H 'Host: uph1' http://127.0.0.1:18085/)"
+if [[ "$UP_RESP" != "h2served proto=HTTP/1.1 xff=present" ]]; then
+  echo "[e2e] the spelled-out default did not keep today's h1 dial: got \"$UP_RESP\""
+  exit 1
+fi
+
+echo "[e2e] up 3: a policy still enforces through the transcode path"
+# basic-auth runs in the hook on the h1 leg; the transcoder is downstream of
+# it. No credentials -> the 401 with the configured challenge; with -> the
+# transcoded identity of the request (the same h2 body as up 1).
+UP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: upauth' http://127.0.0.1:18085/)"
+if [[ "$UP_CODE" != "401" ]]; then
+  echo "[e2e] basic-auth was not enforced through the transcode path: got $UP_CODE"
+  exit 1
+fi
+UP_RESP="$(curl -fsS -u upuser:uppass -H 'Host: upauth' http://127.0.0.1:18085/)"
+if [[ "$UP_RESP" != "h2served proto=HTTP/2.0 xff=present" ]]; then
+  echo "[e2e] authenticated + transcoded did not serve h2 with XFF: got \"$UP_RESP\""
+  exit 1
+fi
+
+echo "[e2e] up 4: the matrix refuses upstream_protocol on a tcp tunnel"
+cat > "$TMPDIR/ngrok-up-bad1.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  uptcp:
+    proto: {tcp: 19019}
+    remote_port: 19261
+    upstream_protocol: http2
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-up-bad1.yml" -log=/tmp/ngrok-e2e-up-bad1.log \
+  start uptcp >"$TMPDIR/ngrok-up-bad1.out" 2>&1; then
+  echo "[e2e] the client accepted upstream_protocol on a port-routed tunnel:"
+  cat "$TMPDIR/ngrok-up-bad1.out"
+  exit 1
+fi
+if ! grep -q 'upstream_protocol' "$TMPDIR/ngrok-up-bad1.out"; then
+  echo "[e2e] the refusal does not name the key:"
+  cat "$TMPDIR/ngrok-up-bad1.out"
+  exit 1
+fi
+
+echo "[e2e] up 5: the matrix refuses upstream_protocol combined with alpn h2"
+# The two h2 stories own the local leg incompatibly (raw passthrough vs
+# transcoder); the refusal says so. The alpn side of the config is otherwise
+# complete (zk + compression off) so the ONLY rule firing is the combination.
+cat > "$TMPDIR/ngrok-up-bad2.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  upboth:
+    proto: {https: 19019}
+    hostname: upboth
+    agent_tls_termination: true
+    alpn: ["h2"]
+    compression: false
+    upstream_protocol: http2
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-up-bad2.yml" -log=/tmp/ngrok-e2e-up-bad2.log \
+  start upboth >"$TMPDIR/ngrok-up-bad2.out" 2>&1; then
+  echo "[e2e] the client accepted both h2 stories on one tunnel:"
+  cat "$TMPDIR/ngrok-up-bad2.out"
+  exit 1
+fi
+if ! grep -q 'alpn' "$TMPDIR/ngrok-up-bad2.out" || ! grep -q 'upstream_protocol' "$TMPDIR/ngrok-up-bad2.out"; then
+  echo "[e2e] the refusal does not name both tools:"
+  cat "$TMPDIR/ngrok-up-bad2.out"
+  exit 1
+fi
+
+echo "[e2e] up 6: the matrix refuses upstream_protocol on a forwarding endpoint"
+cat > "$TMPDIR/ngrok-up-bad3.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  upfwd:
+    proto: {http: 19019}
+    hostname: upfwd
+    forward_to: http://target.internal
+    upstream_protocol: http2
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-up-bad3.yml" -log=/tmp/ngrok-e2e-up-bad3.log \
+  start upfwd >"$TMPDIR/ngrok-up-bad3.out" 2>&1; then
+  echo "[e2e] the client accepted upstream_protocol on a tunnel that never dials:"
+  cat "$TMPDIR/ngrok-up-bad3.out"
+  exit 1
+fi
+if ! grep -q 'forward_to' "$TMPDIR/ngrok-up-bad3.out"; then
+  echo "[e2e] the refusal does not name forward_to:"
+  cat "$TMPDIR/ngrok-up-bad3.out"
   exit 1
 fi
 

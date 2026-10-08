@@ -96,6 +96,15 @@ const (
 	// vaults existed -- closed here, beside the fields that joined it in
 	// needing it.
 	httpAuthFieldName = `"HttpAuth"`
+
+	// oidcSecretFieldName is the oidc action's "client_secret" (SPEC-CLUSTER18):
+	// a *string* policy field, so it serializes outside the credential-array
+	// redaction below and would cross both DEBUG wire logs in plaintext -- the
+	// webhook e2e sentinel's exact class of leak, one field name over. It is
+	// the one policy credential that must travel the wire (as its vault
+	// reference, or inline when written inline); what must not travel is the
+	// DEBUG log's copy of it.
+	oidcSecretFieldName = `"client_secret"`
 )
 
 // policyCredentialFieldNames are the JSON field names of a traffic policy's
@@ -152,6 +161,9 @@ func redactSecrets(buffer []byte) []byte {
 	out, redacted := redactStringField(buffer, secretFieldName)
 	if auth, authRedacted := redactStringField(out, httpAuthFieldName); authRedacted {
 		out, redacted = auth, true
+	}
+	if cs, csRedacted := redactStringField(out, oidcSecretFieldName); csRedacted {
+		out, redacted = cs, true
 	}
 	if creds, credRedacted := redactCredentialFields(out); credRedacted {
 		return creds

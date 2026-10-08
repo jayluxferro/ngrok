@@ -59,6 +59,14 @@ var actionPhases = map[string][]phase{
 	// has -- and only when the rewriter buffers it, which is why compiling
 	// one sets the compiled policy's body cap.
 	ActionWebhookVerification: {phaseRequest},
+
+	// The oidc action (SPEC-CLUSTER18) is request-phase only, for the
+	// authentication actions' reason and a structural one besides: it does
+	// not run in the hook at all. Its verdict must survive three connections
+	// and two external round trips, so the server consumes the compiled
+	// action pre-dispatch (Compiled.OIDC); the row here is what makes the
+	// name known at load and the phase wrong everywhere else.
+	ActionOIDC: {phaseRequest},
 }
 
 // phaseActions lists, in a stable order, the actions a phase implements, for
@@ -140,6 +148,21 @@ func (tp *TrafficPolicy) build() (*Compiled, error) {
 	}
 	if c.request, err = buildPhase(phaseRequest, tp.OnHTTPRequest); err != nil {
 		return nil, err
+	}
+	// At most one oidc action per policy (SPEC-CLUSTER18). The flow's state
+	// belongs to the endpoint: two actions would reserve (possibly different)
+	// callback paths on the same public host and mint session cookies under
+	// the same endpoint, and the pre-dispatch seam hands the server one
+	// runtime, not two. The scan is over the built actions -- the same place
+	// the runtime lives -- so it cannot disagree with what compiled.
+	oidcCount := 0
+	for _, a := range c.request {
+		if _, ok := a.auth.(*OIDCSettings); ok {
+			oidcCount++
+		}
+	}
+	if oidcCount > 1 {
+		return nil, fmt.Errorf("the policy carries %d oidc actions; an endpoint carries at most one (its callback path and session cookies belong to the endpoint, not to a rule)", oidcCount)
 	}
 	// The body cap comes out of the same traversal, so a policy cannot
 	// contain a body-consuming action the rewriter was never told about:
@@ -404,6 +427,29 @@ func buildAction(p phase, where string, r *Action) (*compiledAction, error) {
 			return nil, err
 		}
 		auth, err := buildWebhookVerification(where, cfg)
+		if err != nil {
+			return nil, err
+		}
+		a.auth = auth
+
+	case ActionOIDC:
+		// The oidc action (SPEC-CLUSTER18) follows the authentication
+		// actions' shape too: keys first, then the builder that owns its
+		// runtime (oidc.go). Conditions are refused rather than compiled --
+		// the one refusal in this switch -- because the action applies to the
+		// whole endpoint: the callback path it reserves and the session its
+		// cookies mint are not per-rule, and the pre-dispatch seam it is
+		// consumed at has one verdict per connection, not one per rule. An
+		// operator asking for "authenticate everyone except /health" is
+		// asking for path exemptions, a different feature; a condition that
+		// parsed and was then ignored would look like it meant something.
+		if len(r.Expressions) > 0 {
+			return nil, fmt.Errorf("%s: the %s action cannot carry conditions; it applies to the whole endpoint (the callback path it reserves is not per-rule)", where, r.Name)
+		}
+		if err := checkConfigKeys(where, cfg, "issuer", "client_id", "client_secret", "scopes", "callback_path", "session_duration_seconds", "allowed_domains", "claims"); err != nil {
+			return nil, err
+		}
+		auth, err := buildOIDC(where, cfg)
 		if err != nil {
 			return nil, err
 		}

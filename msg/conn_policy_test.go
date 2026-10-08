@@ -310,3 +310,47 @@ func TestWebhookSecretsAreRedacted(t *testing.T) {
 		t.Fatalf("redaction must leave the policy structure intact: %s", red)
 	}
 }
+
+// TestOIDCClientSecretIsRedacted pins the SPEC-CLUSTER18 addition to the
+// string-field redaction: the oidc action's client_secret is a *string*
+// policy field, so it serializes outside the credential-array scan above --
+// without an entry of its own it would cross both DEBUG wire logs in
+// plaintext, the exact class the webhook sentinel caught. The sentinel is the
+// webhook one's shape: the value gone, the placeholder where it was, the rest
+// of the policy still the message.
+func TestOIDCClientSecretIsRedacted(t *testing.T) {
+	const inlineSecret = "GOCSPX-plain-client-secret-value"
+	doc := &policy.TrafficPolicy{
+		OnHTTPRequest: []*policy.Action{
+			{
+				Name: policy.ActionOIDC,
+				Config: map[string]interface{}{
+					"issuer":    "https://idp.example",
+					"client_id": "client-id-is-not-secret-material",
+					// the reference form resolves on each side; the wire
+					// carries it, the log hides it. This sentinel uses the
+					// inline form, the one with nothing else to hide behind.
+					"client_secret": inlineSecret,
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(&ReqTunnel{
+		Protocol:      "http",
+		Hostname:      "oidcredact.test",
+		TrafficPolicy: doc,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	red := redactSecrets(raw)
+	if bytes.Contains(red, []byte(inlineSecret)) {
+		t.Fatalf("the oidc client_secret survived redaction: %s", red)
+	}
+	if !bytes.Contains(red, []byte(`"client_secret":"<redacted>"`)) {
+		t.Fatalf("the placeholder is missing where the client_secret was: %s", red)
+	}
+	if !bytes.Contains(red, []byte("idp.example")) || !bytes.Contains(red, []byte("client-id-is-not-secret-material")) {
+		t.Fatalf("redaction must leave the rest of the policy intact: %s", red)
+	}
+}

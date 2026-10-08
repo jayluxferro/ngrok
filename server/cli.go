@@ -39,6 +39,13 @@ type Options struct {
 	// already expresses. parseArgs copies the list through untouched; all
 	// validation happened at load.
 	eventDestinations []eventDestinationConfig
+
+	// oidcSessionKey is the oidc action's cookie-signing key
+	// (SPEC-CLUSTER18 4), config-only like eventDestinations: a long-lived
+	// signing key has no business in argv (see serverConfig.OIDCSessionKey).
+	// parseArgs copies it through; the length check is
+	// installOIDCSessionKey's, at startup, where a short key stops the boot.
+	oidcSessionKey string
 }
 
 func parseArgs() *Options {
@@ -84,8 +91,10 @@ func parseArgs() *Options {
 	seen := explicitFlags()
 
 	// event_destinations has no flag to compete with, so it is collected here
-	// and applied in the return below.
+	// and applied in the return below. oidc_session_key travels the same way
+	// (config-only, no flag -- see Options).
 	var eventDestinations []eventDestinationConfig
+	var oidcSessionKey string
 
 	if *configPath != "" {
 		cfg, err := loadServerConfig(*configPath)
@@ -132,6 +141,11 @@ func parseArgs() *Options {
 		// is applied unconditionally: an empty list is "no export", which is
 		// also what an absent config file means.
 		eventDestinations = cfg.EventDestinations
+		// Same for oidc_session_key: config-only, copied verbatim. Empty is
+		// "not configured" and is the zero-config default; a non-empty value
+		// shorter than the policy package's floor fails the boot at
+		// installOIDCSessionKey, not silently here.
+		oidcSessionKey = cfg.OIDCSessionKey
 	}
 
 	// Parse auth tokens from comma-separated string
@@ -171,6 +185,7 @@ func parseArgs() *Options {
 		maxConnPerIP:      *maxConnPerIP,
 		enablePprof:       *enablePprof,
 		eventDestinations: eventDestinations,
+		oidcSessionKey:    oidcSessionKey,
 	}
 }
 

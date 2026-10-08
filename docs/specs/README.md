@@ -41,8 +41,8 @@ rounds with no feature spec — their record is the changelog.
 | [10-webhook-verification.md](10-webhook-verification.md) | webhook-verification policy action; the rewriter's bounded body buffering with deferred verdict | v1.0.15 | shipped |
 | [11-wildcard-hostnames.md](11-wildcard-hostnames.md) | `*.<server-domain>` tunnels: one shared matcher, exact-wins routing | v1.0.14 | shipped |
 | [12-h2-passthrough.md](12-h2-passthrough.md) | Opt-in `h2` ALPN on agent-terminated tunnels; the rewriter's HTTP/2 preface fail-open guard | v1.0.16 | shipped |
-| [14-oidc-identity.md](14-oidc-identity.md) | [13-upstream-h2c.md](13-upstream-h2c.md) | Agent-side `upstream_protocol: http2` — h1↔h2c transcoder on the local leg | queued | draft |
-| `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | next | draft |
+| [13-upstream-h2c.md](13-upstream-h2c.md) | Agent-side `upstream_protocol: http2` — h1↔h2c transcoder on the local leg | queued | draft |
+| [14-oidc-identity.md](14-oidc-identity.md) | `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | next | approved |
 
 ## Not specced here
 

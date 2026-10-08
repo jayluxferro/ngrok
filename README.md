@@ -11,6 +11,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **Zero-knowledge TLS** — terminate https in the agent; the server routes by SNI and never sees plaintext or your certificates
 - **HTTP/2 visitors** — opt-in `alpn: ["h2", "http/1.1"]` on agent-terminated tunnels serves h2-mandatory clients (gRPC) by raw passthrough; HTTP/1 visitors on the same tunnel keep the fully rewritten path
 - **Traffic policy engine** — CEL-expressed rules per tunnel: deny, custom responses, header actions, IP restrictions, and request authentication (basic-auth, bearer, API key, JWT via JWKS)
+- **Single sign-on (OIDC)** — an `oidc` policy action redirects unauthenticated visitors through your identity provider (authorization-code + PKCE, HMAC-signed sessions, no server-side state) and forwards the verified identity as `X-Forwarded-*` headers
 - **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported
 - **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting
 - **QUIC agent transport** — the agent↔server multiplexed connection rides QUIC when enabled (no TCP head-of-line blocking across streams), with automatic smux fallback
@@ -353,6 +354,50 @@ Verification is fail-closed: a tampered body, wrong secret, stale timestamp,
 malformed signature header — and every request whose body the engine cannot
 buffer to verify (chunked, close-delimited, over the 1 MiB cap) — answers
 one fixed 403, never a pass-through and never a 400.
+
+**Single sign-on (OIDC).** Where the credentials actions ask the *visitor*
+to present something, an `oidc` action outsources the question to your
+identity provider: an unauthenticated visit is redirected there (authorization
+code + PKCE S256), the provider's answer lands on a reserved callback path
+on the endpoint's own hostname, and the local service receives the request
+with the verified identity already in it — `X-Forwarded-User`,
+`X-Forwarded-Email`, `X-Forwarded-Preferred-Username` — any client-supplied
+copy of those fields stripped first. Sessions are HMAC-signed cookies with
+no server-side state (restart- and load-balancer-safe by construction), and
+`oidc_session_key` in the server config pins the signing key across
+restarts. The action is enforced at the routing layer, before a proxy
+connection is spent, so an unauthenticated visit costs the endpoint
+nothing but the redirect:
+
+```yaml
+tunnels:
+  app:
+    hostname: app.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: oidc
+          config:
+            issuer: https://accounts.google.com
+            client_id: "....apps.googleusercontent.com"
+            client_secret: secret("main/google")
+            scopes: [openid, email]
+            session_duration_seconds: 3600   # ceiling 86400
+```
+
+The first request on a connection decides it (keep-alive and pipelined
+requests ride the decision, like Host routing always has); the policy's
+other request-phase actions still run, in order, on the authenticated
+connection. Everything fails closed — a token endpoint that answers with
+an error gets a fixed 403, one that cannot be reached gets a 503, and a
+session cookie that fails verification simply starts a new login (a stale
+cookie after a key rotation is indistinguishable from a forged one, and
+neither is ever believed). Zero-knowledge (agent-terminated)
+endpoints cannot carry the action and are refused at registration: the
+server holds only ciphertext there, with no Host or Cookie to run the flow
+on. The full decision surface — `callback_path`, `allowed_domains`,
+`claims` — is documented in the [changelog](docs/CHANGELOG.md).
 
 **Secret vaults.** Credential entries can be kept out of the policy document
 and sourced from a named vault instead — `secret("vault/key")` as the whole

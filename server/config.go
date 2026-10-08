@@ -50,6 +50,20 @@ type serverConfig struct {
 	// strict decode polices its keys on this side exactly as it does on the
 	// client's.
 	Vaults map[string]policy.VaultSource `yaml:"vaults"`
+
+	// OIDCSessionKey is the key the oidc action signs its flow and session
+	// cookies with (SPEC-CLUSTER18 4). Optional: unset, the policy package
+	// generates a random key at first use -- sessions then die with the
+	// process, which is the documented default. Set, sessions survive
+	// restarts and can be shared by ngrokds fronting one hostname. The
+	// minimum length is the policy package's to enforce (SetOIDCSessionKey
+	// refuses anything shorter at startup); this layer only carries it.
+	//
+	// Deliberately config-only, with no flag: a signing key typed on the
+	// command line lands in `ps` output and shell history, which is the
+	// wrong place for a long-lived secret -- the same call
+	// event_destinations made.
+	OIDCSessionKey string `yaml:"oidc_session_key"`
 }
 
 // eventDestinationConfig is one entry of event_destinations: a place the

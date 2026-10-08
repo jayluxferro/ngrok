@@ -1,4 +1,97 @@
 # Changelog
+## 1.0.17 - 2026-10-08 - Single sign-on: the oidc action
+
+An `oidc` action in an `on_http_request` policy makes an endpoint a real
+relying party: a visitor without a session is redirected to your identity
+provider (authorization-code flow with PKCE S256, strict issuer and
+discovery validation, single-use codes), the provider sends the code back
+to a reserved callback path on the endpoint's own hostname, and the
+verified identity arrives at the local service as `X-Forwarded-User`,
+`X-Forwarded-Email` and `X-Forwarded-Preferred-Username` — spliced into the
+dispatched request head, with any client-supplied copy of those fields
+stripped first, so what reaches the upstream is exactly the identity the
+token vouched for.
+
+The action is the first whose verdict survives a connection boundary, and
+it is enforced pre-dispatch at the routing layer rather than in the
+per-request hook, for two reasons the hook layer cannot fix: an
+unauthenticated visit would burn a proxy connection per redirect
+(`HandlePublicConnection` pulls one before any hook runs), and the
+callback needs routing-layer interception a rewriter cannot do. The
+granularity is the first request on a connection — keep-alive and
+pipelined requests ride its decision, the same granularity Host routing
+and the legacy HttpAuth have always had. The policy's other request-phase
+actions still run, in document order, on the authenticated connection.
+
+### The action
+
+```yaml
+tunnels:
+  app:
+    hostname: app.example.com
+    proto:
+      http: 8080
+    traffic_policy:
+      on_http_request:
+        - name: oidc
+          config:
+            issuer: https://accounts.google.com  # https; loopback for tests
+            client_id: "....apps.googleusercontent.com"
+            client_secret: secret("main/google") # vault-composable
+            scopes: [openid, email]              # openid forced first
+            callback_path: /oauth2/callback      # default; reserved endpoint-wide
+            session_duration_seconds: 3600       # (0, 86400]
+            allowed_domains: [example.com]       # optional post-verification gate
+            claims: { hd: example.com }          # optional exact-match check
+```
+
+### The session
+
+No server-side session store exists, by design: the session cookie is an
+HMAC-SHA256 signature over the identity and expiry (signed, not encrypted
+— the ID token never rides a cookie), so sessions survive a restart and
+balance across servers by construction. The flow cookie that binds the
+dance is short-lived and scoped to the callback path.
+
+`oidc_session_key` in the server's config sets the signing key: unset, a
+random key is generated per startup (a restart then invalidates every
+session — logged, at INFO); set, it must be at least 32 bytes and sessions
+survive restarts. It is config-file only, deliberately not a flag — a
+signing key has no business in `ps` output or shell history, the same call
+`event_destinations` made.
+
+### The honest limits
+
+- **No revocation.** A minted session lives until it expires; logout is the
+  browser dropping the cookie. There is no server-side kill switch.
+- **Failure taxonomy, fail-closed everywhere.** A token endpoint that
+  *answers* with an error gets the fixed `403 oidc: authentication
+  failed`; a token endpoint that cannot be *reached* gets a `503` — an
+  identity provider outage is an outage of the protected endpoint, never
+  an open door. Every unverified or malformed piece of the dance (state,
+  nonce, signature, claims) gets the 403. A session cookie that fails its
+  MAC is treated as *no session* — a fresh redirect to the provider, not a
+  403 — because a stale cookie (say, every visitor's, after the operator
+  rotates `oidc_session_key`) is indistinguishable from a forged one, and
+  both are simply unauthenticated. The claimed identity is never believed
+  either way.
+- **`session_duration_seconds` above 86400 is a load refusal**, not a
+  clamp — a policy asking for more than a day of session is a policy worth
+  reading again.
+- **Zero-knowledge endpoints cannot carry the action**: the server holds
+  only ciphertext there — no Host, no Cookie, no plaintext to redirect —
+  and the registration is refused naming both facts, before the url is
+  claimed. A `forward_to` chain that lands an oidc policy on an
+  agent-terminated endpoint fails closed agent-side (403), same rule as
+  every other policy that cannot run where the traffic terminates.
+- **First request decides.** The verdict's granularity is the connection,
+  not the request: a request pipelined behind an authenticated one rides
+  the authentication (pinned by test, byte for byte).
+
+The fake IdP the e2e suite drives the whole loop against — discovery, JWKS,
+authorize, token, single-use codes, `redirect_uri` binding — ships as
+`scripts/oidc_fake_idp.go`, build-ignored like the h2c helper.
+
 ## 1.0.16 - 2026-10-08 - HTTP/2 passthrough on agent-terminated tunnels
 
 An opt-in `alpn` key on zero-knowledge tunnels, so visitors that *must* speak
