@@ -145,7 +145,11 @@ func agentTLSConfig(t *TunnelConfiguration) (*tls.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s cert model: %v", model.name, err)
 		}
-		finishAgentTLSConfig(cfg)
+		var alpn []string
+		if t != nil {
+			alpn = t.Alpn
+		}
+		finishAgentTLSConfig(cfg, alpn)
 		return cfg, nil
 	}
 
@@ -157,8 +161,10 @@ func agentTLSConfig(t *TunnelConfiguration) (*tls.Config, error) {
 
 // finishAgentTLSConfig applies the invariants every model shares. It is a
 // function rather than inline lines so that "all models" is enforced in one
-// place: a model added to the registry gets these by construction.
-func finishAgentTLSConfig(cfg *tls.Config) {
+// place: a model added to the registry gets these by construction. alpn is the
+// one per-tunnel input (SPEC-CLUSTER16 2): the tunnel's configured protocols,
+// advertised in every handshake this config terminates.
+func finishAgentTLSConfig(cfg *tls.Config, alpn []string) {
 	// The public visitors of these endpoints are arbitrary clients, some of
 	// them appliances that cannot do better; TLS 1.2 is the floor this build
 	// commits to (anything older has known protocol-level breaks).
@@ -168,6 +174,26 @@ func finishAgentTLSConfig(cfg *tls.Config) {
 	// policies, not by TLS identities, and requesting a certificate would make
 	// every client that cannot produce one fail the handshake.
 	cfg.ClientAuth = tls.NoClientCert
+
+	// The ALPN advertisement is set only when the tunnel configures one, and
+	// left nil otherwise: a tunnel without the alpn key must produce
+	// byte-identical handshakes to before the key existed. (That opt-in is
+	// deliberate, SPEC-CLUSTER16 1: advertising h2 unconditionally would flip
+	// every h2-capable visitor onto h2 toward local services that only speak
+	// HTTP/1.1.) The list is assigned as written, order preserved -- "h2"
+	// first means h2-capable visitors get h2, which is the operator's stated
+	// preference -- and the negotiated protocol needs no branch after
+	// termination: plaintext flows into the relay whatever was negotiated.
+	//
+	// The assignment is plain, with no clone-then-set: every model above built
+	// a fresh *tls.Config for this one call, so nothing else holds this
+	// pointer. That is the difference from the server's QUIC path, which must
+	// clone before setting NextProtos because its TCP listener shares the
+	// config whose handshakes must keep advertising no application protocol at
+	// all (server/quic.go quicTLSConfig).
+	if len(alpn) > 0 {
+		cfg.NextProtos = alpn
+	}
 }
 
 // readPEMFile reads one PEM file, naming the file and the config key it came

@@ -1,4 +1,96 @@
 # Changelog
+## 1.0.16 - 2026-10-08 - HTTP/2 passthrough on agent-terminated tunnels
+
+An opt-in `alpn` key on zero-knowledge tunnels, so visitors that *must* speak
+HTTP/2 -- grpc-go clients above all -- work end-to-end through the existing
+raw-passthrough architecture: the agent's TLS terminator offers `h2` in its
+ALPN, the visitor negotiates it, and from there the whole connection is
+carried as opaque bytes in both directions.
+
+Shipping this also fixed a latent bug the design work uncovered: the
+rewriter's request-line parser accepted the h2 prior-knowledge preface
+(`PRI * HTTP/2.0` -- `PRI` is a valid HTTP/1 token and `*` a non-empty
+target), the "head" parsed with zero fields, and the always-on
+`X-Forwarded-For` injection spliced a header line into the middle of the
+24-byte fixed preface, shifting `SM\r\n\r\n` out of position. Any conforming
+h2 server then rejected the connection as a framing error. A prior-knowledge
+visitor to any rewritten tunnel was broken by the rewriter itself, before
+this release.
+
+### The tunnel key
+
+```yaml
+tunnels:
+  grpc-edge:
+    proto:
+      https: 7000
+    hostname: grpc
+    agent_tls_termination: true
+    alpn: ["h2", "http/1.1"]   # http/1.1 (default) | h2
+    compression: false          # required to be explicitly false with h2
+```
+
+CLI twin: `-alpn h2,http/1.1` beside the agent-TLS flags. `alpn` is validated
+at load, and `h2` in the list is refused unless the tunnel is one the h2
+visitor cannot dodge controls on:
+
+- **`agent_tls_termination` is required** -- ALPN is negotiated between
+  visitor and agent, which only exists where the agent terminates TLS.
+- **No `on_http_request` / `on_http_response` rules** -- an h2 connection
+  never produces an HTTP/1 head for a policy phase to judge, so a rule there
+  would be a control an h2 visitor simply sidesteps. The refusal names the
+  conflicting phases.
+- **No header settings, and `host_header` only unset or `preserve`** -- same
+  reasoning: those rewrites splice text into heads this connection will never
+  have.
+- **`compression: false`, stated explicitly** -- the gzip transform re-frames
+  HTTP/1 responses; there are none to re-frame here, and a default that
+  silently promised one would be a lie the config refuses to tell.
+
+An `alpn` list of `["http/1.1"]` alone triggers none of this: it is the
+spelled-out default, and every visitor is HTTP/1, so every control applies.
+The asymmetry is the point -- the refusals guard the combination where a
+control would silently not run, not the key itself.
+
+### The guard
+
+The rewriter recognizes the preface at request-head parse (`PRI` as the
+method, or `HTTP/2.0` as the version -- either signal alone is enough to say
+the stream is not HTTP/1) and, with no policy hook armed on the connection,
+hands the whole connection to the raw byte copy: every byte consumed so far
+is replayed verbatim, nothing is injected, nothing rewritten, both directions
+for the life of the connection. An h1 visitor on the same tunnel keeps the
+fully rewritten path -- the guard is per connection, not per tunnel.
+
+Releasing the response side took one more mechanism the first live run
+caught: the response rewriter parks between messages waiting for a status
+*line*, and an h2 upstream's first answer is a SETTINGS frame -- binary, with
+no line break in it at all -- so a parked side would sit there holding the
+frames while the visitor waited for a handshake answer that never left the
+agent: both sides asleep, zero bytes, a clean deadlock. The request side now
+arms a one-shot wake flag when it hands the connection over, and the parked
+line wait exits on it at its first opportunity, replaying whatever it
+consumed in order before joining the raw copy.
+
+With a policy hook armed, the guard closes the connection instead of passing
+it through and logs one WARN naming the tunnel: passthrough would deliver
+every request to the local service without the hook ever seeing one. The
+close is a close and not a 431 -- a visitor that assumed h2 cannot read an
+HTTP/1-text error, and a closed connection says the same thing without
+pretending to speak its protocol. This configuration is already refused at
+load; the guard is the depth behind that refusal.
+
+### What an h2 visitor does not get
+
+`X-Forwarded-For` / `X-Forwarded-Proto` injection, header rewrites, host
+rewrites, compression, the traffic policy's http phases, and the inspector's
+HTTP parse: all of these live on the HTTP/1 side of the rewriter, and a
+passthrough connection has no such side. The tunnel's own logs say so at the
+moment it happens (one INFO line per connection, naming the tunnel), and the
+load-time matrix above exists so no configuration can expect both at once.
+`on_tcp_connect` still runs server-side on the raw accept, as it always has
+for agent-terminated tunnels.
+
 ## 1.0.15 - 2026-10-05 - Webhook verification
 
 A request-phase policy action that verifies the signatures webhook providers

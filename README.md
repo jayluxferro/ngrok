@@ -9,6 +9,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **TCP tunneling** — arbitrary TCP, with fixed, owned remote ports (`-remote-port`)
 - **UDP tunneling** — datagram-preserving public UDP (DNS, game servers, IoT devices), per-flow admission, same owned ports
 - **Zero-knowledge TLS** — terminate https in the agent; the server routes by SNI and never sees plaintext or your certificates
+- **HTTP/2 visitors** — opt-in `alpn: ["h2", "http/1.1"]` on agent-terminated tunnels serves h2-mandatory clients (gRPC) by raw passthrough; HTTP/1 visitors on the same tunnel keep the fully rewritten path
 - **Traffic policy engine** — CEL-expressed rules per tunnel: deny, custom responses, header actions, IP restrictions, and request authentication (basic-auth, bearer, API key, JWT via JWKS)
 - **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported
 - **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting

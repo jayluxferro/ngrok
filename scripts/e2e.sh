@@ -3533,4 +3533,197 @@ else
   echo "[e2e] wh 8: no signing secret appears in either wire log"
 fi
 
+# ---------------------------------------------------------------------------
+# HTTP/2 passthrough (SPEC-CLUSTER16): opt-in alpn on an agent-terminated
+# tunnel. The group rides the webhook group's ngrokd (127.0.0.1:14450, https
+# listener 18446) and its zk CA, which are still live at this point in the
+# script -- an h2-passthrough tunnel is an agent-terminated tunnel with one
+# more terminator setting, so the harness shape is the wh-zk scenario's.
+# ---------------------------------------------------------------------------
+
+echo "[e2e] h2 1: the h2c upstream serves both protocols on one port"
+# The local service of every tunnel below: a plaintext-h2 (h2c) server that
+# also answers h1, started with go run (the ignore-tagged helper is test
+# tooling, not module code). The readiness probe is itself the self-test --
+# prior-knowledge h2c must round-trip before anything points a tunnel at it,
+# because a helper that silently serves h1-only would turn every later h2
+# assertion into a confusing failure. The poll loop is long on purpose:
+# go run pays compile time on a cold cache before the port opens.
+go run scripts/h2c_upstream.go 127.0.0.1:19016 >/tmp/ngrok-e2e-h2c-upstream.log 2>&1 &
+for i in {1..60}; do
+  H2C_SELF="$(curl -sS --http2-prior-knowledge http://127.0.0.1:19016/ 2>/dev/null || true)"
+  if [[ "$H2C_SELF" == "h2served proto=HTTP/2.0 xff=absent" ]]; then
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$H2C_SELF" != "h2served proto=HTTP/2.0 xff=absent" ]]; then
+  echo "[e2e] the h2c upstream never answered prior-knowledge h2:"
+  cat /tmp/ngrok-e2e-h2c-upstream.log
+  exit 1
+fi
+
+echo "[e2e] h2 2: an alpn tunnel registers and serves (config-file form)"
+# The full opt-in spelling: agent termination, the CA cert model, both
+# protocols advertised, and compression explicitly off -- the matrix's one
+# setting that is refused by DEFAULT (compression is on unless stated), so
+# the e2e proves the whole legal shape loads through the real config path.
+cat > "$TMPDIR/ngrok-h2.yml" <<YAML
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  h2pass:
+    proto:
+      https: 19016
+    hostname: h2pass
+    agent_tls_termination: true
+    tls:
+      ca_crt: $TMPDIR/zk-ca.crt
+      ca_key: $TMPDIR/zk-ca.key
+    alpn: ["h2", "http/1.1"]
+    compression: false
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-h2.yml" -log=/tmp/ngrok-e2e-h2-client.log \
+  start h2pass >/tmp/ngrok-e2e-h2-client-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-h2-client.log "h2pass (agent-terminated + alpn)"
+wait_for_wh_tls h2pass
+
+echo "[e2e] h2 3: a prior-knowledge h2 visitor is served over h2, untouched"
+# --http2-prior-knowledge speaks TLS without ALPN and then sends the h2
+# preface cold -- exactly the bytes that hit the rewriter's guard (and the
+# shape the pre-guard code corrupted: X-Forwarded-For was spliced into the
+# 24-byte preface and the framing broke). proto=HTTP/2.0 proves the preface
+# arrived intact; xff=absent pins the documented limitation -- h2 is raw
+# passthrough, so nothing is injected, and the assertion is the contract.
+H2_RESP="$(curl -fsS --http2-prior-knowledge --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve h2pass:18446:127.0.0.1 -H 'Host: h2pass' https://h2pass:18446/)"
+if [[ "$H2_RESP" != "h2served proto=HTTP/2.0 xff=absent" ]]; then
+  echo "[e2e] prior-knowledge h2 was not served as untouched h2: got \"$H2_RESP\""
+  exit 1
+fi
+
+echo "[e2e] h2 4: an ALPN-negotiated h2 visitor is served the same way"
+# --http2 negotiates via ALPN: the terminator offers [h2, http/1.1] and h2
+# wins by order. Same assertion, different admission path -- prior-knowledge
+# exercises the guard, this exercises the advertisement itself.
+H2_RESP="$(curl -fsS --http2 --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve h2pass:18446:127.0.0.1 -H 'Host: h2pass' https://h2pass:18446/)"
+if [[ "$H2_RESP" != "h2served proto=HTTP/2.0 xff=absent" ]]; then
+  echo "[e2e] ALPN-negotiated h2 was not served as untouched h2: got \"$H2_RESP\""
+  exit 1
+fi
+
+echo "[e2e] h2 5: an h1 visitor on the SAME tunnel keeps the rewritten path"
+# The dual-protocol table's other column: --http1.1 pins the visitor to h1,
+# which the rewriter-driven path serves exactly as before -- XFF injected,
+# the always-on behavior for every live HTTP tunnel. One tunnel, two
+# visitors, and neither can dodge what the other gets.
+H2_RESP="$(curl -fsS --http1.1 --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve h2pass:18446:127.0.0.1 -H 'Host: h2pass' https://h2pass:18446/)"
+if [[ "$H2_RESP" != "h2served proto=HTTP/1.1 xff=present" ]]; then
+  echo "[e2e] an h1 visitor did not get the injected XFF it always had: got \"$H2_RESP\""
+  exit 1
+fi
+
+echo "[e2e] h2 6: the matrix refuses alpn without agent_tls_termination"
+# Each refusal runs the real binary against a real config and demands the
+# startup failure AND the rule's own words -- the same discipline the policy
+# group's broken-file scenario set.
+cat > "$TMPDIR/ngrok-h2-bad1.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  h2edge:
+    proto:
+      https: 19016
+    hostname: h2edge
+    alpn: ["h2"]
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-h2-bad1.yml" -log=/tmp/ngrok-e2e-h2-bad1.log \
+  start h2edge >"$TMPDIR/ngrok-h2-bad1.out" 2>&1; then
+  echo "[e2e] the client started an alpn tunnel with no terminator to advertise it:"
+  cat "$TMPDIR/ngrok-h2-bad1.out"
+  exit 1
+fi
+if ! grep -q 'alpn requires agent_tls_termination' "$TMPDIR/ngrok-h2-bad1.out"; then
+  echo "[e2e] the refusal does not name the missing terminator:"
+  cat "$TMPDIR/ngrok-h2-bad1.out"
+  exit 1
+fi
+
+echo "[e2e] h2 7: the matrix refuses h2 with compression left at its default"
+cat > "$TMPDIR/ngrok-h2-bad2.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  h2zip:
+    proto:
+      https: 19016
+    hostname: h2zip
+    agent_tls_termination: true
+    alpn: ["h2", "http/1.1"]
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-h2-bad2.yml" -log=/tmp/ngrok-e2e-h2-bad2.log \
+  start h2zip >"$TMPDIR/ngrok-h2-bad2.out" 2>&1; then
+  echo "[e2e] the client offered h2 with compression still defaulting on:"
+  cat "$TMPDIR/ngrok-h2-bad2.out"
+  exit 1
+fi
+if ! grep -q 'compression is not explicitly false' "$TMPDIR/ngrok-h2-bad2.out"; then
+  echo "[e2e] the refusal does not say the operator must state compression: false:"
+  cat "$TMPDIR/ngrok-h2-bad2.out"
+  exit 1
+fi
+
+echo "[e2e] h2 8: the matrix refuses h2 beside http-phase policy rules"
+cat > "$TMPDIR/ngrok-h2-bad3.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+tunnels:
+  h2guard:
+    proto:
+      https: 19016
+    hostname: h2guard
+    agent_tls_termination: true
+    alpn: ["h2"]
+    compression: false
+    traffic_policy:
+      on_http_request:
+        - name: deny
+          expressions: ['req.url.path == "/secret"']
+YAML
+if ./bin/ngrok -config="$TMPDIR/ngrok-h2-bad3.yml" -log=/tmp/ngrok-e2e-h2-bad3.log \
+  start h2guard >"$TMPDIR/ngrok-h2-bad3.out" 2>&1; then
+  echo "[e2e] the client offered h2 beside rules an h2 visitor would dodge:"
+  cat "$TMPDIR/ngrok-h2-bad3.out"
+  exit 1
+fi
+if ! grep -q 'on_http_request/on_http_response rules' "$TMPDIR/ngrok-h2-bad3.out"; then
+  echo "[e2e] the refusal does not name the conflicting policy phases:"
+  cat "$TMPDIR/ngrok-h2-bad3.out"
+  exit 1
+fi
+
+echo "[e2e] h2 9: the -alpn flag feeds the synthesized default tunnel"
+# The flag path and the config path meet the same validator, but the flag is
+# its own wiring: comma list into the synthesized tunnel, beside the tls
+# model flags, with -compression=false stating the matrix's demand.
+cat > "$TMPDIR/ngrok-h2-cli.yml" <<'YAML'
+server_addr: 127.0.0.1:14450
+trust_host_root_certs: true
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-h2-cli.yml" -log=/tmp/ngrok-e2e-h2-flag-client.log \
+  -proto=https -hostname=h2flag \
+  -agent-tls-termination -tls-ca-crt="$TMPDIR/zk-ca.crt" -tls-ca-key="$TMPDIR/zk-ca.key" \
+  -alpn h2,http/1.1 -compression=false \
+  19016 >/tmp/ngrok-e2e-h2-flag-stdout.log 2>&1 &
+wait_for_tunnel /tmp/ngrok-e2e-h2-flag-client.log "h2flag (flag-built alpn tunnel)"
+wait_for_wh_tls h2flag
+H2_RESP="$(curl -fsS --http2 --cacert "$TMPDIR/zk-ca.crt" \
+  --resolve h2flag:18446:127.0.0.1 -H 'Host: h2flag' https://h2flag:18446/)"
+if [[ "$H2_RESP" != "h2served proto=HTTP/2.0 xff=absent" ]]; then
+  echo "[e2e] the flag-built alpn tunnel did not serve h2: got \"$H2_RESP\""
+  exit 1
+fi
+
 echo "[e2e] PASS"

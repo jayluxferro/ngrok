@@ -591,6 +591,108 @@ func fzRefusalOnTheWire(armed, static []byte) bool {
 	}
 }
 
+// fzPrefaceInput reports whether the request bytes open with a head the
+// rewriter's preface guard fires on (h2Preface): a request line whose method
+// is PRI or whose version is HTTP/2.0, at the head of a connection that
+// parses. With no hook armed the connection passes through; with any hook
+// armed it is closed outright. The predicate mirrors parseHead plus
+// parsedHead.isHTTP2Preface rather than calling them -- an oracle that imports
+// the code under test would prove nothing, the same choice
+// fzNormalizationOnlyCL made -- so the two spellings are kept apart on
+// purpose, and drift between them is a finding.
+//
+// The head has to parse, and that part matters: a PRI line followed by a line
+// that is not a field is a head parseHead rejects, and that input belongs to
+// the refusal exception above (fzRefusedHead), not to this one. The two
+// signals alone are true of bytes the rewriter never treats as a preface.
+func fzPrefaceInput(reqIn string) bool {
+	// Lines as a split on "\n", which is the convention fzBlankLine and
+	// fzFieldName already work in: the terminator is not part of a line, and
+	// a trailing "\r" is. The last element of the split is the tail behind the
+	// final newline -- empty when the input ends with one, and never a line --
+	// so a head is complete only if its blank line lands before the tail: a
+	// head the input never terminates is one the guard never sees, and one
+	// that stays on the ordinary paths (end of stream in the middle of a head).
+	lines := strings.Split(reqIn, "\n")
+	complete := len(lines) - 1
+	i := 0
+
+	// The tolerated blank lines before a start line are consumed first, the
+	// way parseHead consumes them: the guard sees the preface behind them.
+	for {
+		if i >= complete {
+			return false
+		}
+		if !fzBlankLine(lines[i]) {
+			break
+		}
+		i++
+	}
+	startLine := lines[i]
+	i++
+
+	// The request line, as parseRequestLine reads it: three space-separated
+	// parts, a token method, a non-empty target, a version shaped HTTP/d.d.
+	parts := strings.Split(strings.TrimSuffix(startLine, "\r"), " ")
+	if len(parts) != 3 || parts[1] == "" || !fzIsToken(parts[0]) || !fzIsHTTPVersion(parts[2]) {
+		return false
+	}
+	if parts[0] != "PRI" && parts[2] != "HTTP/2.0" {
+		return false
+	}
+
+	// Then the head's fields, up to the blank line that ends the head. The
+	// guard only sees a preface in a head that parses; anything else takes the
+	// refusal path instead. The field grammar here is parseHeaderField's, not
+	// fzFieldName's: the name is what precedes the colon with trailing spaces
+	// and tabs trimmed off, and that has to be a token. fzFieldName is
+	// deliberately stricter -- it exists to keep body lines from counting as
+	// droppable fields, so "0 :" failing it is correct there and wrong here,
+	// where the question is whether the rewriter parsed the head at all.
+	for {
+		if i >= complete {
+			return false
+		}
+		line := lines[i]
+		i++
+		if fzBlankLine(line) {
+			return true
+		}
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			return false // obs-fold: parseHeaderField refuses the head
+		}
+		colon := strings.IndexByte(line, ':')
+		if colon <= 0 {
+			return false
+		}
+		if !fzIsToken(strings.TrimRight(line[:colon], " \t")) {
+			return false
+		}
+	}
+}
+
+// fzIsHTTPVersion mirrors the request-line grammar's version shape: "HTTP/",
+// then digit.digit. It is the acceptance that lets "HTTP/2.0" parse as a
+// request line at all, which is why the guard has to name it.
+func fzIsHTTPVersion(v string) bool {
+	return len(v) == 8 && v[:5] == "HTTP/" && v[6] == '.' &&
+		v[5] >= '0' && v[5] <= '9' && v[7] >= '0' && v[7] <= '9'
+}
+
+// fzIsToken reports whether s is entirely tchar (fzTokenByte), which is what
+// a request method must be for parseRequestLine to accept the line.
+func fzIsToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for k := 0; k < len(s); k++ {
+		if !fzTokenByte(s[k]) {
+			return false
+		}
+	}
+	return true
+}
+
 // --- the policy matrix ------------------------------------------------------
 
 // fzNoopPolicy transforms nothing. IsNoop is true for it, which is also the
@@ -743,22 +845,48 @@ func fzCheck(t *testing.T, sd side, in, other []byte) {
 	// whole run, so it is computed once.
 	panics := fzFinished(t, "panicking hooks", fzRun(reqIn, respIn, fzPanicHookPolicy))
 	refused := fzRefusedHead(t, static, panics)
-	if !bytes.Equal(panics.reqOut, static.reqOut) && !refused {
-		t.Fatalf("a request hook that panics changed the bytes on the wire:\nwith hooks: %q\nwithout:    %q", panics.reqOut, static.reqOut)
-	}
-	if !bytes.Equal(panics.respOut, static.respOut) && !refused {
-		t.Fatalf("a response hook that panics changed the bytes on the wire:\nwith hooks: %q\nwithout:    %q", panics.respOut, static.respOut)
+
+	// The second exception, and it is the same shape: a connection that opens
+	// with the HTTP/2 prior-knowledge preface is closed outright when any hook
+	// is armed (h2Preface) -- passthrough would carry every request on it
+	// straight past the hook -- where an unarmed policy passes the bytes
+	// through untouched. "Closed" has one observable here, and it is stricter
+	// than the 431 refusal above: nothing is forwarded and nothing is written
+	// back, because an h2 visitor cannot read an HTTP/1-text error, so the
+	// connection ends without an answer. The unarmed runs (noop, static) are
+	// unaffected by the guard and need no exception: passing a preface through
+	// is their identity or their fail-open, which the checks above already
+	// cover.
+	preface := fzPrefaceInput(reqIn)
+	if preface {
+		if len(panics.reqOut) != 0 || len(panics.respOut) != 0 {
+			t.Fatalf("a connection that opened with the h2 preface was carried under armed hooks:\nwith hooks: %q / %q\nwithout:    %q / %q",
+				panics.reqOut, panics.respOut, static.reqOut, static.respOut)
+		}
+	} else {
+		if !bytes.Equal(panics.reqOut, static.reqOut) && !refused {
+			t.Fatalf("a request hook that panics changed the bytes on the wire:\nwith hooks: %q\nwithout:    %q", panics.reqOut, static.reqOut)
+		}
+		if !bytes.Equal(panics.respOut, static.respOut) && !refused {
+			t.Fatalf("a response hook that panics changed the bytes on the wire:\nwith hooks: %q\nwithout:    %q", panics.respOut, static.respOut)
+		}
 	}
 
 	// Invariant 1 for a hook that tries to inject: dropped at the wire. An
 	// oversized head never reaches the hook either, so the request-side one-
 	// message check is skipped with the same exception (the injection check
 	// needs no exemption: an empty output is not a message and it says nothing
-	// about the hook, which never ran).
+	// about the hook, which never ran). The preface connection joins the
+	// exception for the same reason its armed run above is empty: the hook is
+	// never asked, and the run writes nothing.
 	evil := fzFinished(t, "CRLF hooks", fzRun(reqIn, respIn, fzEvilHookPolicy))
 	fzNoInjection(t, "CRLF hooks, request", sideRequest, []byte(reqIn), evil.reqOut)
 	fzNoInjection(t, "CRLF hooks, response", sideResponse, []byte(respIn), evil.respOut)
-	if !refused {
+	if preface {
+		if len(evil.reqOut) != 0 {
+			t.Fatalf("a connection that opened with the h2 preface was carried under armed hooks: %q", evil.reqOut)
+		}
+	} else if !refused {
 		fzOneMessage(t, "CRLF hooks, request", sideRequest, []byte(reqIn), evil.reqOut, false)
 	}
 	fzOneMessage(t, "CRLF hooks, response", sideResponse, []byte(respIn), evil.respOut, true)

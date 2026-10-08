@@ -20,7 +20,10 @@ as amendments at the bottom of the file).
 
 ## Index
 
-Implementation clusters, in build order. Numbering is by spec file; releases
+Implementation clusters. Numbering is by spec file; releases land in
+dependency order, which can differ from file order — spec 13 reuses the
+client files spec 12 owns until v1.0.16 ships, so spec 14's oidc lands
+between them. Releases
 skipped below (1.0.6, 1.0.12, 1.0.13) were audit/hardening and toolchain
 rounds with no feature spec — their record is the changelog.
 
@@ -37,6 +40,9 @@ rounds with no feature spec — their record is the changelog.
 | [09-vaults-event-export.md](09-vaults-event-export.md) | Secret vaults (`secret()` at build time), event export destinations with drop accounting | v1.0.11 | shipped |
 | [10-webhook-verification.md](10-webhook-verification.md) | webhook-verification policy action; the rewriter's bounded body buffering with deferred verdict | v1.0.15 | shipped |
 | [11-wildcard-hostnames.md](11-wildcard-hostnames.md) | `*.<server-domain>` tunnels: one shared matcher, exact-wins routing | v1.0.14 | shipped |
+| [12-h2-passthrough.md](12-h2-passthrough.md) | Opt-in `h2` ALPN on agent-terminated tunnels; the rewriter's HTTP/2 preface fail-open guard | v1.0.16 | shipped |
+| [14-oidc-identity.md](14-oidc-identity.md) | [13-upstream-h2c.md](13-upstream-h2c.md) | Agent-side `upstream_protocol: http2` — h1↔h2c transcoder on the local leg | queued | draft |
+| `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | next | draft |
 
 ## Not specced here
 

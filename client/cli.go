@@ -26,6 +26,7 @@ Examples:
 	ngrok -proto=udp 53
 	ngrok -proto=udp -remote-port=5353 5353
 	ngrok -agent-tls-termination -tls-ca-crt=ca.pem -tls-ca-key=ca.key -hostname=app.example.com 8080
+	ngrok -agent-tls-termination -tls-ca-crt=grpc.crt -tls-ca-key=grpc.key -alpn=h2,http/1.1 -compression=false 7000
 
 
 Advanced usage: ngrok [OPTIONS] <command> [command args] [...]
@@ -95,6 +96,13 @@ type Options struct {
 	tlsKey              string
 	tlsCaCrt            string
 	tlsCaKey            string
+
+	// alpn is the raw -alpn value (SPEC-CLUSTER16 1): one comma-separated
+	// string, kept raw here and split and validated in LoadConfiguration --
+	// exactly like the header flags' raw "key:value" strings -- so a flag and
+	// the config-file alpn key are judged by exactly one code path and refused
+	// in the same words.
+	alpn string
 
 	// proxyTransport is the value of -proxy-transport (SPEC-CLUSTER7 5): a
 	// client-level setting like -authtoken, not a per-tunnel one, so it
@@ -264,6 +272,11 @@ func ParseArgs() (opts *Options, err error) {
 		"",
 		"Path to the PEM private key of -tls-ca-crt. It never leaves this machine. Requires -tls-ca-crt. (with -agent-tls-termination)")
 
+	alpn := flag.String(
+		"alpn",
+		"",
+		"Application protocols to offer in the public TLS handshake of an agent-terminated https tunnel, comma-separated in preference order: 'h2', 'http/1.1', or both. Unset offers no ALPN at all. Requires -agent-tls-termination; offering h2 additionally requires -compression=false and no host-header or request/response-header manipulation, which an h2 connection bypasses. (with -agent-tls-termination) (HTTPS only)")
+
 	flag.Parse()
 
 	opts = &Options{
@@ -293,6 +306,7 @@ func ParseArgs() (opts *Options, err error) {
 		tlsKey:               *tlsKey,
 		tlsCaCrt:             *tlsCaCrt,
 		tlsCaKey:             *tlsCaKey,
+		alpn:                 *alpn,
 		command:              flag.Arg(0),
 	}
 

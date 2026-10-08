@@ -1267,3 +1267,463 @@ func TestEndpointFlagsAreRegistered(t *testing.T) {
 		t.Fatalf("usage output should explain pooling:\n%s", usage)
 	}
 }
+
+// Tests for the alpn tunnel key (SPEC-CLUSTER16 1). The terminator half -- what
+// the configured list does to the TLS handshake -- is tlsagent_test.go's; these
+// are the load-time contract: what a config may offer, what may accompany an
+// h2 offer, and the exact refusal an operator sees when the two disagree. The
+// messages are user-facing contracts, so the refusals are asserted verbatim:
+// LoadConfiguration returns validateAlpn's error unwrapped, which is what makes
+// the equality possible.
+
+// alpnTunnelYAML builds a one-tunnel config that is a VALID h2-offering
+// agent-terminated https tunnel: the base every matrix case starts from, so
+// that what a case changes is the thing being tested. The terminator needs no
+// cert material -- validateAgentTLS leaves the ephemeral model to the session
+// -- which keeps every case down to its one interesting key.
+func alpnTunnelYAML(extraLines ...string) string {
+	lines := []string{
+		"tunnels:",
+		"  web:",
+		"    proto:",
+		"      https: 127.0.0.1:7000",
+		"    agent_tls_termination: true",
+		"    alpn:",
+		"      - h2",
+		"      - http/1.1",
+		"    compression: false",
+	}
+	lines = append(lines, extraLines...)
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func TestLoadConfigurationAlpnValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string // the full refusal, verbatim
+	}{
+		{
+			name:   "the valid base loads",
+			config: alpnTunnelYAML(),
+		},
+		{
+			name:   "host_header preserve is not a control h2 could dodge",
+			config: alpnTunnelYAML("    host_header: preserve"),
+		},
+		{
+			// The rewriter matches its keywords case-insensitively, so
+			// "Preserve" IS preserve -- the h2 guard has to judge the value
+			// the same way its writer does, or this valid spelling would be
+			// refused only on the h2 road.
+			name:   "host_header preserve in another case is still preserve",
+			config: alpnTunnelYAML("    host_header: Preserve"),
+		},
+		{
+			name: "an on_tcp_connect-only policy is fine: it runs server-side, before any TLS",
+			config: alpnTunnelYAML(
+				"    traffic_policy:",
+				"      on_tcp_connect:",
+				"        - name: restrict-ips",
+				"          config:",
+				"            allow:",
+				"              - 127.0.0.0/8",
+			),
+		},
+		{
+			name:    "alpn without agent_tls_termination",
+			config:  strings.Replace(alpnTunnelYAML(), "    agent_tls_termination: true\n", "", 1),
+			wantErr: `Tunnel web: alpn requires agent_tls_termination: the advertised protocols belong to the TLS handshake this agent terminates, and without it the https leg is terminated on the server, which offers no ALPN`,
+		},
+		{
+			// An http-only tunnel answers to validateAgentTLS first, whose
+			// refusal for the same shape fires earlier in the chain -- this
+			// pins that ordering so a future reordering cannot strand the
+			// operator with the less specific message.
+			name: "agent_tls_termination without an https leg is the earlier validator's refusal",
+			config: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+    agent_tls_termination: true
+    alpn:
+      - h2
+    compression: false
+`,
+			wantErr: `Tunnel web: agent_tls_termination requires the tunnel's protocols to include https, got http`,
+		},
+		{
+			name:    "a token outside the set",
+			config:  strings.Replace(alpnTunnelYAML(), "      - http/1.1", "      - spdy", 1),
+			wantErr: `Tunnel web: alpn value "spdy" is not supported: the accepted values are "h2" and "http/1.1"`,
+		},
+		{
+			// The tokens are wire tokens: "H2" is not the identifier RFC 7540
+			// registers, and advertising it verbatim would be an offer no
+			// visitor could answer. Case-folding it here would put bytes on
+			// the wire the operator did not write.
+			name:    "a near-miss spelling is refused, not corrected",
+			config:  strings.Replace(alpnTunnelYAML(), "      - h2", "      - H2", 1),
+			wantErr: `Tunnel web: alpn value "H2" is not supported: the accepted values are "h2" and "http/1.1"`,
+		},
+		{
+			name:    "a duplicated protocol",
+			config:  strings.Replace(alpnTunnelYAML(), "      - http/1.1", "      - h2", 1),
+			wantErr: `Tunnel web: alpn lists "h2" more than once: advertise each protocol at most once`,
+		},
+		{
+			// An explicitly written empty list is a control that says nothing:
+			// refused, with the two ways out of it named.
+			name:    "an explicitly empty list",
+			config:  strings.Replace(alpnTunnelYAML(), "    alpn:\n      - h2\n      - http/1.1", "    alpn: []", 1),
+			wantErr: `Tunnel web: alpn is empty: omit the key to offer no ALPN, or list "h2" and/or "http/1.1"`,
+		},
+		{
+			name: "h2 with an on_http_request policy",
+			config: alpnTunnelYAML(
+				"    traffic_policy:",
+				"      on_http_request:",
+				"        - name: deny",
+				"          expressions:",
+				"            - 'req.url.path == \"/blocked\"'",
+			),
+			wantErr: `Tunnel web: alpn offers h2 but the traffic policy has on_http_request/on_http_response rules: h2 connections are raw passthrough, and a visitor must not be able to dodge them by negotiating h2 (on_tcp_connect is fine -- it runs server-side on the raw accept; drop the h2 alpn value or the http rules)`,
+		},
+		{
+			name: "h2 with an on_http_response policy",
+			config: alpnTunnelYAML(
+				"    traffic_policy:",
+				"      on_http_response:",
+				"        - name: remove-headers",
+				"          config:",
+				"            headers:",
+				"              - Server",
+			),
+			wantErr: `Tunnel web: alpn offers h2 but the traffic policy has on_http_request/on_http_response rules: h2 connections are raw passthrough, and a visitor must not be able to dodge them by negotiating h2 (on_tcp_connect is fine -- it runs server-side on the raw accept; drop the h2 alpn value or the http rules)`,
+		},
+		{
+			name:    "h2 with a rewritten host_header",
+			config:  alpnTunnelYAML("    host_header: rewrite"),
+			wantErr: `Tunnel web: alpn offers h2 but host_header is set to "rewrite": rewriting the Host header is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop host_header, set it to preserve, or drop the h2 alpn value)`,
+		},
+		{
+			name:    "h2 with an explicit-host host_header",
+			config:  alpnTunnelYAML("    host_header: app.internal"),
+			wantErr: `Tunnel web: alpn offers h2 but host_header is set to "app.internal": rewriting the Host header is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop host_header, set it to preserve, or drop the h2 alpn value)`,
+		},
+		{
+			name: "h2 with request_header manipulation",
+			config: alpnTunnelYAML(
+				"    request_header:",
+				"      add:",
+				"        - \"X-Custom: value\"",
+			),
+			wantErr: `Tunnel web: alpn offers h2 but request_header adds or removes headers: header manipulation is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop the h2 alpn value or the request_header entries)`,
+		},
+		{
+			name: "h2 with response_header manipulation",
+			config: alpnTunnelYAML(
+				"    response_header:",
+				"      remove:",
+				"        - Server",
+			),
+			wantErr: `Tunnel web: alpn offers h2 but response_header adds or removes headers: header manipulation is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop the h2 alpn value or the response_header entries)`,
+		},
+		{
+			// The key is simply absent: compression defaults ON, and the
+			// refusal has to say what to write, not just that it is wrong.
+			name:    "h2 with compression left at its default",
+			config:  strings.Replace(alpnTunnelYAML(), "    compression: false\n", "", 1),
+			wantErr: `Tunnel web: alpn offers h2 but compression is not explicitly false: compression defaults on and is rewriter-driven, which an h2 visitor bypasses -- set compression: false alongside the h2 alpn value`,
+		},
+		{
+			// Explicitly on is the same refusal: the operator stated it, and
+			// what they stated is what an h2 visitor would bypass.
+			name:    "h2 with compression explicitly on",
+			config:  strings.Replace(alpnTunnelYAML(), "    compression: false", "    compression: true", 1),
+			wantErr: `Tunnel web: alpn offers h2 but compression is not explicitly false: compression defaults on and is rewriter-driven, which an h2 visitor bypasses -- set compression: false alongside the h2 alpn value`,
+		},
+		{
+			// The asymmetry, the whole point of gating rule 3 on the h2 value:
+			// pinning h1 changes nothing servicewise, so a tunnel may offer
+			// http/1.1 under every rewriter-driven control it likes.
+			name: "http/1.1 alone needs none of the h2 conditions",
+			config: `
+tunnels:
+  web:
+    proto:
+      https: 127.0.0.1:7000
+    agent_tls_termination: true
+    alpn:
+      - http/1.1
+    host_header: rewrite
+    request_header:
+      add:
+        - "X-Custom: value"
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, tt.config)
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the config to load, got: %v", err)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadConfigurationAlpnTunnel pins that a loaded alpn list survives into
+// the tunnel the loader hands back -- the list tlsagent.go will advertise.
+func TestLoadConfigurationAlpnTunnel(t *testing.T) {
+	configPath := writeConfig(t, alpnTunnelYAML())
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start", args: []string{"web"}})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+
+	tunnel := config.Tunnels["web"]
+	if tunnel == nil {
+		t.Fatalf("expected a tunnel named web, got %d tunnels", len(config.Tunnels))
+	}
+	if want := []string{"h2", "http/1.1"}; !reflect.DeepEqual(tunnel.Alpn, want) {
+		t.Fatalf("alpn: expected %v (order preserved, h2 preferred), got %v", want, tunnel.Alpn)
+	}
+}
+
+// TestAlpnConfigYAMLRoundTrip runs the alpn key through the marshal/unmarshal
+// cycle SaveAuthToken puts every config through, and checks the other
+// direction too: a config that says nothing about alpn must not grow the key
+// when re-marshaled (the field is omitempty).
+func TestAlpnConfigYAMLRoundTrip(t *testing.T) {
+	config := new(Configuration)
+	if err := yaml.Unmarshal([]byte(alpnTunnelYAML()), config); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	for _, key := range []string{"alpn:", "- h2", "- http/1.1"} {
+		if !strings.Contains(string(marshaled), key) {
+			t.Fatalf("marshaled config is missing %q:\n%s", key, marshaled)
+		}
+	}
+
+	reloaded := new(Configuration)
+	if err := yaml.Unmarshal(marshaled, reloaded); err != nil {
+		t.Fatalf("failed to re-unmarshal marshaled config: %v", err)
+	}
+	if again := reloaded.Tunnels["web"]; !reflect.DeepEqual(config.Tunnels["web"], again) {
+		t.Fatalf("round trip changed the tunnel:\n before: %+v\nafter: %+v", config.Tunnels["web"], again)
+	}
+
+	without := new(Configuration)
+	if err := yaml.Unmarshal([]byte(tunnelYAML()), without); err != nil {
+		t.Fatalf("failed to unmarshal the alpn-less config: %v", err)
+	}
+	withoutMarshaled, err := yaml.Marshal(without)
+	if err != nil {
+		t.Fatalf("failed to marshal the alpn-less config: %v", err)
+	}
+	if strings.Contains(string(withoutMarshaled), "alpn") {
+		t.Fatalf("no alpn key should be emitted when none was configured:\n%s", withoutMarshaled)
+	}
+}
+
+// TestValidateAlpnHTTPSRefusalReachableDirectly pins the https-leg half of
+// rule 1, which the loader cannot reach -- validateAgentTLS, earlier in the
+// chain, refuses the same tunnel shape first (the table above pins that
+// ordering). The check is kept in validateAlpn so that the function is a total
+// judge of an alpn list against a tunnel, callable for any tunnel, and so the
+// refusal exists with its own words if the chain is ever reordered.
+func TestValidateAlpnHTTPSRefusalReachableDirectly(t *testing.T) {
+	err := validateAlpn("web", &TunnelConfiguration{
+		Protocols:           map[string]string{"http": "127.0.0.1:8080"},
+		AgentTLSTermination: true,
+		Alpn:                []string{alpnH2},
+	})
+	if err == nil {
+		t.Fatal("expected alpn on an https-less tunnel to be refused")
+	}
+	want := `Tunnel web: alpn requires the tunnel's protocols to include https, got http`
+	if err.Error() != want {
+		t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), want)
+	}
+}
+
+// TestAlpnFlagParsing is the core flag test: -alpn carries its raw
+// comma-separated value, and the flag's default is the empty string the
+// loader reads as "not given".
+func TestAlpnFlagParsing(t *testing.T) {
+	opts, _ := parseArgs(t, []string{"ngrok", "-alpn", "h2, http/1.1", "8080"})
+
+	if want := "h2, http/1.1"; opts.alpn != want {
+		t.Fatalf("-alpn arrived as %q, want the raw value %q (splitting happens at load)", opts.alpn, want)
+	}
+	if opts.command != "default" || len(opts.args) != 1 || opts.args[0] != "8080" {
+		t.Fatalf("positional argument handling changed: command=%q args=%v", opts.command, opts.args)
+	}
+}
+
+// TestAlpnFlagParsingDefaults guards the other direction: without the flag,
+// nothing is offered.
+func TestAlpnFlagParsingDefaults(t *testing.T) {
+	opts, _ := parseArgs(t, []string{"ngrok", "8080"})
+
+	if opts.alpn != "" {
+		t.Fatalf("alpn should default to empty, got %q", opts.alpn)
+	}
+}
+
+// TestAlpnFlagsAreRegistered checks the flag exists and carries help text: a
+// flag nobody can discover in the usage output is as good as missing.
+func TestAlpnFlagsAreRegistered(t *testing.T) {
+	_, usage := parseArgs(t, []string{"ngrok", "8080"})
+
+	if !strings.Contains(usage, "-alpn") {
+		t.Fatalf("flag -alpn is missing from the usage output:\n%s", usage)
+	}
+	if !strings.Contains(usage, "agent-tls-termination") || !strings.Contains(usage, "h2") {
+		t.Fatalf("usage output should explain what -alpn requires and offers:\n%s", usage)
+	}
+}
+
+// TestDefaultTunnelAlpnSynthesis covers the config.go wiring: the flag feeds
+// the synthesized "default" tunnel, split and trimmed, and the same validator
+// that police a config-file alpn key police what the flag produced.
+func TestDefaultTunnelAlpnSynthesis(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	config, err := LoadConfiguration(&Options{
+		config:              configPath,
+		command:             "default",
+		args:                []string{"7000"},
+		protocol:            "https",
+		agentTLSTermination: true,
+		compression:         false,
+		alpn:                "h2, http/1.1",
+	})
+	if err != nil {
+		t.Fatalf("expected the synthesized tunnel to load, got: %v", err)
+	}
+
+	tunnel := config.Tunnels["default"]
+	if tunnel == nil {
+		t.Fatalf("expected a synthesized default tunnel")
+	}
+	if want := []string{"h2", "http/1.1"}; !reflect.DeepEqual(tunnel.Alpn, want) {
+		t.Fatalf("alpn: expected %v (comma split, spaces trimmed), got %v", want, tunnel.Alpn)
+	}
+}
+
+// TestDefaultTunnelWithoutAlpnFlag: a user who sets no -alpn flag must get
+// exactly the tunnel they got before the flag existed -- nil list, nothing
+// advertised.
+func TestDefaultTunnelWithoutAlpnFlag(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	config, err := LoadConfiguration(&Options{
+		config:   configPath,
+		command:  "default",
+		args:     []string{"7000"},
+		protocol: "https",
+	})
+	if err != nil {
+		t.Fatalf("expected the default tunnel to load, got: %v", err)
+	}
+	if tunnel := config.Tunnels["default"]; tunnel.Alpn != nil {
+		t.Fatalf("no -alpn flag should leave the list nil, got %v", tunnel.Alpn)
+	}
+}
+
+// TestDefaultTunnelAlpnSynthesisRejectsBadValues drives the flag road through
+// the same refusals the config-file road uses: same rules, same words, with
+// the synthesized tunnel named.
+func TestDefaultTunnelAlpnSynthesisRejectsBadValues(t *testing.T) {
+	configPath := writeConfig(t, "server_addr: \"tunnel.example.com:443\"\n")
+
+	tests := []struct {
+		name    string
+		alpn    string
+		wantErr string
+	}{
+		{
+			name:    "an unknown token",
+			alpn:    "h2,spdy",
+			wantErr: `Tunnel default: alpn value "spdy" is not supported: the accepted values are "h2" and "http/1.1"`,
+		},
+		{
+			// An empty piece is not a value: the split left it behind, and
+			// advertising "" would be an offer nobody answers.
+			name:    "a trailing comma",
+			alpn:    "h2,",
+			wantErr: `Tunnel default: alpn value "" is not supported: the accepted values are "h2" and "http/1.1"`,
+		},
+		{
+			name:    "a duplicate across the comma",
+			alpn:    "h2,h2",
+			wantErr: `Tunnel default: alpn lists "h2" more than once: advertise each protocol at most once`,
+		},
+		{
+			// Without the switch, the terminator whose ALPN this is does not
+			// exist -- the flag road is refused by the same rule 1 the config
+			// road is.
+			name:    "alpn without -agent-tls-termination",
+			alpn:    "h2",
+			wantErr: `Tunnel default: alpn requires agent_tls_termination: the advertised protocols belong to the TLS handshake this agent terminates, and without it the https leg is terminated on the server, which offers no ALPN`,
+		},
+		{
+			// The h2 conditions bind the flag road too: the flag turned
+			// compression off here, but the header flags turned a control on.
+			name:    "h2 with -request-header-add",
+			alpn:    "h2",
+			wantErr: `Tunnel default: alpn offers h2 but request_header adds or removes headers: header manipulation is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop the h2 alpn value or the request_header entries)`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &Options{
+				config:              configPath,
+				command:             "default",
+				args:                []string{"7000"},
+				protocol:            "https",
+				agentTLSTermination: true,
+				compression:         false,
+				alpn:                tt.alpn,
+			}
+			if tt.name == "alpn without -agent-tls-termination" {
+				opts.agentTLSTermination = false
+			}
+			if tt.name == "h2 with -request-header-add" {
+				opts.requestHeaderAdd = stringList{"X-Custom: value"}
+			}
+
+			_, err := LoadConfiguration(opts)
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

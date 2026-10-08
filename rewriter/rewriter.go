@@ -16,6 +16,16 @@
 // has already been read. A connection the old code would have carried keeps
 // working; it just stops being rewritten.
 //
+// One stream reaches that raw copy by design rather than by defeat: the HTTP/2
+// prior-knowledge preface. Its first line is shaped exactly like an HTTP/1
+// request line -- "PRI * HTTP/2.0" parses as one -- and everything behind it is
+// binary framing, so a connection that opens with it has stopped being the
+// protocol these machines parse before a single header existed. The preface is
+// recognized at request-head parse and the whole connection, both directions,
+// is handed to the raw copy before anything is rewritten into it (h2Preface);
+// a policy hook armed on the tunnel is the one thing that closes it instead,
+// because passthrough would be a way around the hook.
+//
 // One transformation does touch a body. With Policy.Compress set, a response the
 // client asked for gzip on -- and that is not a HEAD, a bodyless status, an
 // already-encoded message, a byte-range answer or a type that does not compress
@@ -44,6 +54,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"ngrok/log"
 )
@@ -69,6 +80,22 @@ const (
 // errLineTooLong reports a line that does not fit in the 64 KiB read buffer.
 // No valid HTTP framing line here is that long.
 var errLineTooLong = errors.New("line longer than the 64 KiB read buffer")
+
+// errPassthroughWake ends a line wait on a connection that has gone
+// passthrough. The response side of a pair sits between messages in ReadSlice,
+// waiting for a status line; the request side hands the connection to the raw
+// copy when it recognizes the HTTP/2 preface, and what the upstream sends from
+// then on is binary frames that may never contain the delimiter -- a SETTINGS
+// frame does not. Without an exit, that side would hold the upstream's frames
+// in its buffer waiting for a newline that never comes, and the h2 visitor
+// waits for a handshake answer that never leaves the agent: the connection
+// deadlocks with both sides sleeping. The wake flag
+// (connState.passthroughWake) makes ReadSlice hand back the bytes it consumed
+// for the unfinished line together with this error, and stepHead answers it
+// with the same flush-and-go-raw the line-boundary check takes. The flag is
+// consumed one-shot because the raw copy that follows must read the source for
+// real.
+var errPassthroughWake = errors.New("rewriter: connection went passthrough mid-line")
 
 // Policy is the per-tunnel header policy, built from config + StartProxy
 // metadata. Add/Remove entries are ordered slices; add entries are "Key: value"
@@ -715,6 +742,7 @@ const (
 	stGzipClose                 // feeding a close-delimited body to the gzip stream
 	stDrain                     // request terminated: the source is read and discarded
 	stDone                      // a synthetic response was this direction's last message
+	stClosed                    // refused by the h2 preface guard: the connection ends, nothing more is emitted
 )
 
 // connState is the state one connection's two directions share. The request and
@@ -750,6 +778,19 @@ type connState struct {
 	// and the request side checks this flag before parsing its next head).
 	upgraded bool
 
+	// passthrough records that the connection has stopped being HTTP/1 text in
+	// both directions: the request side recognized an HTTP/2 prior-knowledge
+	// preface (h2Preface) and handed the whole connection to the raw copy. It
+	// is the h2 counterpart of upgraded, and the response side needs it for the
+	// same reason the request side needs its own way to stop parsing: an
+	// upstream that speaks h2 answers with frames, which the response side's
+	// head assembly would otherwise keep trying to read as a status line,
+	// holding the server's first bytes until a line break happened to turn up
+	// in them or 64 KiB accumulated. With the flag, the response side stops
+	// parsing at its next checkpoint -- stepHead's entry, or its line loop --
+	// and copies the rest verbatim.
+	passthrough bool
+
 	// terminate carries a synthetic response from the direction that decided on
 	// it (the request side: a hook terminated the request, or a head the policy
 	// could not read was refused) to the direction that can put it on the wire
@@ -777,6 +818,20 @@ type connState struct {
 	// is closing the source and not setting a read deadline on it: see the wake
 	// there for the mux-path hang that rules deadlines out.
 	wakeResponse func()
+
+	// passthroughWake is the one-shot flag errPassthroughWake rides on. Where
+	// the terminate wake must end a read that will never be answered (closing
+	// the source is the only tool that does that on every conn implementation),
+	// the passthrough wake only has to end a line WAIT: the upstream of a
+	// passthrough connection is speaking -- its first frames are what would
+	// sit undelivered in the line buffer -- so the read itself returns and the
+	// exit is needed at the next loop decision, not inside the source. That is
+	// why this wake can work without closing anything: the response reader's
+	// ReadSlice checks the flag between its delimiter scan and its next fill,
+	// a point it reaches whenever the source hands it bytes, whatever the
+	// connection implementation is. Armed by setPassthrough on the request
+	// side, consumed once by the response side's pooledReader.
+	passthroughWake *atomic.Bool
 
 	// respParked is true while the response side is between messages and about
 	// to block in a read of the source; parkedGen is the request generation it
@@ -945,6 +1000,26 @@ func (st *connState) isUpgraded() bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.upgraded
+}
+
+// setPassthrough marks the connection as one whose bytes are no longer HTTP/1
+// text, so that both directions stop parsing theirs (see
+// connState.passthrough). Request side only: the preface is recognized there,
+// and it is the one side that cannot miss it.
+func (st *connState) setPassthrough() {
+	st.mu.Lock()
+	st.passthrough = true
+	wake := st.passthroughWake
+	st.mu.Unlock()
+	if wake != nil {
+		wake.Store(true)
+	}
+}
+
+func (st *connState) isPassthrough() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.passthrough
 }
 
 // streamRewriter is one direction's read-driven state machine. It reads through
@@ -1164,6 +1239,12 @@ var errNegativeRead = errors.New("rewriter: source returned a negative read coun
 type pooledReader struct {
 	src io.Reader
 
+	// wake, on the response side's reader, is the connection's
+	// passthroughWake flag: ReadSlice consults it between its delimiter scan
+	// and its next fill (see errPassthroughWake). nil on the request side,
+	// which is the side that arms it and never waits on it.
+	wake *atomic.Bool
+
 	mu         sync.Mutex
 	buf        *readBuf // the pooled buffer cell; nil while recycled
 	terminated bool     // a read returned a source error with nothing buffered
@@ -1346,6 +1427,21 @@ func (pr *pooledReader) ReadSlice(delim byte) (line []byte, err error) {
 			pr.r += i + 1
 			return line, nil
 		}
+		// Between the scan and the next fill is the one point this loop can
+		// leave without a delimiter: the connection went passthrough while
+		// this direction was assembling a line, so what it consumed is not a
+		// line and never will be. Hand it back as a partial with the wake
+		// error -- stepHead replays it in order and goes raw. Reaching this
+		// point means the source delivered bytes (or is about to be asked
+		// again after delivering some earlier), which is exactly the
+		// passthrough shape: the upstream is speaking, just not in lines.
+		// CompareAndSwap, not Load: the return is one-shot, and the raw copy
+		// that follows must read the source for real.
+		if pr.wake != nil && pr.wake.CompareAndSwap(true, false) {
+			line = b[pr.r:pr.w]
+			pr.r = pr.w
+			return line, errPassthroughWake
+		}
 		if pr.err != nil {
 			line = b[pr.r:pr.w]
 			pr.r = pr.w
@@ -1417,16 +1513,22 @@ func (r *streamRewriter) releaseBuffer() {
 // bufio.NewReaderSize code had, and no worse.
 func newPairWithWake(reqSrc, respSrc io.Reader, p *Policy, reqLog, respLog log.Logger, wake func()) (req, resp io.Reader) {
 	cp := compilePolicy(p, reqLog)
-	st := &connState{wakeResponse: wake}
+	// The passthrough wake is always present, in-memory pairs included: it
+	// costs one atomic, and the in-memory preface tests then exercise the
+	// same exit the live connection takes.
+	var passthroughWake atomic.Bool
+	st := &connState{wakeResponse: wake, passthroughWake: &passthroughWake}
 
 	req = &streamRewriter{
 		side: sideRequest, dir: "request",
 		br: newPooledReader(reqSrc), lg: reqLog, st: st, cp: cp,
 		phase: stHead,
 	}
+	respBr := newPooledReader(respSrc)
+	respBr.wake = &passthroughWake
 	resp = &streamRewriter{
 		side: sideResponse, dir: "response",
-		br: newPooledReader(respSrc), lg: respLog, st: st, cp: cp,
+		br: respBr, lg: respLog, st: st, cp: cp,
 		phase: stHead,
 	}
 	return req, resp
@@ -1510,7 +1612,11 @@ func (r *streamRewriter) step() error {
 		return r.stepGzipClose()
 	case stDrain:
 		return r.stepDrain()
-	case stDone:
+	case stDone, stClosed:
+		// stDone is a direction whose last message went out; stClosed is one
+		// the preface guard refused. Either way there is nothing left to
+		// emit, and the clean EOF is what ends the join -- and with it the
+		// connection, which is the point of stClosed.
 		return io.EOF
 	}
 	return r.stepRaw()
@@ -1584,6 +1690,18 @@ func (r *streamRewriter) stepBodyCL() error {
 // stepHead assembles one request or response head, rewrites it, queues it, and
 // decides how the body that follows is framed.
 func (r *streamRewriter) stepHead() error {
+	// A connection the h2 preface guard handed to the raw copy is not HTTP/1
+	// text in either direction, and this side may be anywhere inside its first
+	// head: go raw before another line of it is read as one. On the request
+	// side this is unreachable -- the guard leaves that side in stRaw itself --
+	// but the state is the connection's, not a direction's, and one check for
+	// it at the door reads better than a proof of who could possibly have set
+	// it.
+	if r.st.isPassthrough() {
+		r.phase = stRaw
+		return nil
+	}
+
 	// The request side stops parsing once the connection has been upgraded: the
 	// response side sets the flag when it sees a 101, and from there on the bytes
 	// belong to the upgraded protocol -- binary websocket frames, which may well
@@ -1648,6 +1766,17 @@ func (r *streamRewriter) stepHead() error {
 			r.failOpen("head line longer than 64 KiB")
 			return nil
 		}
+		if err == errPassthroughWake {
+			// The line wait ended because the connection went passthrough,
+			// not because the source ended: everything consumed so far --
+			// tolerated blank lines, a partial first line, whatever binary
+			// bytes arrived -- is replayed in order and this direction joins
+			// the raw copy. The same body as the line-boundary check below,
+			// reached from the other side of the same race.
+			r.flushPending()
+			r.phase = stRaw
+			return nil
+		}
 		if err != nil {
 			if len(r.pending) == 0 {
 				// A terminate is one reason this read ended: the wake
@@ -1668,6 +1797,21 @@ func (r *streamRewriter) stepHead() error {
 			// End of stream inside a head: the connection is over either way, but
 			// the peer still gets every byte it sent.
 			r.failOpen("end of stream in the middle of a head")
+			return nil
+		}
+		// The preface guard may fire while this side is in the middle of its own
+		// first head: the response side parks here before the request side has
+		// parsed anything, and an upstream speaks only after the client's
+		// preface has reached it through the raw copy the guard installs. The
+		// first checkpoint after that is a line boundary -- h2 frames are
+		// binary, but any boundary will do -- and at one, the connection is
+		// already a raw copy in both directions: hand back what this side
+		// consumed, in order, and stop parsing it. The log line for the event is
+		// the request side's; this is the same connection seen from the other
+		// end.
+		if r.side == sideResponse && r.st.isPassthrough() {
+			r.flushPending()
+			r.phase = stRaw
 			return nil
 		}
 		if len(r.pending) > maxHeadBytes {
@@ -1706,6 +1850,17 @@ func (r *streamRewriter) stepHead() error {
 			return nil
 		}
 		r.failOpen("malformed head: %v", err)
+		return nil
+	}
+
+	// The HTTP/2 prior-knowledge preface (RFC 7540 3.5) parses as a request
+	// line -- that is the trap -- and the stream behind it is binary framing, so
+	// a head that got this far without an error is not a request at all. The
+	// guard decides what the connection becomes; nothing below may treat the
+	// head as a request, because there is no request to rewrite, forward, or
+	// buffer a body for.
+	if r.side == sideRequest && head.isHTTP2Preface() {
+		r.h2Preface()
 		return nil
 	}
 
@@ -2143,6 +2298,58 @@ func (r *streamRewriter) refuseHead(reason, body string) bool {
 // branch that reads it is one predictable load on a path that is about to
 // block in a read.
 var testParkGapHook func(*connState)
+
+// h2Preface is the guard for the HTTP/2 prior-knowledge connection preface
+// (RFC 7540 3.5): "PRI * HTTP/2.0", then "SM\r\n\r\n", then SETTINGS frames.
+// The request line parses as HTTP/1 -- that is the trap, and the reason a head
+// this far along carries no error -- and everything behind it is binary
+// framing, so this head is not a request but the first line of a different
+// protocol. Left to the ordinary path, it would be rewritten like one: the
+// policy's headers spliced into a fixed 24-byte preface, shifting the SM out
+// of position, and every conforming h2 server closing the connection as a
+// framing error. What happens instead is decided by whether the policy has
+// hooks armed:
+//
+//   - No hooks: the connection is passed through, whole. The bytes consumed so
+//     far -- the preface line and whatever tolerated blank lines preceded it --
+//     are replayed verbatim (the same flush the unparseable-head fail-open
+//     path uses), SM and the SETTINGS frames behind them are still in the read
+//     buffer, and both directions go raw for the life of the connection. No
+//     injection, no rewriting, no compression: an h2 connection has no HTTP/1
+//     heads for any of it to apply to, and a header line spliced into framing
+//     is not a missing feature but a broken connection. setPassthrough is how
+//     the response side learns -- it cannot detect the preface itself, since
+//     what an h2 upstream sends is frames, not a status line.
+//
+//   - Hooks armed: the connection is closed. Passthrough would deliver every
+//     request on it to the local service without the hook ever seeing one --
+//     an h2 visitor's way around an armed control -- and this configuration is
+//     refused when the tunnel is loaded; the guard is the depth behind that
+//     refusal, not its only line. Closing, and not answering: the visitor
+//     assumed h2, an HTTP/1-text error is not something it can read -- a 431
+//     would be garbage framing to it -- and a closed connection says the same
+//     thing without pretending to speak its protocol. The bytes consumed so
+//     far are dropped, never forwarded.
+//
+// The live logger is the connection itself (NewConnPair logs through the
+// source conns), so the warning names it -- and with it the tunnel -- the way
+// every other warn here does.
+func (r *streamRewriter) h2Preface() {
+	if r.cp.reqHook != nil || r.cp.respHook != nil {
+		r.lg.Warn("%s: HTTP/2 prior-knowledge preface; a policy hook is armed on this connection, so it is closed without an answer rather than passed through", r.dir)
+		r.pending = r.pending[:0]
+		r.phase = stClosed
+		return
+	}
+	// The Info rather than the fail-open Warn is deliberate: on a tunnel that
+	// offers h2 this line is the feature working, and one per connection at
+	// WARNING would be noise. It is still the moment this connection stopped
+	// being rewritten -- X-Forwarded-For included -- and the log says so.
+	r.lg.Info("%s: HTTP/2 prior-knowledge preface; the whole connection passes through unmodified, in both directions", r.dir)
+	r.st.setPassthrough()
+	r.flushPending()
+	r.phase = stRaw
+}
 
 // hookRewrite consults the policy hook for this head, if the policy has one and
 // this head is one it applies to, and returns the verdict merged for the
@@ -3091,6 +3298,19 @@ func (h *parsedHead) acceptsGzip() bool {
 // "Connection: upgrade" and a non-empty Upgrade field (RFC 7230 6.7).
 func (h *parsedHead) isUpgrade() bool {
 	return h.hasToken("connection", "upgrade") && h.firstValue("upgrade") != ""
+}
+
+// isHTTP2Preface reports whether a request head is the fixed prior-knowledge
+// preface line of HTTP/2 (RFC 7540 3.5). Either signal is enough to say the
+// stream is not HTTP/1: the method is PRI -- a token, reserved, part of no
+// HTTP/1 exchange -- or the version names HTTP/2.0, which isHTTPVersion's
+// digit.digit shape lets through. That acceptance is what made a preface look
+// like a request here at all; this predicate is where it ends, and where the
+// connection stops being treated as one. Both tests are exact: the preface is
+// spelled one way, and a method or version that only resembles it is a stream
+// for the ordinary rules, whatever it turns out to be.
+func (h *parsedHead) isHTTP2Preface() bool {
+	return h.method == "PRI" || h.version == "HTTP/2.0"
 }
 
 // chunked reports whether the message is chunk-framed.

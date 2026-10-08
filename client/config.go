@@ -98,6 +98,17 @@ type TunnelConfiguration struct {
 	// registration is picked up at the next reconnect.
 	TLS *TLSConfig `yaml:"tls,omitempty"`
 
+	// Alpn lists the application protocols this tunnel's public TLS handshake
+	// advertises (SPEC-CLUSTER16 1), in preference order: ["h2", "http/1.1"]
+	// offers both and prefers h2. Nil -- the default -- advertises nothing at
+	// all, byte-identical handshakes to before the key existed, because
+	// advertising h2 unconditionally would flip every h2-capable visitor onto
+	// h2 toward local services that only speak HTTP/1.1. Opt-in is the only
+	// safe default. The list is agent-local -- it belongs to the terminator,
+	// tlsagent.go -- so it never travels the wire; what may accompany an h2
+	// offer is validateAlpn's business, and that is checked at load.
+	Alpn []string `yaml:"alpn,omitempty"`
+
 	// HTTP header manipulation. Validated for every tunnel regardless of
 	// protocol, but only applied to http tunnels.
 	HostHeader     string        `yaml:"host_header,omitempty"`
@@ -356,6 +367,13 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			return
 		}
 
+		// alpn is judged last on purpose: its h2 rules read the policy and the
+		// header settings the validators above have already normalized (see
+		// validateAlpn).
+		if err = validateAlpn(name, t); err != nil {
+			return
+		}
+
 		// use the name of the tunnel as the subdomain if none is specified.
 		// Port-routed protocols (tcp, udp) never take a name -- the server
 		// refuses hostname/subdomain on them because their url is the bound
@@ -445,12 +463,14 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 			TrafficPolicy: filePolicy,
 
 			// Fixed remote port and agent TLS termination (SPEC-CLUSTER5),
-			// wired exactly like the proto options above: the flags feed the
-			// synthesized tunnel, and the same validators that police a
-			// config-file tunnel police what the flags produced.
+			// and the tunnel's alpn list (SPEC-CLUSTER16 1), wired exactly
+			// like the proto options above: the flags feed the synthesized
+			// tunnel, and the same validators that police a config-file
+			// tunnel police what the flags produced.
 			RemotePort:          uint16(opts.remotePort),
 			AgentTLSTermination: opts.agentTLSTermination,
 			TLS:                 newTLSConfig(opts.tlsCrt, opts.tlsKey, opts.tlsCaCrt, opts.tlsCaKey),
+			Alpn:                parseAlpnFlag(opts.alpn),
 		}
 
 		for _, proto := range strings.Split(opts.protocol, "+") {
@@ -495,6 +515,13 @@ func LoadConfiguration(opts *Options) (config *Configuration, err error) {
 		}
 
 		if err = validateTrafficPolicy("default", config.Tunnels["default"]); err != nil {
+			return
+		}
+
+		// Same position as in the config-file loop: after the flag-built
+		// policy has been resolved, so the h2 refusals judge the policy that
+		// will actually run.
+		if err = validateAlpn("default", config.Tunnels["default"]); err != nil {
 			return
 		}
 
@@ -587,6 +614,17 @@ const (
 	hostHeaderPreserve = "preserve"
 )
 
+// The alpn vocabulary (SPEC-CLUSTER16 1). Both spellings are the exact ALPN
+// wire tokens -- "h2" is the identifier RFC 7540 registers for HTTP/2 and
+// "http/1.1" the one HTTP/1.1 negotiates with -- and they are matched exactly
+// rather than case-folded: whatever is configured is advertised verbatim in
+// the handshake, and a near-miss spelling ("H2", "HTTP/2") is an offer no
+// visitor can answer, so it is refused instead of sent.
+const (
+	alpnH2     = "h2"
+	alpnHTTP11 = "http/1.1"
+)
+
 // newHeaderConfig turns the repeatable flag values into a HeaderConfig. It
 // returns nil when both lists are empty so that users who set no header flags
 // keep the exact config they had before (no empty request_header block, and no
@@ -609,6 +647,27 @@ func newTLSConfig(crt, key, caCrt, caKey string) *TLSConfig {
 	}
 
 	return &TLSConfig{Crt: crt, Key: key, CaCrt: caCrt, CaKey: caKey}
+}
+
+// parseAlpnFlag splits -alpn's comma-separated value into a tunnel's alpn
+// list (SPEC-CLUSTER16 1), tolerating spaces around the values: "-alpn=h2,
+// http/1.1" and "-alpn h2, http/1.1" are one list. The flag's empty default
+// stays nil, which is exactly the list a config-file tunnel without the key
+// gets. Nothing else is decided here -- an empty piece, an unknown token, a
+// duplicate are all left for validateAlpn -- so a flag and a config key are
+// refused for the same reasons in the same words.
+func parseAlpnFlag(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	alpn := make([]string, 0, len(parts))
+	for _, part := range parts {
+		alpn = append(alpn, strings.TrimSpace(part))
+	}
+
+	return alpn
 }
 
 // validateHeaderPolicy validates the header settings of one tunnel. It is
@@ -1022,6 +1081,112 @@ func validateAgentTLS(tunnelName string, t *TunnelConfiguration) error {
 	// which the client then reports the same way.
 	if _, err := agentTLSConfig(t); err != nil {
 		return fmt.Errorf("Tunnel %s: %v", tunnelName, err)
+	}
+
+	return nil
+}
+
+// validateAlpn checks a tunnel's alpn list (SPEC-CLUSTER16 1): the application
+// protocols its agent-terminated terminator offers on the public TLS
+// handshake. Like the validators around it, it runs for config-file tunnels
+// and for the CLI-synthesized "default" tunnel, and everything it rejects is a
+// startup error naming the tunnel and the rule.
+//
+// It is deliberately the last validator in the chain, because the h2 rules are
+// about what ELSE the tunnel configures: they read the traffic policy the
+// loaders above have already resolved from traffic_policy_file and stripped of
+// empty documents, so an empty policy block cannot masquerade as armed hooks.
+//
+// The matrix has a deliberate asymmetry worth stating: only an h2 offer
+// triggers the passthrough rules. ["http/1.1"] alone pins the leg to h1, which
+// the rewriter-driven path already serves, so it changes nothing servicewise
+// and demands nothing. With h2 in the list, the connection is raw passthrough
+// -- nothing rewriter-driven runs on it -- so every rewriter-driven control
+// the tunnel configures would be a control h2 visitors could dodge by
+// negotiating h2, and each refusal below names the conflicting key and says
+// which side to give up.
+func validateAlpn(tunnelName string, t *TunnelConfiguration) error {
+	if t.Alpn == nil {
+		return nil
+	}
+	if len(t.Alpn) == 0 {
+		return fmt.Errorf("Tunnel %s: alpn is empty: omit the key to offer no ALPN, or list %q and/or %q", tunnelName, alpnH2, alpnHTTP11)
+	}
+
+	// Rule 1: the advertised protocols belong to the handshake THIS agent
+	// terminates. Without agent_tls_termination the https leg's TLS ends on
+	// the server, which advertises no ALPN -- the list would be a promise the
+	// handshake never makes. (The https-leg half of the rule mirrors
+	// validateAgentTLS's own check, so this function is a total judge of an
+	// alpn list; through the loader the earlier validator answers that shape
+	// first.)
+	if !t.AgentTLSTermination {
+		return fmt.Errorf("Tunnel %s: alpn requires agent_tls_termination: the advertised protocols belong to the TLS handshake this agent terminates, and without it the https leg is terminated on the server, which offers no ALPN", tunnelName)
+	}
+	hasHTTPS := false
+	for proto := range t.Protocols {
+		if proto == msg.ProtoHTTPS {
+			hasHTTPS = true
+		}
+	}
+	if !hasHTTPS {
+		return fmt.Errorf("Tunnel %s: alpn requires the tunnel's protocols to include https, got %v", tunnelName, protoNames(t.Protocols))
+	}
+
+	// Rule 2: the vocabulary. Matched exactly against the two wire tokens, no
+	// duplicates -- a protocol advertised twice is a malformed offer, and a
+	// token outside the set is one no visitor could ever negotiate.
+	seen := make(map[string]bool, len(t.Alpn))
+	for _, proto := range t.Alpn {
+		switch proto {
+		case alpnH2, alpnHTTP11:
+		default:
+			return fmt.Errorf("Tunnel %s: alpn value %q is not supported: the accepted values are %q and %q", tunnelName, proto, alpnH2, alpnHTTP11)
+		}
+		if seen[proto] {
+			return fmt.Errorf("Tunnel %s: alpn lists %q more than once: advertise each protocol at most once", tunnelName, proto)
+		}
+		seen[proto] = true
+	}
+
+	// Rule 3, h2 only: the tunnel must be servable for h2 visitors, which by
+	// the passthrough semantics means nothing rewriter-driven may be
+	// configured. on_tcp_connect is deliberately absent from this list -- it
+	// runs server-side on the raw accept, before any TLS exists, so an h2
+	// connection cannot dodge it.
+	if !seen[alpnH2] {
+		return nil
+	}
+
+	if t.TrafficPolicy != nil && (len(t.TrafficPolicy.OnHTTPRequest) > 0 || len(t.TrafficPolicy.OnHTTPResponse) > 0) {
+		return fmt.Errorf("Tunnel %s: alpn offers h2 but the traffic policy has on_http_request/on_http_response rules: h2 connections are raw passthrough, and a visitor must not be able to dodge them by negotiating h2 (on_tcp_connect is fine -- it runs server-side on the raw accept; drop the h2 alpn value or the http rules)", tunnelName)
+	}
+
+	// host_header is judged the way the rewriter judges it, case-insensitively
+	// on the keyword: "Preserve" resolves to preserve just as "PRESERVE" does,
+	// and neither is a control an h2 visitor could dodge.
+	if t.HostHeader != "" && !strings.EqualFold(t.HostHeader, hostHeaderPreserve) {
+		return fmt.Errorf("Tunnel %s: alpn offers h2 but host_header is set to %q: rewriting the Host header is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop host_header, set it to preserve, or drop the h2 alpn value)", tunnelName, t.HostHeader)
+	}
+
+	for _, headers := range []struct {
+		key string
+		cfg *HeaderConfig
+	}{
+		{"request_header", t.RequestHeader},
+		{"response_header", t.ResponseHeader},
+	} {
+		if headers.cfg == nil || (len(headers.cfg.Add) == 0 && len(headers.cfg.Remove) == 0) {
+			continue
+		}
+		return fmt.Errorf("Tunnel %s: alpn offers h2 but %s adds or removes headers: header manipulation is rewriter-driven, and a visitor must not be able to dodge it by negotiating h2 (drop the h2 alpn value or the %s entries)", tunnelName, headers.key, headers.key)
+	}
+
+	// Compression defaults ON, and the rewriter cannot frame h2 bodies -- so an
+	// operator must state the off, and a config that merely failed to turn it
+	// off is refused the same way one that turned it on is.
+	if t.Compress() {
+		return fmt.Errorf("Tunnel %s: alpn offers h2 but compression is not explicitly false: compression defaults on and is rewriter-driven, which an h2 visitor bypasses -- set compression: false alongside the h2 alpn value", tunnelName)
 	}
 
 	return nil

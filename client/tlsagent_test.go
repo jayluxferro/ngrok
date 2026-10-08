@@ -474,6 +474,171 @@ func TestAgentTLSModelsShareTheInvariants(t *testing.T) {
 	}
 }
 
+// Tests for the alpn advertisement (SPEC-CLUSTER16 2). The load-time contract
+// -- what may be offered alongside h2 -- is config_test.go's; these pin the
+// terminator half: the configured list reaches NextProtos on every model a tls
+// block can select, a tunnel without the key advertises nothing at all, and a
+// real handshake against a finished config actually negotiates h2.
+
+// agentTLSModelCases is the three-model table TestAgentTLSModelsShareTheInvariants
+// walks, rebuilt here so the ALPN rules are checked against every cert model,
+// not just whichever one the first test happened to build. Adding a fourth
+// model means adding it here -- and to that test -- by hand, which is the point:
+// a model that skipped the shared invariants would be a model advertising (or
+// not advertising) protocols on its own authority.
+func agentTLSModelCases(t *testing.T) []struct {
+	name string
+	tls  *TLSConfig
+} {
+	t.Helper()
+
+	caPEM, caKeyPEM := agentTestCA(t)
+	caBlock, _ := pem.Decode(caPEM)
+	caCert, _ := x509.ParseCertificate(caBlock.Bytes)
+	keyBlock, _ := pem.Decode(caKeyPEM)
+	caKey, _ := x509.ParseECPrivateKey(keyBlock.Bytes)
+	crtPEM, keyPEM := agentTestLeafPEM(t, caCert, caKey, "alpn.example.com")
+
+	return []struct {
+		name string
+		tls  *TLSConfig
+	}{
+		{"explicit", &TLSConfig{
+			Crt: writeAgentTLSFile(t, "alpn.crt", crtPEM),
+			Key: writeAgentTLSFile(t, "alpn.key", keyPEM),
+		}},
+		{"ca", &TLSConfig{
+			CaCrt: writeAgentTLSFile(t, "alpn-ca.crt", caPEM),
+			CaKey: writeAgentTLSFile(t, "alpn-ca.key", caKeyPEM),
+		}},
+		{"ephemeral", nil},
+	}
+}
+
+// TestAgentTLSNoAlpnLeavesNextProtosNil is the byte-identity gate (SPEC-CLUSTER16
+// review gate 1): a tunnel with no alpn key must advertise no application
+// protocol, so its visitor handshakes stay byte-identical to before the key
+// existed. Advertising h2 unconditionally would flip every h2-capable visitor
+// onto h2 toward local services that only speak HTTP/1.1.
+func TestAgentTLSNoAlpnLeavesNextProtosNil(t *testing.T) {
+	for _, tc := range agentTLSModelCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := agentTLSConfig(&TunnelConfiguration{TLS: tc.tls})
+			if err != nil {
+				t.Fatalf("agentTLSConfig: %v", err)
+			}
+			if cfg.NextProtos != nil {
+				t.Fatalf("a tunnel without alpn must advertise nothing, got %v", cfg.NextProtos)
+			}
+		})
+	}
+}
+
+// TestAgentTLSAlpnAdvertisedOnEveryModel is the configured half: the tunnel's
+// list reaches NextProtos as written, in preference order, on every model.
+func TestAgentTLSAlpnAdvertisedOnEveryModel(t *testing.T) {
+	for _, tc := range agentTLSModelCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := agentTLSConfig(&TunnelConfiguration{
+				TLS:  tc.tls,
+				Alpn: []string{"h2", "http/1.1"},
+			})
+			if err != nil {
+				t.Fatalf("agentTLSConfig: %v", err)
+			}
+			if want := []string{"h2", "http/1.1"}; !reflect.DeepEqual(cfg.NextProtos, want) {
+				t.Fatalf("NextProtos = %v, want %v exactly as written (h2 first: h2-capable visitors get h2)", cfg.NextProtos, want)
+			}
+		})
+	}
+}
+
+// handshakeOffering is handshakeWith's ALPN-aware twin: the existing helper
+// builds a client that offers no application protocol, which is exactly the
+// one visitor shape the negotiation test cannot use. Like handshakeWith it
+// runs a real handshake over a pipe, trusting nothing.
+func handshakeOffering(t *testing.T, cfg *tls.Config, serverName string, protos []string) (tls.ConnectionState, error) {
+	t.Helper()
+
+	serverEnd, clientEnd := net.Pipe()
+	defer clientEnd.Close()
+
+	type clientResult struct {
+		state tls.ConnectionState
+		err   error
+	}
+	result := make(chan clientResult, 1)
+	go func() {
+		client := tls.Client(clientEnd, &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+			NextProtos:         protos,
+		})
+		err := client.Handshake()
+		result <- clientResult{client.ConnectionState(), err}
+	}()
+
+	server := tls.Server(serverEnd, cfg)
+	if err := server.Handshake(); err != nil {
+		return tls.ConnectionState{}, err
+	}
+
+	res := <-result
+	return res.state, res.err
+}
+
+// TestAgentTLSAlpnNegotiatesH2 is the end-to-end pin of the feature's promise:
+// against a finished config (the ephemeral model -- the advertisement is the
+// same on every model, just proven above), an h2-offering visitor negotiates
+// h2, the dual-protocol tunnel serves both protocols to the same visitor
+// population, and the unset tunnel answers even an h2-offering visitor with
+// no negotiated protocol at all.
+func TestAgentTLSAlpnNegotiatesH2(t *testing.T) {
+	cfg, err := agentTLSConfig(&TunnelConfiguration{Alpn: []string{"h2", "http/1.1"}})
+	if err != nil {
+		t.Fatalf("agentTLSConfig: %v", err)
+	}
+	unset, err := agentTLSConfig(&TunnelConfiguration{})
+	if err != nil {
+		t.Fatalf("agentTLSConfig: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		cfg   *tls.Config
+		offer []string
+		want  string
+	}{
+		{"an h2 client negotiates h2", cfg, []string{"h2"}, "h2"},
+		{"a client offering both gets the server's first offer, h2", cfg, []string{"h2", "http/1.1"}, "h2"},
+		{"an h1-only client on the same tunnel negotiates http/1.1", cfg, []string{"http/1.1"}, "http/1.1"},
+		{"a client offering no ALPN still connects", cfg, nil, ""},
+		{
+			// The unset half, from the visitor's side: an h2-offering client
+			// against a tunnel with no alpn key negotiates nothing -- the
+			// advertisement is simply absent, which is what keeps the old
+			// handshakes byte-identical.
+			name:  "the unset tunnel answers an h2-offering client with none",
+			cfg:   unset,
+			offer: []string{"h2"},
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state, err := handshakeOffering(t, tc.cfg, "alpn.example.com", tc.offer)
+			if err != nil {
+				t.Fatalf("handshake offering %v failed: %v", tc.offer, err)
+			}
+			if state.NegotiatedProtocol != tc.want {
+				t.Fatalf("negotiated %q, want %q", state.NegotiatedProtocol, tc.want)
+			}
+		})
+	}
+}
+
 // TestAgentTLSCAModelRefusesNonCA is the CA model's loudest failure mode: a
 // plain leaf named as a CA would mint certificates nobody can verify, and the
 // error has to say the named file is not an authority.

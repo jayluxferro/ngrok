@@ -713,6 +713,7 @@ type fakeConn struct {
 	dst    bytes.Buffer
 	id     string
 	warned []string
+	infos  []string
 }
 
 func (c *fakeConn) Read(p []byte) (int, error)  { return c.src.Read(p) }
@@ -722,6 +723,10 @@ func (c *fakeConn) Id() string                  { return c.id }
 func (c *fakeConn) Warn(format string, args ...interface{}) error {
 	c.warned = append(c.warned, fmt.Sprintf(format, args...))
 	return nil
+}
+
+func (c *fakeConn) Info(format string, args ...interface{}) {
+	c.infos = append(c.infos, fmt.Sprintf(format, args...))
 }
 
 // TestNewConnPairDelegates: the adapter rewrites Reads and leaves every other
@@ -2533,5 +2538,405 @@ func TestPipelinedTerminateAnswersItsOwnRequest(t *testing.T) {
 		stream.done()
 	case <-time.After(5 * time.Second):
 		t.Fatal("the response side never produced R1's response and R2's synthetic response")
+	}
+}
+
+// The HTTP/2 prior-knowledge preface (SPEC-CLUSTER16, workstream A).
+//
+// "PRI * HTTP/2.0" parses as an HTTP/1 request line -- PRI is a token, "*" a
+// non-empty target, and the version grammar takes any digit.digit -- so a
+// preface used to flow into the rewrite path like any other request, and the
+// tunnel's always-on X-Forwarded injection spliced a header line into a fixed
+// 24-byte preface, shifting SM out of position. Every conforming h2 server
+// then closed the connection as a framing error. The tests below pin the
+// guard that replaces that: the connection is not a request stream, and it is
+// handed to the raw copy whole -- or closed outright when a policy hook is
+// armed, because passthrough would be a way around the hook.
+
+// h2ClientBytes is the fixed client connection preface of HTTP/2 (RFC 7540
+// 3.5) followed by the frames a real client sends with it: an empty SETTINGS,
+// then a DATA frame on stream 1 whose payload carries line breaks -- binary
+// framing is under no obligation not to, which is exactly why the bytes after
+// the first head must never be parsed as heads.
+var h2ClientBytes = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" +
+	"\x00\x00\x00\x04\x00\x00\x00\x00\x00" + // SETTINGS, empty payload
+	"\x00\x00\x0c\x00\x01\x00\x00\x00\x01" + "hello\nworld\n" // DATA on stream 1, END_STREAM
+
+// h2ServerBytes is what an h2 upstream answers with: its own SETTINGS, the ACK
+// of the client's, a WINDOW_UPDATE. The increment's low byte is 0x0a on
+// purpose: the response side's first checkpoint after the guard fires is a
+// line boundary, and these frames have to survive arriving as "lines".
+var h2ServerBytes = "\x00\x00\x0c\x04\x00\x00\x00\x00\x00" + // SETTINGS
+	"\x00\x00\x00\x04\x01\x00\x00\x00\x00" + // SETTINGS ACK
+	"\x00\x00\x04\x08\x00\x00\x00\x00\x00" + "\x00\x0f\x00\x0a" // WINDOW_UPDATE
+
+// h2ServerNoDelimBytes is h2ServerBytes with the one byte that made it
+// line-shaped replaced: no 0x0a anywhere, so no read of it can ever return a
+// "line" and the only exit from a line wait over it is the passthrough wake
+// itself. A live upstream's first frames usually look exactly like this --
+// SETTINGS carries values, not line breaks -- and the e2e hang the wake closes
+// was precisely this shape: frames held in the line buffer, both sides asleep.
+var h2ServerNoDelimBytes = "\x00\x00\x0c\x04\x00\x00\x00\x00\x00" + // SETTINGS
+	"\x00\x00\x00\x04\x01\x00\x00\x00\x00" + // SETTINGS ACK
+	"\x00\x00\x04\x08\x00\x00\x00\x00\x00" + "\x00\x0f\x00\x05" // WINDOW_UPDATE
+
+// TestHTTP2PrefacePassesThroughByteExact is the regression test for the bug
+// the guard closes. The policy is tunnelPolicy -- the one every live http
+// tunnel builds, X-Forwarded injection included, which is exactly the header
+// that used to land inside the preface -- and every byte in must come out
+// byte for byte, preface, SM, frames, and the ordinary HTTP/1 request
+// pipelined behind them. That last part is the "whole connection" claim: the
+// guard is not a per-message decision, and nothing later on the connection is
+// parsed either, so a client that speaks h2 and h1 on different connections
+// gets both behaviors from the same tunnel.
+func TestHTTP2PrefacePassesThroughByteExact(t *testing.T) {
+	in := h2ClientBytes + "GET /after HTTP/1.1\r\nHost: a.example\r\n\r\n"
+
+	gotReq, gotResp := pair(t, tunnelPolicy(), in, h2ServerBytes)
+	check(t, "request", gotReq, in)
+	check(t, "response", gotResp, h2ServerBytes)
+	if strings.Contains(gotReq, "X-Forwarded-For") {
+		t.Fatalf("a header was injected into the h2 preface")
+	}
+}
+
+// TestHTTP2PrefaceDetection pins the two signals the guard fires on. Either
+// one is enough, because either is enough to say the stream is not HTTP/1:
+// PRI is a reserved method that belongs to no HTTP/1 exchange, and an
+// HTTP/2.0 version on a request line is a client declaring a protocol this
+// parser does not speak. The control at the bottom is the same policy meeting
+// the same shape of head with a different start line, which must still be
+// rewritten -- detection is about the line, not about the connection having
+// headers.
+func TestHTTP2PrefaceDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		head string
+	}{
+		// The preface line itself: both signals at once.
+		{"PRI * HTTP/2.0", "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"},
+		// PRI alone, on a request line that is otherwise ordinary HTTP/1.
+		{"PRI alone", "PRI * HTTP/1.1\r\nHost: a.example\r\n\r\n"},
+		// HTTP/2.0 alone, method and all: the version is what the client
+		// claims, and no HTTP/1 request carries it.
+		{"HTTP/2.0 alone", "GET / HTTP/2.0\r\nHost: a.example\r\n\r\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+": no hook, passes through", func(t *testing.T) {
+			gotReq, _ := pair(t, tunnelPolicy(), tc.head, "")
+			check(t, "request", gotReq, tc.head)
+			if strings.Contains(gotReq, "X-Forwarded-For") {
+				t.Fatalf("a preface head was rewritten instead of passed through")
+			}
+		})
+
+		t.Run(tc.name+": request hook armed, closed", func(t *testing.T) {
+			calls := 0
+			p := &Policy{RequestHook: func(*http.Request) *RequestVerdict {
+				calls++
+				return &RequestVerdict{Terminate: syntheticTermination()}
+			}}
+			gotReq, gotResp := pair(t, p, tc.head, "")
+			if gotReq != "" || gotResp != "" {
+				t.Fatalf("a connection that opened with a preface was carried under an armed hook: %q / %q", gotReq, gotResp)
+			}
+			if calls != 0 {
+				t.Fatalf("the hook was called %d time(s) on a connection with no parsed request", calls)
+			}
+		})
+	}
+
+	// Control: the same policy, the same headers, an HTTP/1 request line. The
+	// guard is about what the start line says, and this is what the connection
+	// it fires on would have looked like.
+	in := "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"
+	gotReq, _ := pair(t, tunnelPolicy(), in, "")
+	check(t, "h1 control", gotReq,
+		"GET / HTTP/1.1\r\nHost: a.example\r\nX-Forwarded-For: 203.0.113.7\r\nX-Forwarded-Proto: http\r\n\r\n")
+}
+
+// TestHTTP2PrefaceWithARequestHookClosesTheConnection pins the armed side of
+// the guard, and the three things "closed" rules out at once: nothing reaches
+// the local service (the preface bytes are dropped, not replayed), nothing is
+// written back (no 431 and no synthetic response of any shape -- an h2
+// visitor cannot read HTTP/1-text errors, so a closed connection is the whole
+// answer), and the hook is never consulted (a preface head parses as a
+// request line, but it is not a request, and no policy action may run on it).
+// The hook here returns a Terminate, the strongest thing it can say, so a
+// guard that merely skipped the rewrite and went on would still fail this on
+// the response bytes.
+//
+// The warning is asserted through the connection the live path logs through:
+// it is what names the event to the operator, on a connection whose id -- and
+// therefore tunnel -- is in its prefix.
+func TestHTTP2PrefaceWithARequestHookClosesTheConnection(t *testing.T) {
+	calls := 0
+	p := &Policy{RequestHook: func(*http.Request) *RequestVerdict {
+		calls++
+		return &RequestVerdict{Terminate: syntheticTermination()}
+	}}
+
+	public := &fakeConn{src: strings.NewReader(h2ClientBytes), id: "h2:public"}
+	upstream := &fakeConn{src: strings.NewReader(""), id: "h2:upstream"}
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("the local service saw %d byte(s) of a connection that opened with a preface: %q", len(got), got)
+	}
+	if got := drain(t, fromUpstream); got != "" {
+		t.Fatalf("the client was answered on a closed connection: %q", got)
+	}
+	if calls != 0 {
+		t.Fatalf("the hook was called %d time(s) on a connection with no parsed request", calls)
+	}
+	if len(public.warned) != 1 {
+		t.Fatalf("the guard warned %d time(s), want the one line that names what happened: %q", len(public.warned), public.warned)
+	}
+	if !strings.Contains(public.warned[0], "HTTP/2 prior-knowledge preface") {
+		t.Fatalf("the warning does not name the preface: %q", public.warned[0])
+	}
+	if !strings.Contains(public.warned[0], "closed") {
+		t.Fatalf("the warning does not say the connection was closed: %q", public.warned[0])
+	}
+}
+
+// TestHTTP2PrefaceWithAResponseHookClosesTheConnection pins "hooks armed" as
+// a property of the connection rather than of one direction: a response-phase
+// action is a control too, and an h2 connection passed through raw would
+// never show it a single response. The request hook is nil here, which is
+// what makes the case sharp -- a guard that only looked at the request hook
+// would pass this connection through.
+//
+// The closing is asserted on the live shape rather than through pair(): the
+// guard is a request-side decision, and what reaches the client is decided by
+// conn.Join's pipe, which closes both legs when the request direction ends.
+// That close is what ends the parked response side's read -- no answer is
+// coming, and none may be fabricated for it.
+func TestHTTP2PrefaceWithAResponseHookClosesTheConnection(t *testing.T) {
+	calls := 0
+	p := &Policy{ResponseHook: func(*http.Response) *ResponseVerdict {
+		calls++
+		return nil
+	}}
+
+	public := &fakeConn{src: strings.NewReader(h2ClientBytes), id: "h2:public"}
+	upstream := newStagedRespConn(h2ServerBytes)
+	toUpstream, fromUpstream := NewConnPair(public, upstream, p)
+
+	respOut := make(chan copyResult, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- copyResult{b.String(), err}
+	}()
+
+	// The response side is parked in its first head -- the state it would be
+	// in on a live connection while the preface is being parsed.
+	select {
+	case <-upstream.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never parked on its upstream")
+	}
+
+	// The request side recognizes the preface and closes the connection: the
+	// local service never sees a byte of it.
+	if got := drain(t, toUpstream); got != "" {
+		t.Fatalf("the local service saw %d byte(s) of a connection that opened with a preface: %q", len(got), got)
+	}
+
+	// What Join's pipe does next: close the legs. The response side's answer
+	// is the teardown, not bytes.
+	upstream.Close()
+
+	select {
+	case got := <-respOut:
+		if got.out != "" {
+			t.Fatalf("the client was answered on a connection the guard closed: %q", got.out)
+		}
+		if got.err == nil {
+			t.Fatal("the parked response side ended cleanly instead of being torn down with the connection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side was not torn down with the connection it was parked on")
+	}
+	if calls != 0 {
+		t.Fatalf("the response hook was called %d time(s) on a connection with no parsed response", calls)
+	}
+}
+
+// TestHTTP2PrefacePutsTheResponseSideRaw is the half the request side cannot
+// see: the response side is parked in its first head long before the preface
+// is parsed -- on a live connection it parks the moment the join starts, and
+// an upstream speaks only after the client's preface reaches it through the
+// raw copy the guard installs. So the guard's flag has to reach a side that
+// is already inside stepHead's line loop, and the first line the upstream's
+// frames happen to contain has to hand the direction over whole: what was
+// consumed comes out in order, and everything behind it is copied raw. An
+// upstream read as a status line instead would hold these bytes until a line
+// break turned up on its own or 64 KiB piled up.
+//
+// The staging is the same shape as TestPipelinedTerminateAnswersItsOwnRequest:
+// the upstream's first read parks until the test releases it, which is what
+// makes "the guard fired while the response side was parked" the case under
+// test rather than a race the test sometimes wins.
+func TestHTTP2PrefacePutsTheResponseSideRaw(t *testing.T) {
+	public := &fakeConn{src: strings.NewReader(h2ClientBytes), id: "h2:public"}
+	upstream := newStagedRespConn(h2ServerBytes)
+
+	toUpstream, fromUpstream := NewConnPair(public, upstream, tunnelPolicy())
+
+	respOut := make(chan copyResult, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, fromUpstream)
+		respOut <- copyResult{b.String(), err}
+	}()
+
+	// The response side is parked in the read of its first "head" -- before
+	// the preface has been parsed, which is the ordering the guard has to
+	// survive.
+	select {
+	case <-upstream.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never parked on its upstream")
+	}
+
+	// The preface parses on the request side and the guard fires: every byte
+	// so far is replayed and the direction goes raw.
+	check(t, "request", drain(t, toUpstream), h2ClientBytes)
+
+	// The upstream's frames arrive after the guard, into a direction that must
+	// no longer be parsing heads: they come out exactly as they went in.
+	close(upstream.release)
+	select {
+	case got := <-respOut:
+		if got.err != nil {
+			t.Fatalf("the response side did not end cleanly: %v", got.err)
+		}
+		check(t, "response", got.out, h2ServerBytes)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never delivered the upstream's frames")
+	}
+}
+
+// heldRespConn is the upstream of the wake test below: it hands over its one
+// payload when released and then holds the connection open -- no further
+// bytes, and no EOF either. That is what a live h2 upstream does after its
+// SETTINGS until the visitor speaks again, and it is the state the wake exists
+// for: the fail-open exit needs an error to trigger, and a healthy upstream
+// that is simply waiting offers none. Only the passthrough wake ends that line
+// wait; before it existed, this shape was the e2e hang, both sides sleeping
+// with zero bytes delivered.
+type heldRespConn struct {
+	conn.Conn
+	entered chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+	payload string
+
+	enterOne sync.Once
+	closeOne sync.Once
+	sent     bool
+}
+
+func newHeldRespConn(payload string) *heldRespConn {
+	return &heldRespConn{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		closed:  make(chan struct{}),
+		payload: payload,
+	}
+}
+
+func (c *heldRespConn) Read(p []byte) (int, error) {
+	c.enterOne.Do(func() { close(c.entered) })
+	if c.sent {
+		// The held tail: a healthy upstream waiting for its client. Only a
+		// close ends it, which is the test's cleanup, not a delivery.
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-c.release:
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+	c.sent = true
+	return copy(p, c.payload), nil
+}
+
+func (c *heldRespConn) Close() error {
+	c.closeOne.Do(func() { close(c.closed) })
+	return nil
+}
+
+// TestHTTP2PrefaceWakeReleasesAResponseSideHeldOnBinary is the live half of
+// TestHTTP2PrefacePutsTheResponseSideRaw. There the staged upstream ended in
+// an EOF, so the direction could leave its line wait through the fail-open
+// exit; here the upstream holds the connection open after its frames, as a
+// real h2 service does, and the only way out of the wait for a status line
+// that will never be one is the wake flag: ReadSlice must hand back what it
+// consumed with errPassthroughWake the moment its next loop point comes, the
+// bytes replay in order, and the direction joins the raw copy while the source
+// stays open. The request side's assertion runs first because the guard must
+// have fired before the frames arrive -- the order of a live connection, where
+// the upstream speaks only after the preface reaches it through the raw copy.
+func TestHTTP2PrefaceWakeReleasesAResponseSideHeldOnBinary(t *testing.T) {
+	public := &fakeConn{src: strings.NewReader(h2ClientBytes), id: "h2:public"}
+	upstream := newHeldRespConn(h2ServerNoDelimBytes)
+
+	toUpstream, fromUpstream := NewConnPair(public, upstream, tunnelPolicy())
+
+	// The copy is bounded to exactly the payload's length so its return does
+	// not depend on the held tail ever ending: the frames themselves are the
+	// thing under assertion.
+	respOut := make(chan copyResult, 1)
+	go func() {
+		var b strings.Builder
+		_, err := io.Copy(&b, io.LimitReader(fromUpstream, int64(len(h2ServerNoDelimBytes))))
+		respOut <- copyResult{b.String(), err}
+	}()
+
+	// The response side parks in its first line wait before the preface is
+	// parsed, as it does the moment a live join starts.
+	select {
+	case <-upstream.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side never parked on its upstream")
+	}
+
+	// The guard fires: passthrough is armed and the preface is replayed whole.
+	check(t, "request", drain(t, toUpstream), h2ClientBytes)
+
+	// The upstream's frames arrive into the parked, held direction. Without
+	// the wake this copy never returns -- no delimiter, no error, no EOF --
+	// and the failure below is a timeout naming that hang.
+	close(upstream.release)
+	select {
+	case got := <-respOut:
+		check(t, "response", got.out, h2ServerNoDelimBytes)
+		if got.err != nil {
+			t.Fatalf("the bounded copy of the released frames failed: %v", got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the response side was never released from its line wait on binary frames")
+	}
+
+	// Cleanup and the held-tail exit: the direction is raw-reading its open
+	// source (that is what holding means), so the close is what ends it.
+	upstream.Close()
+	tail := make(chan error, 1)
+	go func() {
+		_, err := fromUpstream.Read(make([]byte, 1))
+		tail <- err
+	}()
+	select {
+	case err := <-tail:
+		if err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("the held direction ended on %v, want the cleanup close", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the raw direction did not end with its source's close")
 	}
 }
