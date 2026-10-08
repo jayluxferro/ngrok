@@ -1,4 +1,126 @@
 # Changelog
+## 1.0.20 - 2026-10-08 - ngrok-bot: a read-only Telegram ops surface over the admin API
+
+Cluster 19 made the admin listener programmable; this release adds the
+smallest useful program over it. `ngrok-bot` is a standalone binary the
+operator runs beside ngrokd: it answers a few read-only commands in
+Telegram — `/help`, `/status` (the `/metrics` counters that matter:
+uptime, public/control connections, tunnels active, auth rejects, rate
+and event drops), `/tunnels` (one line per tunnel, capped at 20 with a
+`+N more` footer), `/health` (one `/healthz` probe with latency and
+verdict) — and pushes alerts on its own initiative: events whose type is
+in the configured `alert_events` set (`auth_reject`, `rate_limit_drop`,
+`connection_cap_drop`, `tunnel_open`, `tunnel_close` by default) are
+forwarded to every allowed chat, and a `/healthz` watcher alerts when
+ngrokd becomes unreachable (two consecutive failures — one blip is noise)
+and again on recovery with the outage duration. Build with `make bot` (or
+`make release-bot`); the bot embeds no assets, so its build needs no
+go-bindata pass, and no new dependencies were added — the YAML config
+uses the `gopkg.in/yaml.v3` already in the module.
+
+### The security model
+
+The bot holds admin credentials, so it must be read-only **by
+construction**, not by discipline. Its admin client is four typed methods
+(`health`, `metrics`, `tunnels`, `events`) against a fixed path allowlist
+— there is no method that takes an arbitrary path, and no verb but GET
+against the admin API — so the read-only property is the type system,
+not a convention. (The package's one write-shaped call is Telegram's own
+`sendMessage` POST — the Bot API's protocol, not a use of the bot's
+admin credentials; and its body rides as JSON, not a query string,
+because an URL-encoded body would place message content into the access
+logs of every intermediary.) The chat allowlist fails closed:
+`allowed_chats` empty
+refuses to start, and an update from a stranger produces no reply at all,
+not even a help hint. Every message is plain text — `parse_mode` is never
+sent — so tunnel URLs, owner names and reject reasons, all attacker- or
+operator-influenced strings, cannot smuggle Telegram markup; the escaping
+problem is deleted rather than solved. The bot binds nothing: long
+polling out to the Telegram API, plain HTTP out to the admin API, no
+webhook, no inbound listener, no file writes beyond its own log, no exec.
+And there are no control actions — no restart, no tunnel manipulation, no
+config application: an authenticated chat message that starts processes
+or changes server state is an RCE-class surface and would need its own
+threat model before existing at all (the spec-15 remote-control
+non-goal, restated for a chat surface).
+
+### Configuration
+
+```yaml
+telegram_token: "123:abc"        # env NGROK_BOT_TELEGRAM_TOKEN overrides
+admin_url: "http://127.0.0.1:9090"   # required, http(s) scheme enforced
+admin_token: "..."               # env NGROK_BOT_ADMIN_TOKEN overrides
+allowed_chats: [123456789]       # REQUIRED — empty set = startup error
+alert_events: [auth_reject, rate_limit_drop, connection_cap_drop,
+               tunnel_open, tunnel_close]   # default = this set
+health_interval_seconds: 30      # 0 disables the /healthz watcher
+command_rate_per_min: 10         # per-chat command budget; 0 = off
+command_timeout_seconds: 10      # admin call timeout
+```
+
+Unknown `alert_events` values refuse to start, naming the valid set
+(typo protection); an event arriving at runtime with a type the bot does
+not know (a newer ngrokd) is formatted generically as type + raw JSON —
+config-time strict, runtime tolerant, because the event vocabulary
+crosses a wire the bot does not version. Both secrets may come from env
+over file, and the startup log line prints the config with tokens masked
+to `***`.
+
+### The honest costs
+
+- Alert delivery is drop-accounted (the `event_destinations` precedent:
+  loss must be visible) — a full send queue counts its drops and a
+  one-line `N alerts dropped` notice goes out once a minute per affected
+  chat. But if Telegram itself is unreachable, that notice is dropped
+  too; the log WARN is then the only record of what was lost.
+  Notification through the pipe that is down cannot report its own
+  losses, and the release says so rather than implying otherwise.
+- Commands are argument-free verbs: no inline keyboards, no callbacks,
+  no pagination, no arguments. One bot process watches one ngrokd —
+  multi-server means running more bot processes, not a fleet manager.
+- Two secrets are read from config or env rather than a vault: pulling
+  `ngrok/policy` in for `secret()` would drag cel-go into a 5 MB tool.
+  Env fallback is the honest 80% here.
+- The release archives grow one file each — `ngrok-bot` now rides inside
+  the existing per-platform tarballs and zips beside `ngrok` and
+  `ngrokd`. No new archive, no new asset class: the asset count is
+  unchanged.
+
+### Also in this release
+
+- **`proxy_transport` joined the workbench validation** (a post-1.0.19
+  correction). The admin workbench's validate-config endpoint was the
+  one road that called `proxy_transport: grpc` a valid document: the
+  enum check sat in the client loader's flag merge, outside the
+  extracted traversal both roads share. The flag override now runs
+  before the extracted call and the switch lives at its end — last, so
+  a bad tunnel still outranks a bad carrier word exactly as the loader
+  has always ordered it — and the parity corpus pins both the refusal
+  and the ordering. Spec 15 also gained amendments recording the
+  token-only-document reality (a bare auth token has been a YAML parse
+  error since the parser swap; the workbench mirrors the loader instead
+  of accepting what the agent rejects — pinned both sides) and the
+  `/static/*` auth semantics (the dashboard's three files ride the API
+  rate budget and require credentials; a bare `curl` gets 401 by
+  design).
+- **The SAML revival bar was evaluated and closed** (the cluster 22
+  audit, recorded in spec 14's non-goals). The leading Go library is
+  unmaintained and its last release pins a signature-bypass-vulnerable
+  XML-DSig dependency; the actively-maintained alternative requires a
+  Go version this repo deliberately does not take; across the credible
+  libraries there are fourteen security advisories since 2020 — six
+  signature-validation bypasses and two full auth bypasses among them —
+  with XML semantics, not cryptography, as the recurring root cause.
+  Native SAML will not be built. When a deployment with a SAML-only
+  identity provider actually appears, the documented answer is a
+  Keycloak sidecar brokering SAML to OIDC in front of the existing
+  `oidc` action — the fork stays OIDC-only, with zero new modules in
+  the tunnel server's process.
+
+Non-goals held: no control actions, no webhook mode, no
+Markdown/HTML formatting, no multi-server. Design record:
+[spec 16](specs/16-telegram-ops-bot.md).
+
 ## 1.0.19 - 2026-10-08 - ngrokd admin web UI: the config workbench
 
 The admin listener becomes a control plane you can actually use from a

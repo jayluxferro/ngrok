@@ -676,6 +676,72 @@ nothing — the editor is ephemeral by design. `/api/*` has its own rate
 budget at five times `-adminRate` so keystroke validation cannot exhaust
 the pages budget.
 
+## ngrok-bot (Telegram ops bot)
+
+The admin listener is a complete observability API, and `ngrok-bot` is the
+smallest useful program over it: a standalone binary you run beside ngrokd
+that answers a few read-only commands in Telegram and pushes alerts from
+the event stream. Commands in any allowed chat:
+
+- `/help` — what the bot can do, one message (`/start` is an alias)
+- `/status` — uptime, public/control connections, tunnels active, auth
+  rejects, rate and event drops, from `/metrics`
+- `/tunnels` — one line per tunnel (url, connections, owner, policy),
+  capped at 20 with a `+N more` footer
+- `/health` — one `/healthz` probe: latency and verdict
+
+Beyond commands it forwards events whose type is in the configured
+`alert_events` set to every allowed chat, and a `/healthz` watcher alerts
+when ngrokd becomes unreachable (two consecutive failures — one blip is
+noise) and again on recovery with the outage duration.
+
+**Quickstart:**
+
+1. Build it: `make bot` (or `make release-bot`). The bot embeds no assets,
+   so its build is a plain `go build` — no go-bindata pass. The default
+   `make` target still builds only the client and server.
+2. Create a bot with [@BotFather](https://t.me/BotFather) and keep the
+   token. Send your bot any message, then read your chat ID from
+   `https://api.telegram.org/bot<token>/getUpdates`.
+3. Run ngrokd with `-adminAddr=127.0.0.1:9090` (see the hardened command
+   above), and write `~/.ngrok-bot`:
+   ```yaml
+   telegram_token: "123:abc"                  # env NGROK_BOT_TELEGRAM_TOKEN overrides
+   admin_url: "http://127.0.0.1:9090"         # the -adminAddr listener; required
+   admin_token: "..."                         # env NGROK_BOT_ADMIN_TOKEN overrides
+   allowed_chats: [123456789]                 # REQUIRED - empty = refuses to start
+   alert_events: [auth_reject, rate_limit_drop, connection_cap_drop,
+                  tunnel_open, tunnel_close]  # default = this set
+   health_interval_seconds: 30                # 0 disables the /healthz watcher
+   command_rate_per_min: 10                   # per-chat command budget; 0 = off
+   command_timeout_seconds: 10                # admin call timeout
+   ```
+
+4. Run it beside ngrokd:
+   ```bash
+   ./bin/ngrok-bot -config=$HOME/.ngrok-bot
+   ```
+
+**The security model, in four lines.** The bot holds admin credentials,
+so it is read-only by construction — its admin client is four typed
+methods against a fixed path allowlist (`/healthz`, `/metrics`,
+`/tunnels`, `/events`), with no generic request method and no verb but
+GET against the admin API (the one other call it makes is Telegram's
+own `sendMessage` — the Bot API's protocol, not the bot's credentials).
+The chat allowlist fails closed: a stranger
+gets nothing at all, not even a help hint. Every message is plain text —
+`parse_mode` is never sent, so tunnel URLs and owner names have no markup
+to inject and there is nothing to escape. The bot binds nothing: it dials
+out to Telegram (long polling, no webhook) and to ngrokd, and runs no
+inbound listener of its own.
+
+**An honest limitation:** alert delivery is drop-accounted — a full send
+queue counts what it dropped and a one-line `N alerts dropped` notice
+goes out once a minute. But if Telegram itself is unreachable, that
+notice is dropped too; the log WARN is then the only record of what was
+lost. Notification through the pipe that is down cannot report its own
+losses.
+
 ## Protocol
 
 ngrok uses a custom protocol over TLS for secure tunneling:

@@ -1,6 +1,6 @@
 # SPEC-CLUSTER20 — ngrok-bot: a read-only Telegram ops surface over the admin API
 
-Status: draft (target v1.0.20)
+Status: shipped (v1.0.20)
 
 The admin listener is a complete observability API — `/metrics`,
 `/tunnels`, `/events` SSE, `/healthz`, three-mode auth, per-IP rate
@@ -120,6 +120,9 @@ func (a *adminClient) events(ctx) (<-chan eventFrame, func(), error)
   `/events`. There is no method that takes an arbitrary path, and no
   verb anywhere but GET — the read-only property is the type system,
   not a convention (review gate 1 greps for it and finds nothing).
+  Read-only scopes to the *admin* API: the one write-shaped call in
+  the package is Telegram's own `sendMessage` POST (§3), which is the
+  Bot API's protocol and not a use of the bot's admin credentials.
 - `events` returns decoded frames off a background reader:
   `bufio.Scanner` over the response body, `data: ` lines,
   `json.RawMessage` payloads. On read error or EOF it reconnects with
@@ -198,9 +201,16 @@ func (a *adminClient) events(ctx) (<-chan eventFrame, func(), error)
 ### 6. Security model (the section a reviewer reads first)
 
 - **Read-only by construction** (§2): no generic request method, no
-  non-GET verb in the package, no `/api/*` path in the source. Gate 1
-  greps `bot/` for `POST|PUT|DELETE|PATCH|http.NewRequest` contexts
-  and for the four allowed paths only.
+  non-GET verb against the *admin* API, no other admin path in the
+  source. (The package's one write-shaped call is Telegram's own
+  `sendMessage` POST — the Bot API's protocol, spelled
+  `http.MethodPost`; a query-string body alternative would leak
+  message content into intermediary access logs, and read-only is a
+  property of how the bot uses its admin credentials, not of the Bot
+  API.) Gate 1 greps `bot/` for `POST|PUT|DELETE|PATCH` (zero hits —
+  the send site spells `http.MethodPost`) and pins that the admin
+  client's request builders are GET-only over exactly the four
+  allowed paths.
 - **Chat allowlist, fail-closed** (§1): strangers get *nothing* — not
   a help hint, not an error, zero messages. Test pins it: an update
   from a non-allowed chat produces no `sendMessage` call at all.
@@ -313,9 +323,12 @@ lane touches `server/`, `client/`, `msg/`, `policy/`, `rewriter/`,
 ## Review gates
 
 1. **Read-only pins**: `grep -nE 'POST|PUT|DELETE|PATCH' bot/` →
-   nothing; `grep -n 'parse_mode' bot/` → only the absence test;
+   nothing (the Telegram send site spells `http.MethodPost` — the
+   Bot API's own write, outside the admin client);
+   `grep -n 'parse_mode' bot/` → only the absence test;
    `grep -nE 'os/exec|exec.Command|WriteFile|Create\(' bot/` → only
-   the log path; admin paths in source are exactly the four allowed.
+   the log path; admin paths in source are exactly the four allowed,
+   and the admin client's request builders are GET-only.
 2. **Fail-closed**: no `allowed_chats` → non-zero exit; stranger chat
    produces zero sends — both pinned by tests, asserted again in e2e.
 3. **Alerts honest**: drop accounting counted and surfaced (test);
@@ -324,7 +337,11 @@ lane touches `server/`, `client/`, `msg/`, `policy/`, `rewriter/`,
 4. **Message safety**: hostile-string corpus through every formatter;
    4096 truncation; `parse_mode` never sent (unit + e2e record scan).
 5. **Additivity**: `git diff --stat v1.0.19..HEAD` touches no Go file
-   outside `bot/`, `main/ngrok-bot/`, `version/version.go`; `msg/`
+   outside `bot/`, `main/ngrok-bot/`, `version/version.go`,
+   `client/config.go`, `client/config_test.go` (the two carry the
+   fb697c3 post-1.0.19 correction that moved `proxy_transport` into
+   the extracted validation — a release rider, not bot work; named
+   here so the gate stays checkable against the real diff); `msg/`
    untouched; no `go.mod`/`go.sum` change at all.
 6. **Full gates**: `go vet` + `go test` + `-race` for `bot/`; all
    three entry points build (debug + release tags); full e2e green

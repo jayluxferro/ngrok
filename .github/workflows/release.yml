@@ -104,11 +104,25 @@ jobs:
             go build -tags release -ldflags="-s -w" -o bin/ngrokd-${{ matrix.suffix }} ./main/ngrokd
           fi
 
+      # The bot embeds no assets; it builds from the same checkout after the
+      # asset pass above and simply ignores it.
+      - name: Build bot
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            go build -tags release -ldflags="-s -w" -o bin/ngrok-bot-${{ matrix.suffix }}.exe ./main/ngrok-bot
+          else
+            go build -tags release -ldflags="-s -w" -o bin/ngrok-bot-${{ matrix.suffix }} ./main/ngrok-bot
+          fi
+
       - name: Create archive (Unix)
         if: matrix.goos != 'windows'
         run: |
           cd bin
-          tar czf ngrok-${{ matrix.suffix }}.tar.gz ngrok-${{ matrix.suffix }} ngrokd-${{ matrix.suffix }}
+          tar czf ngrok-${{ matrix.suffix }}.tar.gz ngrok-${{ matrix.suffix }} ngrokd-${{ matrix.suffix }} ngrok-bot-${{ matrix.suffix }}
           sha256sum ngrok-${{ matrix.suffix }}.tar.gz > ngrok-${{ matrix.suffix }}.tar.gz.sha256
           echo "Created: ngrok-${{ matrix.suffix }}.tar.gz"
 
@@ -116,7 +130,7 @@ jobs:
         if: matrix.goos == 'windows'
         run: |
           cd bin
-          zip ngrok-${{ matrix.suffix }}.zip ngrok-${{ matrix.suffix }}.exe ngrokd-${{ matrix.suffix }}.exe
+          zip ngrok-${{ matrix.suffix }}.zip ngrok-${{ matrix.suffix }}.exe ngrokd-${{ matrix.suffix }}.exe ngrok-bot-${{ matrix.suffix }}.exe
           sha256sum ngrok-${{ matrix.suffix }}.zip > ngrok-${{ matrix.suffix }}.zip.sha256
           echo "Created: ngrok-${{ matrix.suffix }}.zip"
 
@@ -140,6 +154,7 @@ jobs:
           path: |
             bin/ngrok-${{ matrix.suffix }}*
             bin/ngrokd-${{ matrix.suffix }}*
+            bin/ngrok-bot-${{ matrix.suffix }}*
           retention-days: 90
 
   release:
@@ -188,7 +203,7 @@ jobs:
 
           ### Downloads
 
-          **Client and Server binaries for all supported platforms:**
+          **Client, Server and Bot binaries for all supported platforms:**
 
           | Platform | Architecture | Download |
           |----------|-------------|----------|
@@ -214,6 +229,7 @@ jobs:
 
           - **Client**: `./ngrok` (or `ngrok.exe` on Windows)
           - **Server**: `./ngrokd` (or `ngrokd.exe` on Windows)
+          - **Bot**: `./ngrok-bot` (or `ngrok-bot.exe` on Windows)
 
           ### Checksums
 

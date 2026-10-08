@@ -4699,4 +4699,366 @@ if ! grep -q '1048576' "$TMPDIR/a2-big.out"; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# ngrok-bot (SPEC-CLUSTER20): the spec's ten e2e scenarios for the read-only
+# Telegram ops surface, run against the real pieces on both sides -- a real
+# ngrokd (the eighth; the bot's admin_url points at its -adminAddr) and a
+# real agent for /tunnels and the auth_reject alert -- with only the Bot API
+# faked, by scripts/fake_telegram.go. One bot process serves the whole group:
+# the scenarios share its in-memory offset and its send record the way a real
+# operator's session accumulates, and startup failures are scenarios 1-3
+# precisely because the long-lived bot boots AFTER them.
+#
+# Ports grepped across the whole file before picking, the standing rule: the
+# other seven ngrokds sit on admin :19090-:19100, public http :18080-:18087,
+# https :18443-:18446, tunnel :14443-:14452; local upstreams on :19001-:19019.
+# This group takes admin :19101, public http :18088, tunnel :14453, and the
+# fake Telegram on :19102 with the dead-token fake of scenario 3 on :19103 --
+# none of which appear anywhere else in the file.
+#
+# Logs go to /tmp/ngrok-e2e-bot/ -- deliberately OUTSIDE the
+# /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks, so a failed run's bot
+# log survives the next run's clean slate -- and the group clears its own
+# directory first, for the same O_APPEND reason the opening rm exists for.
+# ---------------------------------------------------------------------------
+
+BOT_DIR=/tmp/ngrok-e2e-bot
+BOT_ADMIN=127.0.0.1:19101
+BOT_FAKE=127.0.0.1:19102
+BOT_FAKE_DEAD=127.0.0.1:19103
+BOT_RECORD="$BOT_DIR/sends.jsonl"
+BOT_CHAT=424242
+BOT_STRANGER=999999
+mkdir -p "$BOT_DIR"
+rm -f "$BOT_DIR"/*.log "$BOT_DIR"/*.jsonl
+
+echo "[e2e] building ngrok-bot and the fake Telegram (prebuilt helpers)"
+go build -o "$HELPER_BIN/fake_telegram" scripts/fake_telegram.go
+go build -o "$HELPER_BIN/ngrok-bot" ./main/ngrok-bot
+
+# One flag set, booted twice: scenario 8 kills this ngrokd mid-group and boots
+# it again, and the restart must be the same server the group introduced --
+# same admin token for the bot's watcher, same agent token for the reconnect.
+# -authToken is what makes scenario 7 a rejection at all: with no tokens
+# configured the server validates nothing and could never publish auth_reject.
+BOT_NGROKD_ARGS="-domain=localhost -httpAddr=127.0.0.1:18088 -httpsAddr= -tunnelAddr=127.0.0.1:14453 -adminAddr=$BOT_ADMIN -adminToken=bot-admin-secret -authToken=e2e-agent-token"
+
+echo "[e2e] starting the bot ngrokd (its admin API is what the bot watches)"
+./bin/ngrokd $BOT_NGROKD_ARGS >"$BOT_DIR/ngrokd.log" 2>&1 &
+BOT_NGROKD_PID=$!
+for i in {1..40}; do
+  if grep -q "Listening for control and proxy connections" "$BOT_DIR/ngrokd.log" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "Listening for control and proxy connections" "$BOT_DIR/ngrokd.log" 2>/dev/null; then
+  echo "[e2e] the bot ngrokd never came up"
+  tail -n 40 "$BOT_DIR/ngrokd.log" || true
+  exit 1
+fi
+
+echo "[e2e] starting the fake Telegram (records every sendMessage payload verbatim)"
+"$HELPER_BIN/fake_telegram" -addr "$BOT_FAKE" -record "$BOT_RECORD" >"$BOT_DIR/fake-telegram.log" 2>&1 &
+for i in {1..40}; do
+  if curl -fsS -o /dev/null "http://$BOT_FAKE/debug/offsets" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! curl -fsS -o /dev/null "http://$BOT_FAKE/debug/offsets" 2>/dev/null; then
+  echo "[e2e] the fake Telegram never came up"
+  cat "$BOT_DIR/fake-telegram.log" || true
+  exit 1
+fi
+
+# bot_polls / bot_offset: the fake's /debug counters, read as bare numbers.
+# The offset is the load-bearing one -- see scenario 5.
+bot_polls() {
+  curl -fsS "http://$BOT_FAKE/debug/offsets" 2>/dev/null | grep -o '"polls":[0-9]*' | tr -cd 0-9
+}
+bot_offset() {
+  curl -fsS "http://$BOT_FAKE/debug/offsets" 2>/dev/null | grep -o '"last_offset":[0-9]*' | tr -cd 0-9
+}
+
+# bot_inject <update_id> <chat> <text>: queue one message-shaped update at the
+# fake, waking any held long poll, so the bot routes it within milliseconds
+# rather than at the end of a 50 s hold.
+bot_inject() {
+  curl -fsS -H 'Content-Type: application/json' \
+    -d "{\"update_id\":$1,\"message\":{\"chat\":{\"id\":$2},\"text\":\"$3\"}}" \
+    "http://$BOT_FAKE/inject" >/dev/null
+}
+
+# bot_wait_msg <pattern> <label>: bounded retry for one recorded reply. The
+# sender queue, the 1 msg/s per-chat pacing and the SSE hop between ngrokd and
+# bot all add sub-second latency that a bare sleep would guess at; a bounded
+# poll turns "slow" into "fast" and "never" into a failure with evidence.
+bot_wait_msg() {
+  local pattern="$1"
+  local label="$2"
+  local i
+  for i in {1..60}; do
+    if grep -q "$pattern" "$BOT_RECORD" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] the bot never sent a message matching: $pattern ($label)"
+  echo "[e2e] bot log tail:"
+  tail -n 40 "$BOT_DIR/bot.log" 2>/dev/null || true
+  echo "[e2e] send record so far:"
+  cat "$BOT_RECORD" 2>/dev/null || true
+  return 1
+}
+
+cat > "$TMPDIR/bot.yml" <<'YAML'
+telegram_token: "500:e2e-bot-token"
+telegram_api: "http://127.0.0.1:19102"
+admin_url: "http://127.0.0.1:19101"
+admin_token: "bot-admin-secret"
+allowed_chats: [424242]
+health_interval_seconds: 1
+command_rate_per_min: 50
+command_timeout_seconds: 10
+YAML
+
+echo "[e2e] starting ngrok-bot against the fake and the real admin API"
+"$HELPER_BIN/ngrok-bot" -config="$TMPDIR/bot.yml" -log="$BOT_DIR/bot.log" \
+  >"$BOT_DIR/bot-stdout.log" 2>&1 &
+BOT_PID=$!
+for i in {1..40}; do
+  if grep -q "authenticated as" "$BOT_DIR/bot.log" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if ! grep -q "authenticated as" "$BOT_DIR/bot.log" 2>/dev/null; then
+  echo "[e2e] the bot never authenticated with the fake Telegram"
+  tail -n 40 "$BOT_DIR/bot-stdout.log" 2>/dev/null || true
+  tail -n 40 "$BOT_DIR/bot.log" 2>/dev/null || true
+  exit 1
+fi
+# Wait out the cold start so the first inject lands on a HELD long poll: the
+# scenarios' millisecond-scale routing assumptions need a bot that is
+# already polling, not one still booting.
+for i in {1..40}; do
+  P="$(bot_polls)"
+  if [[ -n "$P" && "$P" -ge 1 ]]; then
+    break
+  fi
+  sleep 0.25
+done
+
+echo "[e2e] bot 1: an empty allowed_chats is a refusal, not a warning"
+cat > "$TMPDIR/bot-nochats.yml" <<'YAML'
+telegram_token: "500:e2e-bot-token"
+telegram_api: "http://127.0.0.1:19102"
+admin_url: "http://127.0.0.1:19101"
+YAML
+if "$HELPER_BIN/ngrok-bot" -config="$TMPDIR/bot-nochats.yml" >"$TMPDIR/bot1.out" 2>&1; then
+  echo "[e2e] the bot started with no allowed_chats:"
+  cat "$TMPDIR/bot1.out"
+  exit 1
+fi
+if ! grep -q 'allowed_chats' "$TMPDIR/bot1.out"; then
+  echo "[e2e] the refusal does not name allowed_chats:"
+  cat "$TMPDIR/bot1.out"
+  exit 1
+fi
+
+echo "[e2e] bot 2: an unknown alert_events value is refused, naming the valid set"
+cat > "$TMPDIR/bot-badevent.yml" <<'YAML'
+telegram_token: "500:e2e-bot-token"
+telegram_api: "http://127.0.0.1:19102"
+admin_url: "http://127.0.0.1:19101"
+allowed_chats: [424242]
+alert_events: [auth_reject, tunnel_opn]
+YAML
+if "$HELPER_BIN/ngrok-bot" -config="$TMPDIR/bot-badevent.yml" >"$TMPDIR/bot2.out" 2>&1; then
+  echo "[e2e] the bot started with a mistyped alert event:"
+  cat "$TMPDIR/bot2.out"
+  exit 1
+fi
+if ! grep -q 'unknown alert_events value' "$TMPDIR/bot2.out" \
+  || ! grep -q 'tunnel_opn' "$TMPDIR/bot2.out" \
+  || ! grep -q 'tunnel_close' "$TMPDIR/bot2.out"; then
+  echo "[e2e] the refusal does not name the typo and a valid event:"
+  cat "$TMPDIR/bot2.out"
+  exit 1
+fi
+
+echo "[e2e] bot 3: a dead token stops the boot (getMe 401 -> non-zero exit)"
+# The second fake instance answers 401 ok:false to everything, the revoked-
+# token world; the bot's own instance on :19102 keeps serving the group.
+"$HELPER_BIN/fake_telegram" -addr "$BOT_FAKE_DEAD" -refuse >"$BOT_DIR/fake-telegram-dead.log" 2>&1 &
+cat > "$TMPDIR/bot-deadtoken.yml" <<'YAML'
+telegram_token: "500:revoked"
+telegram_api: "http://127.0.0.1:19103"
+admin_url: "http://127.0.0.1:19101"
+allowed_chats: [424242]
+YAML
+if "$HELPER_BIN/ngrok-bot" -config="$TMPDIR/bot-deadtoken.yml" >"$TMPDIR/bot3.out" 2>&1; then
+  echo "[e2e] the bot started against a Telegram that refuses its token:"
+  cat "$TMPDIR/bot3.out"
+  exit 1
+fi
+if ! grep -q 'identity check failed' "$TMPDIR/bot3.out"; then
+  echo "[e2e] the exit does not say the identity check failed:"
+  cat "$TMPDIR/bot3.out"
+  exit 1
+fi
+
+echo "[e2e] bot 4: the allowed chat's /status is the metrics render"
+bot_inject 101 "$BOT_CHAT" "/status"
+bot_wait_msg '"chat_id":424242' "the /status reply"
+if ! python3 - "$BOT_RECORD" <<'PY'
+import json, sys
+replies = []
+for line in open(sys.argv[1]):
+    m = json.loads(line)
+    if m.get("chat_id") == 424242:
+        replies.append(m.get("text", ""))
+hit = [t for t in replies if t.startswith("uptime: ") and "tunnels active:" in t]
+assert hit, f"no /status-shaped reply to the allowed chat; replies: {replies!r}"
+print(f"    status reply: {hit[0].splitlines()[0]!r} ...")
+PY
+then
+  echo "[e2e] the /status reply is not the metrics render:"
+  cat "$BOT_RECORD"
+  exit 1
+fi
+
+echo "[e2e] bot 5: a stranger chat gets nothing (the fail-closed pin, executable)"
+bot_inject 102 "$BOT_STRANGER" "/status"
+# Absence cannot be proven by sleeping: "no reply yet" is indistinguishable
+# from "slow bot". The witness is the bot's offset -- it advances past every
+# update it has processed, so once the fake sees a poll at 103 the stranger's
+# update was seen, routed, and dropped by the allowlist. No sendMessage
+# exists on that path, so the empty record is a fact, not a timing hope.
+for i in {1..40}; do
+  OFF="$(bot_offset)"
+  if [[ -n "$OFF" && "$OFF" -ge 103 ]]; then
+    break
+  fi
+  sleep 0.25
+done
+OFF="$(bot_offset)"
+if [[ -z "$OFF" || "$OFF" -lt 103 ]]; then
+  echo "[e2e] the bot never acknowledged the stranger update (last offset: $OFF)"
+  tail -n 40 "$BOT_DIR/bot.log" || true
+  exit 1
+fi
+if grep -q "\"chat_id\":$BOT_STRANGER" "$BOT_RECORD"; then
+  echo "[e2e] the stranger's chat id appears in the send record:"
+  grep "\"chat_id\":$BOT_STRANGER" "$BOT_RECORD"
+  exit 1
+fi
+echo "    stranger update acknowledged at offset $OFF, zero sends"
+
+echo "[e2e] bot 6: /tunnels names the live agent tunnel"
+cat > "$TMPDIR/ngrok-bot-agent.yml" <<'YAML'
+server_addr: 127.0.0.1:14453
+trust_host_root_certs: true
+auth_token: e2e-agent-token
+tunnels:
+  botweb:
+    hostname: bot-e2e
+    proto:
+      http: 19001
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-bot-agent.yml" -log="$BOT_DIR/agent.log" \
+  start botweb >"$BOT_DIR/agent-stdout.log" 2>&1 &
+wait_for_tunnel "$BOT_DIR/agent.log" "botweb (bot group)"
+# The registry row, not the agent's log line, is what /tunnels renders from
+# (the admin2 precedent): poll the endpoint itself until the row exists. This
+# curl also proves the admin token is the right credential before the bot
+# ever uses it.
+for i in {1..40}; do
+  if curl -fsS -H 'X-Ngrok-Admin-Token: bot-admin-secret' "http://$BOT_ADMIN/tunnels" 2>/dev/null | grep -q 'bot-e2e'; then
+    break
+  fi
+  sleep 0.25
+done
+if ! curl -fsS -H 'X-Ngrok-Admin-Token: bot-admin-secret' "http://$BOT_ADMIN/tunnels" 2>/dev/null | grep -q 'bot-e2e'; then
+  echo "[e2e] the bot ngrokd never registered the bot-e2e tunnel"
+  tail -n 40 "$BOT_DIR/agent.log" || true
+  exit 1
+fi
+bot_inject 103 "$BOT_CHAT" "/tunnels"
+# The pattern is the reply's RENDER (url (proto) N/N conns), not just the
+# hostname: the registration also fired a tunnel_open alert naming the same
+# url, and a bare grep for bot-e2e would let that alert stand in for the
+# command this scenario exists to exercise.
+bot_wait_msg 'bot-e2e (http) [0-9]*/[0-9]* conns' "the /tunnels reply naming the tunnel"
+
+echo "[e2e] bot 7: a bad-token agent connect surfaces as an auth_reject alert"
+cat > "$TMPDIR/ngrok-bot-badagent.yml" <<'YAML'
+server_addr: 127.0.0.1:14453
+trust_host_root_certs: true
+auth_token: not-the-token
+tunnels:
+  sneaky:
+    hostname: bot-e2e-bad
+    proto:
+      http: 19001
+YAML
+./bin/ngrok -config="$TMPDIR/ngrok-bot-badagent.yml" -log="$BOT_DIR/badagent.log" \
+  start sneaky >"$BOT_DIR/badagent-stdout.log" 2>&1 &
+BOT_BADAGENT_PID=$!
+# The alert crosses ngrokd's event hub -> the SSE subscription -> the bot's
+# sender, which paces 1 msg/s per chat: bounded retry against the record,
+# never a bare sleep.
+bot_wait_msg 'auth rejected' "the auth_reject alert"
+kill "$BOT_BADAGENT_PID" 2>/dev/null || true
+wait "$BOT_BADAGENT_PID" 2>/dev/null || true
+
+echo "[e2e] bot 8: ngrokd down latches an unreachable alert; restart recovers"
+# Two probes must fail before the latch (one blip is noise -- alerts.go), so
+# with health_interval_seconds: 1 the alert lands ~2 s after the kill. The
+# restart must not race that: the wait below gates the reboot on the latch
+# itself, and the recovery line needs one successful probe after it.
+kill "$BOT_NGROKD_PID" 2>/dev/null || true
+wait "$BOT_NGROKD_PID" 2>/dev/null || true
+bot_wait_msg 'admin API unreachable' "the unreachable alert"
+./bin/ngrokd $BOT_NGROKD_ARGS >>"$BOT_DIR/ngrokd.log" 2>&1 &
+BOT_NGROKD_PID=$!
+bot_wait_msg 'admin API recovered after' "the recovery alert"
+
+echo "[e2e] bot 9: every recorded payload is bare {chat_id, text} -- the parse_mode gate, executable"
+# Spec gate made live: scan the WHOLE record, the raw bytes the bot actually
+# posted, not a re-marshal. The stranger re-check rides along for free --
+# cheap, and it pins the allowlist over everything the group ever sent.
+if ! python3 - "$BOT_RECORD" "$BOT_STRANGER" <<'PY'
+import json, sys
+path, stranger = sys.argv[1], int(sys.argv[2])
+lines = [l for l in open(path) if l.strip()]
+assert lines, "the send record is empty; the bot never spoke"
+for i, line in enumerate(lines):
+    if "parse_mode" in line:
+        raise AssertionError(f"line {i+1} carries parse_mode: {line!r}")
+    m = json.loads(line)
+    assert isinstance(m.get("chat_id"), int), f"line {i+1}: chat_id not an int: {line!r}"
+    assert isinstance(m.get("text"), str), f"line {i+1}: text missing: {line!r}"
+    assert m["chat_id"] != stranger, f"line {i+1}: the stranger got a reply: {line!r}"
+print(f"    {len(lines)} payloads scanned: no parse_mode, no stranger reply")
+PY
+then
+  echo "[e2e] the send record failed the plain-text gate:"
+  cat "$BOT_RECORD"
+  exit 1
+fi
+
+echo "[e2e] bot 10: /help enumerates the table; an unknown command gets the hint"
+# The help text is generated from the command table (commands.go), so these
+# patterns are the table's own summaries: if a command is added and help
+# follows it, this scenario still passes; if help drifts, it cannot.
+bot_inject 104 "$BOT_CHAT" "/help"
+bot_wait_msg '/status -- ngrokd at a glance' "the /help listing"
+bot_wait_msg '/tunnels -- live tunnels' "the /help listing"
+bot_wait_msg '/health -- one /healthz probe' "the /help listing"
+bot_wait_msg '/help -- what the bot can do' "the /help listing"
+bot_inject 105 "$BOT_CHAT" "/nonsense"
+bot_wait_msg 'unknown command; send /help' "the unknown-command hint"
+
 echo "[e2e] PASS"
