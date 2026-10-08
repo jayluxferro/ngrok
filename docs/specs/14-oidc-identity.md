@@ -1,6 +1,6 @@
 # SPEC-CLUSTER18 — OIDC authentication action (`oidc`)
 
-Status: approved (handed to workstreams P/S)
+Status: shipped (v1.0.17)
 
 The first policy action whose verdict must survive three connections and two
 external round trips. That is why it lives at the routing layer beside the
