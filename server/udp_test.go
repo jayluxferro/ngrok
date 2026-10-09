@@ -604,7 +604,16 @@ func TestUdpFlowIdleExpiry(t *testing.T) {
 // -- a flow whose "client" is a spoofed source gets its one query answered
 // and then idles out with no way to keep it alive through replies.
 func TestUdpFlowIdleRefreshIsInboundOnly(t *testing.T) {
-	setUdpIdleTimeout(t, 400*time.Millisecond)
+	// 1.5 s, not the 400 ms this once ran with. The subtests pace their
+	// activity at idle/4, so a goroutine deschedule longer than the idle
+	// timeout between two keepalives legitimately reaps the flow -- and once
+	// reaped, the next datagram establishes a NEW flow on a different pooled
+	// agent conn, so the failure surfaced at the final read ("still-here
+	// never arrived") rather than at the flow-count check. Under a full-suite
+	// -race load that deschedule happened at 400 ms. At 1.5 s the pacing gaps
+	// are a quarter of the deadline and the deschedule must exceed the old
+	// budget by nearly 4x to reproduce it; the assertions are unchanged.
+	setUdpIdleTimeout(t, 1500*time.Millisecond)
 
 	t.Run("client datagrams sustain the flow", func(t *testing.T) {
 		setupTestRegistry(t)
@@ -808,7 +817,15 @@ func TestUdpFlowCaps(t *testing.T) {
 // expires at the idle timeout -- its limiter slot, goroutines and proxy conn
 // with it -- despite the flood of inbound attempts.
 func TestUdpFullQueueDoesNotSustainFlow(t *testing.T) {
-	setUdpIdleTimeout(t, 400*time.Millisecond)
+	// 1.5 s, not the 400 ms this once ran with. The 500-datagram floor
+	// below needs most of the flood window's iterations to actually run, and
+	// under a full-suite -race load the 1 ms-paced loop could not make 500
+	// sends inside 3x400 ms -- the loop, not the flow under test, was what
+	// failed. At 1.5 s the window is 4.5 s and the floor needs barely a
+	// tenth of it. The flood's premise -- the 16-slot queue and the kernel
+	// buffers full while the agent leg never reads -- is untouched by
+	// pacing: it is volume against a stalled reader.
+	setUdpIdleTimeout(t, 1500*time.Millisecond)
 
 	setupTestRegistry(t)
 	ctl := testControl(t, "")
