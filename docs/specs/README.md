@@ -50,6 +50,7 @@ rounds with no feature spec — their record is the changelog.
 | [19-upstream-connection-pooling.md](19-upstream-connection-pooling.md) | Opt-in `upstream_pool` for HTTP/HTTPS tunnels: parsed local leg over a shared per-address pool — the h1 twin of the cluster-17 transcoder; raw-socket reuse refused at the design level | draft | draft |
 | [20-workbench-policy-presets.md](20-workbench-policy-presets.md) | Workbench policy presets: `GET /api/presets` + curated fragments pinned valid against the real validator — engine drift breaks the build, not the operator's insert | draft | draft |
 | [21-workbench-snapshot-diffing.md](21-workbench-snapshot-diffing.md) | Workbench snapshot diffing: SPA-side added/removed/reconfigured/restarted classification of `/tunnels` polls, watched-field immutability pinned; zero Go changes | draft | draft |
+| [22-vault-acls.md](22-vault-acls.md) | Per-tenant vault ACLs: `acl:` per vault, token-string principals via ownerOf, enforcement threaded through the single agent-document Compile, denial byte-identical to unknown-vault | draft | draft |
 
 ## Not specced here
 
