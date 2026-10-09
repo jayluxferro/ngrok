@@ -12,14 +12,19 @@ go build -tags debug -o bin/ngrok ./main/ngrok
 go build -tags debug -o bin/ngrokd ./main/ngrokd
 
 echo "[smoke] starting ngrokd"
-./bin/ngrokd -domain=ngrok.me -httpAddr=127.0.0.1:18080 -httpsAddr= -tunnelAddr=127.0.0.1:14443 -adminAddr=127.0.0.1:19090 >/tmp/ngrokd-smoke.log 2>&1 &
+# This script's own corner -- http :18200, tunnel :15500, admin :19200. It
+# used to bind e2e.sh's base tuple (18080/14443/19090) verbatim, so a smoke
+# run alongside an e2e run died on the bind. Nothing else in scripts/
+# claims these (e2e.sh tops out at :19103 upstream-side and bench.sh owns
+# 18180/18480/15443/19110/19190).
+./bin/ngrokd -domain=ngrok.me -httpAddr=127.0.0.1:18200 -httpsAddr= -tunnelAddr=127.0.0.1:15500 -adminAddr=127.0.0.1:19200 >/tmp/ngrokd-smoke.log 2>&1 &
 NGROKD_PID=$!
 trap 'kill $NGROKD_PID >/dev/null 2>&1 || true' EXIT
 sleep 1
 
 echo "[smoke] checking health endpoint"
-curl -fsS http://127.0.0.1:19090/healthz >/dev/null
-curl -fsS http://127.0.0.1:19090/metrics >/dev/null
+curl -fsS http://127.0.0.1:19200/healthz >/dev/null
+curl -fsS http://127.0.0.1:19200/metrics >/dev/null
 
 echo "[smoke] hashing token helper"
 ./bin/ngrokd -hashToken=test >/dev/null

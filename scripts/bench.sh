@@ -11,8 +11,12 @@
 #
 # Every scenario runs end to end through a real ngrokd + ngrok pair: a python
 # upstream on loopback, a public listener on 18180, a tunnel listener on 15443.
-# Those ports are deliberately disjoint from scripts/e2e.sh (18080/14443/19001+)
-# so the two harnesses can run at the same time without fighting over a port.
+# Those ports are deliberately disjoint from scripts/e2e.sh so the two
+# harnesses can run at the same time without fighting over a port. e2e.sh's
+# full claims: public http :18080-:18092, https :18443-:18446, tunnel
+# :14443-:14457, admin :19090-:19103, local upstreams :19001-:19022 -- its
+# ngrok-bot group's ngrokd owns :19101, the fixture's original port, which is
+# why the fixture moved to :19110 here.
 #
 # What the scenarios measure, and what they do not:
 #
@@ -185,12 +189,14 @@ fi
 export NGROK_INSECURE_SKIP_VERIFY="${NGROK_INSECURE_SKIP_VERIFY:-1}"
 
 # Fixed parameters. Keeping these as constants rather than flags is deliberate.
+# The standing rule from e2e.sh: grep every port in every script before
+# picking one. This harness owns the 18180/18480/15443/19110/19190 corner.
 BENCH_HOST="bench"            # vhost the tunnel registers; also the Host: header
-BENCH_UPSTREAM_PORT=19101     # python fixture          (e2e.sh uses 19001-19005)
-BENCH_HTTP_PORT=18180         # public listener         (e2e.sh uses 18080)
-BENCH_HTTPS_PORT=18480        # public https listener   (e2e.sh uses 18443)
-BENCH_TUNNEL_PORT=15443       # client <-> server       (e2e.sh uses 14443)
-BENCH_ADMIN_PORT=19190        # admin                   (e2e.sh uses 19090)
+BENCH_UPSTREAM_PORT=19110     # python fixture (was 19101; e2e.sh's bot group owns that)
+BENCH_HTTP_PORT=18180         # public listener         (e2e.sh uses 18080-18092)
+BENCH_HTTPS_PORT=18480        # public https listener   (e2e.sh uses 18443-18446)
+BENCH_TUNNEL_PORT=15443       # client <-> server       (e2e.sh uses 14443-14457)
+BENCH_ADMIN_PORT=19190        # admin                   (e2e.sh uses 19090-19103)
 # What ngrokd BINDS the tunnel listener on. Clients always dial 127.0.0.1, so
 # the default is exactly what it always was; the netem variant sets 127.0.0.2
 # so the shaping relay can own 127.0.0.1:<tunnel port> on the carrier path.
@@ -1109,7 +1115,7 @@ start_stack() {
   fi
   for port in "${guard_ports[@]}"; do
     if port_in_use "$port"; then
-      die "port $port is already in use -- a previous bench run (or another service) still holds it; this harness owns 19101/18180/18480/15443/19190"
+      die "port $port is already in use -- a previous bench run (or another service) still holds it; this harness owns 19110/18180/18480/15443/19190"
     fi
   done
 

@@ -5089,7 +5089,7 @@ bot_wait_msg 'unknown command; send /help' "the unknown-command hint"
 # other groups hold public http :18080-:18088, https :18443-:18446, tunnel
 # :14443-:14453, admin :19090-:19103, local upstreams :19001-:19019, and
 # claimed remote ports :14877-:14879 (scripts/bench.sh holds 18180/18480/
-# 15443/19101/19190). This group takes public http :18089-:18092 (one per
+# 15443/19110/19190). This group takes public http :18089-:18092 (one per
 # stack), tunnel :14454-:14457 (the QUIC stack's listener rides the UDP side
 # of its tunnel port, like every -quicAddr stack in this file), local
 # upstreams :19021 (http echo) and :19022 (udp echo), and the mixed client's
