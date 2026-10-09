@@ -1,11 +1,11 @@
 module ngrok
 
-go 1.23.0
+go 1.26.0
 
-// quic-go is pinned at v0.54.0 because that is the newest release declaring
-// go 1.23 -- the toolchain pin above (v0.55+ needs go 1.24). Upgrading it
-// rides the next deliberate toolchain upgrade, not an incidental `go get`
-// (SPEC-CLUSTER7 review gate 5).
+// quic-go follows the toolchain floor deliberately, never by an incidental
+// `go get`: this directive meets v0.63.0's declared floor exactly (1.26.0 --
+// current @latest as of the go 1.26.0 bump), and the require line moves only
+// in a deliberate uplift commit (SPEC-CLUSTER7 review gate 5).
 require (
 	github.com/alecthomas/log4go v0.0.0-20180109082532-d146e6b86faa
 	github.com/golang-jwt/jwt/v5 v5.3.1

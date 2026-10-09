@@ -137,3 +137,22 @@ Status: shipped (see the changelog entry for its release; this document is the d
 5. quic-go pinned v0.45.0 with the go-1.21 constraint documented in go.mod vicinity or
    CHANGELOG (upgrade rides the toolchain bump).
 6. Bench numbers reported with the loopback caveat stated in the same table, not the prose.
+
+---
+
+## Amendment (2026-10-09, v1.0.22 toolchain bump)
+
+The pin statements above — "quic-go pinned at v0.45.0 (newest release
+declaring go 1.21 — our pin; v0.46+ needs go 1.22)" and review gate 5 — are
+historical: they record the go-1.21 floor this spec was written under. The
+deliberate v1.0.22 toolchain bump raised the repo floor to **go 1.26.0** and
+moved quic-go to **v0.63.0** (newest release; declared floor go 1.26.0,
+exactly met by the new floor). Gate 5's substance — the pin moves only with a
+deliberate toolchain upgrade, never an incidental `go get` — stands; the
+v0.45.0 version it named does not. Spec bodies are immutable; this amendment
+is the only edit.
+
+Ruling note (2026-10-09, same bump): quic-go v0.63.0 rides this floor as the
+uplift commit's require line; go 1.27 is deliberately deferred — its rebuilt
+encoding/json engine flips map-key marshaling (golang/go#79938) and lands as
+its own migration unit.

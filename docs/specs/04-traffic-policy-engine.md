@@ -106,3 +106,21 @@ Verification: full gates + `bash scripts/e2e.sh`.
 - Policy attached to a tunnel enforces deny/custom-response/restrict-ips/add-remove-headers/log/set-vars with CEL conditions, config shapes matching ngrok's docs.
 - `curl` a blocked path → synthetic response; allowed path → upstream; restricted IP → 403; headers transformed both directions.
 - Changelog documents the action set, the CEL variable subset, and the parity gaps honestly.
+
+---
+
+## Amendment (2026-10-09, v1.0.22 toolchain bump)
+
+The go-floor statements above — "go 1.21 directive AND CI builds with go1.21",
+"cel-go pinned ≤ v0.20.x for go 1.21", review gate 5's "no go directive bump" —
+are historical: they record the constraints this spec was written under, not
+the current ones. The floor has since been raised deliberately, twice: cel-go
+moved to cel.dev/cel-go v0.32.0 (which is what forced go 1.23), and the
+v1.0.22 toolchain bump raised the repo floor to **go 1.26.0** (go.mod and
+setup-go alike). Spec bodies are immutable; this amendment is the only edit.
+
+Ruling note (2026-10-09, same bump): the floor stops at go 1.26.0
+deliberately — Go 1.27's rebuilt encoding/json engine flips map-key
+marshaling semantics (golang/go#79938; it is what trips this spec's own
+policy fuzz wire-shape invariant), and that migration lands as its own unit,
+not a rider on this one.

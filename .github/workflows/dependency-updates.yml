@@ -19,7 +19,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
 
       - name: Update dependencies (patch/minor)
         env:
@@ -34,9 +34,9 @@ jobs:
         run: |
           # A blanket `go get -u ./...` aborts the whole run the first time
           # some module's newest release requires a newer Go than this repo
-          # pins (the 1.23 pin is deliberate -- cel-go v0.32 needs go 1.23.0,
-          # and holding there keeps quic-go on v0.54.0, the newest release
-          # declaring go 1.23); go refuses the upgrade and that refusal used
+          # pins (the 1.26 pin is deliberate -- holding there keeps quic-go on
+          # the newest release whose declared go floor fits the pin, v0.63.0 at
+          # this writing); go refuses the upgrade and that refusal used
           # to be a weekly red X. Update one module at a time instead: skip
           # exactly the toolchain-floor refusals (warned and summarized),
           # fail on any other error.
@@ -53,7 +53,7 @@ jobs:
               # deliberately in this repo, never by an automated bump).
               # Anything else (network, resolution) stays fatal.
               if grep -qE 'requires go >=|but was required as' /tmp/goget.err; then
-                echo "::warning::skipping $mod: newest release cannot be auto-adopted on the pinned go 1.23 toolchain (needs newer Go, or the module renamed its path)"
+                echo "::warning::skipping $mod: newest release cannot be auto-adopted on the pinned go 1.26 toolchain (needs newer Go, or the module renamed its path)"
                 skipped="$skipped $mod"
               else
                 cat /tmp/goget.err >&2
@@ -72,7 +72,7 @@ jobs:
             exit 1
           fi
           if [ -n "$skipped" ]; then
-            echo "### Skipped (cannot auto-adopt on go 1.23):${skipped}" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Skipped (cannot auto-adopt on go 1.26):${skipped}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run tests
