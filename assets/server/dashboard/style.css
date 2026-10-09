@@ -117,3 +117,23 @@ code { color: var(--accent); overflow-wrap: anywhere; }
 #schema-body h3 { font-size: 13px; margin: 12px 0 4px; }
 #schema-body table { font-size: 12px; }
 #schema-body td { padding: 4px 8px 4px 0; }
+
+/* The presets panel (spec 20) mirrors the schema toggle's shape: one
+   full-width disclosure button, then the list. The two disclosures stack in
+   the same aside, so the presets block carries a little bottom margin to
+   keep them visually apart. */
+#presets-toggle { width: 100%; text-align: left; }
+#presets-body { margin-bottom: 10px; }
+.preset { border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 8px 0; }
+.preset-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+.preset-title { font-weight: bold; overflow-wrap: anywhere; }
+.preset-desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; overflow-wrap: anywhere; }
+.preset-insert { font-size: 12px; padding: 1px 8px; }
+/* The last-inserted entry keeps its button tinted until another insert
+   replaces it: the panel's answer to "what did this just put in my editor". */
+.preset.inserted .preset-insert { border-color: var(--ok); color: var(--ok); }
+.preset-notes {
+  margin: 8px 0 0; padding: 6px; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--muted); font-size: 12px;
+}
+.preset-notes div { overflow-wrap: anywhere; }

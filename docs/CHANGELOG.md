@@ -1,4 +1,80 @@
 # Changelog
+## 1.0.25 - 2026-10-09 - workbench policy presets: curated fragments the engine can never rot under
+
+The workbench's editor starts from a blank page. `/api/schema` says what
+EXISTS — every field, every action, every phase — but not what GOOD looks
+like. This release adds `GET /api/presets` (`server/admin_api.go`, the route
+beside the other `/api/` lines in `server/admin.go`): nine hand-tabled
+policy fragments, one per teaching job the phases offer — the smallest valid
+document (request logging), an ip allowlist, a CEL-pathed deny, the four
+credential gates (basic, bearer, JWT, OIDC), webhook verification, and the
+one response-phase fragment that teaches the response phase exists. The
+payload is the bare `[]apiPreset` array, sorted by name at table order;
+JSON encodes a slice in slice order, so two fetches answer byte-identically.
+The route rides `secureAPI` like every other `/api/` surface — 401/405, the
+5× api limiter, `no-store`, the CSP — and the presets panel in the SPA
+(`assets/server/dashboard/app.js` + `style.css`; the static set stays exactly
+three files, because the panel is data the app fetches, which is what
+`/api/*` is for) fetches it once per visit and caches it in memory exactly
+like `schemaCache`. Inserting a fragment is a text insert and nothing more:
+the bytes land in the policy editor through the same input event a
+keystroke fires, so the verdict that appears is the same one a typed
+document earns, and the validate button remains the only oracle. Placeholders
+are `REPLACE_ME` — no preset contains `secret(`, the spelling the workbench's
+raw scan 422s at insert.
+
+### The pin: drift breaks the build, not the operator's insert
+
+Every preset is pinned by `TestPresetsAreValidPolicyDocuments`, four ways:
+each fragment POSTs through the real handler stack to `/api/validate/policy`
+(the war path — the same code the operator's keystrokes hit) and must come
+back `valid: true`; the whole served payload greps clean of `secret(`; each
+fragment's phase key must be a key of the engine's action matrix with every
+rule name in that phase's action list, so an engine phase-move or action
+rename fails the build; and each fragment round-trips `/api/render` to a
+non-empty canonical document. The pin is demonstrated, not assumed: mutating
+one fragment's key to a plausible-looking wrong spelling fails the test with
+the validator's own message (`unknown config field "leeway" (this action
+documents: jwks_uri, issuer, audience, algorithms, leeway_seconds, ...)`),
+and renaming a rule fails it with the engine's "unknown action" refusal that
+lists everything the build does implement. A pin that cannot fail is
+decoration.
+
+### Presets copy the validator, never the README
+
+That is the principle this cluster operationalizes, and it has a finding
+attached: this tree's own README once carried a `restrict-ips` example with a
+`cidrs:` key the validator has always refused — documentation drift the
+engine could not catch, because the README is not compiled. A preset that
+copied the README would ship the rot with a badge on it, so the table was
+hand-checked against `policy/validate.go` instead, and the difference
+matters in the small print: the JWT gate's clock-skew key is
+`leeway_seconds` (the plan prose said "leeway"), webhook verification takes
+a `secrets:` list for rotation (not a single `secret`), and `restrict-ips`
+accepts exactly `enforce | allow | deny` — `ip_policies` is refused with
+"use allow/deny CIDRs". Each preset's notes teach the keys the validator
+actually accepts, so the hint lines an operator reads after insert are the
+engine's truth, not a summary's.
+
+### What the e2e group adds, and the line it honestly stops at
+
+The presets e2e group (a ninth ngrokd, admin-listener only — no public legs,
+no client, an ephemeral tunnel port, one port claim) runs the payload
+contract against a live server: 401 without credentials, 405 on POST, the
+bare sorted nine-preset array, byte-stability across two fetches, the
+`secret(` grep on the served bytes, every served fragment validated AND
+rendered live with the rendered form re-validating, a cross-join of every
+preset's phase and action names against what `/api/schema` advertises, and
+the served `app.js` checked for the presets wiring, the no-innerHTML /
+no-localStorage discipline, and a static set that is still three files. The
+line the group states rather than fakes: the SPA's insert → input-event →
+debounced-verdict path and the cache's retry-on-failed-fetch are DOM state,
+and this harness has no browser — so their observable halves are pinned
+where they live, at the API layer (the bytes the panel inserts are exactly
+the bytes `/api/presets` serves, proven through the validate and render
+endpoints; byte-stability is the server half of cached-per-visit, a refetch
+can never see a different answer).
+
 ## 1.0.24 - 2026-10-09 - upstream_pool: the h1 local leg learns to keep its connections
 
 Cluster 17 gave `upstream_protocol: http2` tunnels a parsed local leg and,

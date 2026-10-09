@@ -409,6 +409,9 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 	// in admin_api.go; every error path answers JSON because the SPA parses
 	// JSON.
 	mux.HandleFunc("/api/schema", secureAPI(http.MethodGet, handleAPISchema))
+	// The curated policy presets (SPEC-CLUSTER26 §2): a GET beside the schema,
+	// same wrapper -- 401/405, the 5x api limiter, no-store, the CSP all ride.
+	mux.HandleFunc("/api/presets", secureAPI(http.MethodGet, handleAPIPresets))
 	mux.HandleFunc("/api/validate/config", secureAPI(http.MethodPost, handleAPIValidateConfig))
 	mux.HandleFunc("/api/validate/policy", secureAPI(http.MethodPost, handleAPIValidatePolicy))
 	mux.HandleFunc("/api/render", secureAPI(http.MethodPost, handleAPIRender))

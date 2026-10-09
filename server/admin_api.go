@@ -202,6 +202,218 @@ var policyActionSummaries = map[string]string{
 	policy.ActionOIDC:                "requires an OpenID Connect login for the whole endpoint (authorization code + PKCE); at most one per policy.",
 }
 
+// --- GET /api/presets --------------------------------------------------------
+
+// apiPreset is one curated policy fragment as /api/presets serves it: the
+// slug, the human title, the one phase the fragment speaks in, a line of
+// description, the fragment itself (insertable as-is into the workbench's
+// policy editor), the hint lines shown after an insert, and the payload kind.
+type apiPreset struct {
+	Name        string   `json:"name"` // sort key, unique
+	Title       string   `json:"title"`
+	Phase       string   `json:"phase"` // on_http_request | on_http_response | on_tcp_connect
+	Description string   `json:"description"`
+	YAML        string   `json:"yaml"`  // the fragment, insertable as-is
+	Notes       []string `json:"notes"` // hint lines rendered after insert
+	Kind        string   `json:"kind"`  // "policy" (v1)
+}
+
+// apiPresets is the curated fragment table (SPEC-CLUSTER26 §3), hand-tabled
+// beside the schema tables, sorted by name at table order. JSON encodes a
+// slice in slice order, so the payload is byte-stable -- no map iteration
+// anywhere in it.
+//
+// The one rule this table obeys above every other: shapes are copied from
+// policy/validate.go, never from the README. Documentation drift is the rot
+// class this cluster exists to kill -- the README's own restrict-ips example
+// carried a `cidrs:` key the validator has always refused -- and a preset
+// that copied the README would ship the rot with a badge on it. Each
+// fragment is therefore pinned to the real validator by
+// TestPresetsAreValidPolicyDocuments, which POSTs every one through
+// /api/validate/policy -- the same handler stack the operator's keystrokes
+// hit -- so an engine move underneath a preset fails the build instead of
+// the operator's insert.
+//
+// No preset contains secret(: the workbench's raw scan 422s it at insert
+// (handleAPIValidatePolicy), so such a fragment would land red. Every
+// credential field carries REPLACE_ME instead, which both validates clean
+// and reads as edit-me at insert time.
+var apiPresets = []apiPreset{
+	{
+		Name:        "admin-path-deny",
+		Title:       "Deny /admin paths",
+		Phase:       "on_http_request",
+		Description: "Refuse every request whose path starts with /admin, by CEL condition, with a 403.",
+		YAML: `on_http_request:
+  - name: deny
+    expressions:
+      - 'req.url.path.startsWith("/admin")'
+    config:
+      status_code: 403
+`,
+		Notes: []string{
+			"expressions is CEL over the phase variables: req.url.path (leading slash kept), req.url.query, req.method, req.headers.",
+			"A rule with no expressions matches everything; deny's status_code is optional (403 default).",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "basic-auth-gate",
+		Title:       "Basic-auth gate",
+		Phase:       "on_http_request",
+		Description: "Require a browser basic-auth login before any request is forwarded.",
+		YAML: `on_http_request:
+  - name: basic-auth
+    config:
+      realm: restricted
+      credentials:
+        - alice:REPLACE_ME
+`,
+		Notes: []string{
+			"List several user:password entries for rotation; each is held as a SHA-256 digest and compared in constant time.",
+			"Missing or wrong credentials earn 401 with WWW-Authenticate: Basic realm=\"restricted\".",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "bearer-token-gate",
+		Title:       "Bearer token gate",
+		Phase:       "on_http_request",
+		Description: "Require an Authorization: Bearer header carrying one of the configured tokens.",
+		YAML: `on_http_request:
+  - name: bearer-auth
+    config:
+      tokens:
+        - REPLACE_ME
+`,
+		Notes: []string{
+			"Several tokens are allowed -- one per client, so one can be revoked without touching the rest; digested like every credential.",
+			"A request without, or with a wrong, token gets 401 and the bare WWW-Authenticate: Bearer challenge.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "ip-allowlist",
+		Title:       "IP allowlist",
+		Phase:       "on_tcp_connect",
+		Description: "Refuse every connection whose source address is outside the allow list, before any HTTP is spoken.",
+		YAML: `on_tcp_connect:
+  - name: restrict-ips
+    config:
+      enforce: true
+      allow:
+        - 10.0.0.0/24
+`,
+		Notes: []string{
+			"The accepted keys are exactly enforce, allow and deny -- ip_policies is refused (it needs the ngrok API).",
+			"A bare address is accepted as a host CIDR (203.0.113.7 means /32); enforce: false reports would-be refusals instead of refusing.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "jwt-gate",
+		Title:       "JWT validation gate",
+		Phase:       "on_http_request",
+		Description: "Require a bearer JWT your identity provider signed, validated against its JWKS endpoint.",
+		YAML: `on_http_request:
+  - name: jwt-validation
+    config:
+      jwks_uri: https://idp.example.com/.well-known/jwks.json
+      issuer: https://idp.example.com
+      audience: my-endpoint
+      algorithms:
+        - RS256
+      leeway_seconds: 30
+`,
+		Notes: []string{
+			"The algorithm allowlist is enforced (RS256 here; no HS*, no \"none\"), and exp is required in every token.",
+			"jwks_uri must be https (loopback http is allowed, so a local test server can serve one); issuer and audience are optional but an empty one is refused.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "oidc-protect",
+		Title:       "OpenID Connect login",
+		Phase:       "on_http_request",
+		Description: "Put the whole endpoint behind an OpenID Connect login (authorization code + PKCE).",
+		YAML: `on_http_request:
+  - name: oidc
+    config:
+      issuer: https://idp.example.com
+      client_id: REPLACE_ME
+      client_secret: REPLACE_ME
+`,
+		Notes: []string{
+			"At most one oidc action per policy: the callback path (default /oauth2/callback) and the session cookies belong to the endpoint.",
+			"Refused on agent-TLS-terminated endpoints: over a zero-knowledge tunnel the server holds only ciphertext, so the login flow has nothing to run on -- register with server-side TLS termination.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "request-logging",
+		Title:       "Request logging",
+		Phase:       "on_http_request",
+		Description: "The smallest valid policy document -- one phase, one rule, one action. Start here.",
+		YAML: `on_http_request:
+  - name: log
+    config:
+      metadata:
+        event: request
+        service: my-app
+`,
+		Notes: []string{
+			"metadata values may interpolate phase variables: ${req.url.path}, ${req.method}, ${req.headers['x-request-id']}.",
+			"Every phase document has this shape: a phase key, a list of rules, each rule a name plus optional expressions plus config.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "security-headers",
+		Title:       "Security response headers",
+		Phase:       "on_http_response",
+		Description: "Add HSTS and X-Content-Type-Options to every response -- and the only preset here that shows the response phase exists.",
+		YAML: `on_http_response:
+  - name: add-headers
+    config:
+      headers:
+        strict-transport-security: max-age=31536000; includeSubDomains
+        x-content-type-options: nosniff
+`,
+		Notes: []string{
+			"The response phase implements add-headers, remove-headers (never user-agent) and log; its conditions read res.* variables.",
+			"At most ten headers per action; names are lower-cased on the wire.",
+		},
+		Kind: "policy",
+	},
+	{
+		Name:        "webhook-verify",
+		Title:       "Webhook signature verification",
+		Phase:       "on_http_request",
+		Description: "Verify the provider's signature over the request body and forward only what verifies.",
+		YAML: `on_http_request:
+  - name: webhook-verification
+    config:
+      provider: stripe
+      secrets:
+        - REPLACE_ME
+`,
+		Notes: []string{
+			"Providers: stripe, github, svix (svix secrets carry the whsec_ prefix Svix's dashboard issues).",
+			"Several secrets are allowed for rotation; tolerance_seconds defaults to 300.",
+		},
+		Kind: "policy",
+	},
+}
+
+// handleAPIPresets answers GET /api/presets: one json.Encode of the curated
+// table. A slice encodes in slice order, so the answer is byte-stable for a
+// given table -- the /api/schema property, one more artifact of the same
+// shape.
+func handleAPIPresets(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(apiPresets)
+}
+
 // handleAPISchema answers GET /api/schema: the config key tables and the
 // policy action matrix with its summaries.
 func handleAPISchema(w http.ResponseWriter, r *http.Request) {

@@ -22,6 +22,8 @@ import (
 	"ngrok/client"
 	"ngrok/msg"
 	"ngrok/policy"
+
+	"gopkg.in/yaml.v3"
 )
 
 // testAdminToken is the token auth the auth-requiring tests present.
@@ -175,6 +177,7 @@ func TestAPIRoutesRequireAuthAndPinMethods(t *testing.T) {
 	// method without credentials is a 405 -- pinned below, with credentials.)
 	unauthed := map[string]string{
 		"/api/schema":          http.MethodGet,
+		"/api/presets":         http.MethodGet,
 		"/api/validate/config": http.MethodPost,
 		"/api/validate/policy": http.MethodPost,
 		"/api/render":          http.MethodPost,
@@ -199,6 +202,7 @@ func TestAPIRoutesRequireAuthAndPinMethods(t *testing.T) {
 	// handler runs.
 	wrongMethod := map[string]string{
 		"/api/schema":          http.MethodPost,
+		"/api/presets":         http.MethodPost,
 		"/api/validate/config": http.MethodGet,
 		"/api/validate/policy": http.MethodGet,
 		"/api/render":          http.MethodGet,
@@ -603,6 +607,147 @@ func TestPolicyActionSummariesMatchTheMatrix(t *testing.T) {
 		if !known {
 			t.Errorf("summary for %q names no action the matrix implements (retired action, or a typo)", name)
 		}
+	}
+}
+
+// --- GET /api/presets (SPEC-CLUSTER26 §4) --------------------------------------
+
+// TestPresetsAreValidPolicyDocuments is the pin that keeps the curated
+// fragments from rotting under the engine. Per preset it checks, in order:
+//
+//	(a) the fragment validates through the REAL handler stack -- POSTed to
+//	    /api/validate/policy, the same code the operator's insert hits;
+//	(b) the whole served payload greps clean of secret( -- the raw scan
+//	    422s it at insert, so a preset carrying one would land red;
+//	(c) the fragment's phase key is a key of the engine's action matrix and
+//	    every rule name sits in that phase's action list -- an engine
+//	    phase-move or action rename fails the build here;
+//	(d) the fragment round-trips /api/render (kind=policy) to a non-empty
+//	    canonical document.
+//
+// A preset that cannot fail is decoration, so every check reads the served
+// bytes and the live matrix, never the table's own claims about itself.
+func TestPresetsAreValidPolicyDocuments(t *testing.T) {
+	srv := newAdminTestServer(t, &adminAuth{Token: testAdminToken, Required: true})
+
+	// The endpoint rides secureAPI like every other /api route: 200 JSON with
+	// no-store, the envelope the operator's browser actually receives.
+	resp := adminGet(t, srv, "/api/presets")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/presets: got %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("/api/presets Content-Type %q, want application/json", ct)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("/api/presets Cache-Control %q, want no-store", resp.Header.Get("Cache-Control"))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("/api/presets: %v", err)
+	}
+	var presets []apiPreset
+	if err := json.Unmarshal(body, &presets); err != nil {
+		t.Fatalf("/api/presets is not a JSON preset array: %v", err)
+	}
+	if len(presets) == 0 {
+		t.Fatal("/api/presets served an empty array; the workbench would offer nothing to start from")
+	}
+	if len(presets) != len(apiPresets) {
+		t.Errorf("/api/presets served %d presets, the table carries %d", len(presets), len(apiPresets))
+	}
+
+	// Table hygiene on the SERVED payload: sorted by name at table order is a
+	// payload contract (a slice encodes in slice order), so it is pinned
+	// against the bytes, not against the table variable.
+	prev := ""
+	seen := map[string]bool{}
+	for _, p := range presets {
+		if p.Name == "" || p.Title == "" || p.Phase == "" || p.Description == "" || p.YAML == "" {
+			t.Errorf("preset %q: name, title, phase, description and yaml must all be present", p.Name)
+		}
+		if p.Kind != "policy" {
+			t.Errorf("preset %q: kind %q, want \"policy\"", p.Name, p.Kind)
+		}
+		if seen[p.Name] {
+			t.Errorf("preset %q is served twice", p.Name)
+		}
+		seen[p.Name] = true
+		if prev != "" && p.Name <= prev {
+			t.Errorf("presets not sorted by name: %q after %q", p.Name, prev)
+		}
+		prev = p.Name
+	}
+
+	// (b) the 422 trap, guarded at the source: not one preset may carry the
+	// spelling the workbench's raw scan refuses at insert.
+	marshaled, err := json.Marshal(presets)
+	if err != nil {
+		t.Fatalf("re-marshaling the served payload failed: %v", err)
+	}
+	if strings.Contains(string(marshaled), "secret(") {
+		t.Error("the served payload contains secret(; the raw scan would 422 that preset at insert")
+	}
+
+	matrix := policy.PhaseActionMatrix()
+
+	for _, p := range presets {
+		t.Run(p.Name, func(t *testing.T) {
+			// (a) the war-path pin: the fragment is judged by the validator
+			// itself, through the endpoint, not by a test-local re-derivation
+			// that could drift from the handler.
+			vresp := adminPost(t, srv, "/api/validate/policy", fmt.Sprintf(`{"content": %q}`, p.YAML))
+			vpayload := decodeJSONBody(t, vresp)
+			if vresp.StatusCode != http.StatusOK || vpayload["valid"] != true {
+				t.Fatalf("validate: got %d %v, want 200 {valid:true}", vresp.StatusCode, vpayload)
+			}
+
+			// (c) the matrix cross-join: parse the fragment generically, so a
+			// phase key the engine does not know (and a rule name the phase
+			// does not implement) both show up as disagreements with the
+			// matrix rather than as a plausible-looking verdict.
+			var frag map[string][]struct {
+				Name string `yaml:"name"`
+			}
+			if err := yaml.Unmarshal([]byte(p.YAML), &frag); err != nil {
+				t.Fatalf("fragment does not parse as a policy document: %v", err)
+			}
+			if len(frag) != 1 {
+				t.Fatalf("fragment carries %d phase keys; a preset teaches exactly one phase", len(frag))
+			}
+			for phaseKey, rules := range frag {
+				if phaseKey != p.Phase {
+					t.Errorf("fragment phase key %q disagrees with the phase field %q", phaseKey, p.Phase)
+				}
+				actions, ok := matrix[phaseKey]
+				if !ok {
+					t.Fatalf("phase key %q is not a key of the action matrix; the engine moved underneath this preset", phaseKey)
+				}
+				if len(rules) == 0 {
+					t.Fatalf("phase %q carries no rules", phaseKey)
+				}
+				for _, r := range rules {
+					if r.Name == "" {
+						t.Fatalf("phase %q carries a rule with no name", phaseKey)
+					}
+					if !containsSorted(actions, r.Name) {
+						t.Errorf("rule %q is not implemented in phase %q (the matrix lists %v); the engine moved underneath this preset",
+							r.Name, phaseKey, actions)
+					}
+				}
+			}
+
+			// (d) the render round trip: what insert puts in the editor must
+			// come back out as a non-empty canonical document.
+			rresp := adminPost(t, srv, "/api/render", fmt.Sprintf(`{"kind": "policy", "content": %q}`, p.YAML))
+			rpayload := decodeJSONBody(t, rresp)
+			if rresp.StatusCode != http.StatusOK || rpayload["valid"] != true {
+				t.Fatalf("render: got %d %v, want 200 {valid:true,...}", rresp.StatusCode, rpayload)
+			}
+			if rendered, _ := rpayload["rendered"].(string); rendered == "" {
+				t.Error("render: empty rendered document")
+			}
+		})
 	}
 }
 

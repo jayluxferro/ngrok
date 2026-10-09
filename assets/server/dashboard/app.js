@@ -686,6 +686,128 @@ function policyActions(parent, actions) {
   parent.append(wrap);
 }
 
+// ---- presets sidebar (spec 20 §5) -----------------------------------------------
+
+// The curated policy fragments /api/presets serves (SPEC-CLUSTER26). Cached
+// per visit exactly like schemaCache: fetched once on first expand, a failed
+// fetch leaves the cache empty so closing and reopening the panel retries.
+let presetsCache = null;
+
+// The policy editor insert writes into. Bound at wiring time, before the
+// user can click anything (the script tag is end-of-body and synchronous).
+let polEditor = null;
+
+function togglePresets() {
+  const body = $("presets-body");
+  const opening = body.hidden;
+  body.hidden = !opening;
+  $("presets-toggle").setAttribute("aria-expanded", opening ? "true" : "false");
+  $("presets-toggle").textContent = opening ? "Presets ▾" : "Presets ▸";
+  if (opening && !presetsCache) loadPresets();
+}
+
+async function loadPresets() {
+  const body = $("presets-body");
+  clear(body);
+  body.append(el("div", "muted", "loading…"));
+  try {
+    presetsCache = await fetchJSON("/api/presets");
+  } catch (err) {
+    presetsCache = null; // retry on next open
+    if (sessionExpired) return;
+    clear(body);
+    body.append(el("div", "verdict bad", err.message));
+    return;
+  }
+  renderPresets(presetsCache);
+}
+
+// renderPresets lists one entry per preset: title + phase tag, description,
+// an insert button. The shape checks keep an older binary (no presets field,
+// or a non-array) a quiet "unavailable" line instead of a thrown render —
+// the same defensive read every other payload in this file gets.
+function renderPresets(presets) {
+  const body = $("presets-body");
+  clear(body);
+  if (!Array.isArray(presets) || presets.length === 0) {
+    body.append(el("div", "muted", "no presets available (older server?)"));
+    return;
+  }
+  for (const p of presets) {
+    if (!p || typeof p !== "object") continue;
+    body.append(presetItem(p));
+  }
+}
+
+function presetItem(p) {
+  const item = el("div", "preset");
+  const head = el("div", "preset-head");
+  head.append(el("span", "preset-title", nz(p.title, nz(p.name, "?"))));
+  if (p.phase) head.append(el("span", "tag", String(p.phase)));
+  item.append(head);
+  item.append(el("div", "preset-desc", nz(p.description, "")));
+
+  const insert = el("button", "preset-insert", "insert");
+  insert.type = "button";
+  const notes = el("div", "preset-notes");
+  notes.hidden = true;
+  insert.addEventListener("click", () => insertPreset(p, item, notes));
+  item.append(insert);
+  item.append(notes);
+  return item;
+}
+
+// insertPreset is a text insert and nothing more (spec 20 non-goals): the
+// fragment lands in the policy editor and the editor's own input path takes
+// over, so the verdict that appears is the same one a typed document earns
+// and the validate button stays the only oracle.
+function insertPreset(p, item, notes) {
+  if (!polEditor) return;
+  polEditor.ta.value = typeof p.yaml === "string" ? p.yaml : "";
+  // The editor debounces validation on "input"; dispatching the same event a
+  // keystroke would keeps exactly one path into validation.
+  polEditor.ta.dispatchEvent(new Event("input"));
+  renderNotes(item, notes, p);
+  polEditor.ta.scrollIntoView({ block: "nearest" });
+}
+
+// renderNotes shows this preset's hint lines and marks its entry as the last
+// one inserted, so the panel answers "what did this just put in my editor".
+function renderNotes(item, notes, p) {
+  for (const other of document.querySelectorAll(".preset.inserted")) {
+    other.classList.remove("inserted");
+  }
+  item.classList.add("inserted");
+  clear(notes);
+  const list = Array.isArray(p.notes) ? p.notes : [];
+  if (list.length === 0) {
+    notes.hidden = true;
+    return;
+  }
+  for (const line of list) notes.append(el("div", null, "· " + String(line)));
+  notes.hidden = false;
+}
+
+// buildPresetsPanel slots the panel above the schema toggle in the workbench
+// aside. It is built here rather than shipped in index.html: the static
+// skeleton keeps the shape spec 15 gave it, and this keeps the preset work
+// inside the two files this feature owns. The nodes still go through el() —
+// the no-innerHTML rule does not care which file built the node.
+function buildPresetsPanel() {
+  const aside = document.querySelector(".wbside");
+  if (!aside) return;
+  const toggle = el("button", null, "Presets ▸");
+  toggle.type = "button";
+  toggle.id = "presets-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  const body = el("div");
+  body.id = "presets-body";
+  body.hidden = true;
+  aside.insertBefore(toggle, aside.firstChild);
+  aside.insertBefore(body, toggle.nextSibling);
+  toggle.addEventListener("click", togglePresets);
+}
+
 // ---- wiring ----------------------------------------------------------------
 
 // Wiring runs at the bottom; the script tag is end-of-body, so the DOM is up
@@ -703,5 +825,6 @@ $("ev-clear").addEventListener("click", () => {
 $("schema-toggle").addEventListener("click", toggleSchema);
 
 makeEditor("config", "cfg");
-makeEditor("policy", "pol");
+polEditor = makeEditor("policy", "pol");
+buildPresetsPanel();
 activate("overview");

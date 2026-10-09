@@ -6920,4 +6920,331 @@ pool_stop "$POOL_MAIN_CLIENT_PID" "$POOL_NGROKD_PID"
 kill "$POOL_UP_PID" "$POOL_HEAL_UP_PID" 2>/dev/null || true
 echo "[e2e] pool group: 10/10 scenarios passed"
 
+# ---------------------------------------------------------------------------
+# The workbench policy presets (SPEC-CLUSTER26, spec 20 §6): /api/presets --
+# the curated fragments the SPA's presets panel offers as starting points --
+# proved against a live server rather than httptest. The unit pin
+# (TestPresetsAreValidPolicyDocuments) already compiles every preset through
+# the real handler stack on every build; this group's job is the part only a
+# live server can say: that the route sits behind the admin auth on a real
+# listener, that the served bytes keep the payload contract (nine, sorted,
+# byte-stable), that every fragment the server serves TODAY validates and
+# renders through the same endpoints the operator's keystrokes hit, and that
+# presets and /api/schema have not drifted apart on the war path.
+#
+# The ninth ngrokd, and the leanest: the presets surface is admin-API only,
+# so this stack has no public legs (-httpAddr= -httpsAddr=) and nothing to
+# register -- -tunnelAddr=127.0.0.1:0 takes an ephemeral port so the flag is
+# satisfied without claiming one, and no client and no local upstream exist
+# here at all. The admin port is the group's only claim.
+#
+# Ports grepped across the whole file before picking, the standing rule: the
+# other ngrokds hold admin :19090-:19104, public http :18080-:18093, https
+# :18443-:18447, tunnel :14443-:14458; local upstreams :19001-:19024; bench
+# holds 18180/18480/15443/19110/19190. This group takes admin :19105 -- none
+# of which appear anywhere else in the file.
+#
+# What is deliberately NOT here: the SPA's insert -> input-event -> debounced
+# verdict path and the presetsCache retry-on-failed-fetch are DOM state, and
+# this harness has no browser. The observable half of both is pinned where it
+# lives: the bytes the panel inserts are exactly the bytes /api/presets
+# serves, so scenarios 6 and 7 run the served fragments through the validate
+# and render endpoints themselves; and byte-stability (scenario 5) is the
+# server half of "cached per visit" -- a refetch can never see a different
+# answer.
+#
+# Logs go to /tmp/ngrok-e2e-presets/ -- deliberately OUTSIDE the
+# /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks, so a failed run's
+# server log survives the next run's clean slate -- and the group clears its
+# own directory first, for the same O_APPEND reason every other group does.
+# ---------------------------------------------------------------------------
+
+PRESETS_DIR=/tmp/ngrok-e2e-presets
+PRE_ADMIN=127.0.0.1:19105
+mkdir -p "$PRESETS_DIR"
+rm -f "$PRESETS_DIR"/*.log
+
+# pre_curl echoes the status code (000 when curl never got one) and leaves
+# the body in the -o file the caller named, exactly like a2_curl:
+# authenticated against the presets listener, bounded so a hung handler is a
+# wrong-status failure instead of a wedged script.
+pre_curl() {
+  curl -sS --max-time 15 -u preset-admin:preset-pass -w '%{http_code}' "$@" || true
+}
+
+# pre_envelope <document file> <out json file> [kind]: the {"content": ...}
+# envelope every POST /api/* endpoint takes. The quoting is python's job --
+# a YAML fragment is newlines and quotes, exactly the bytes shell quoting is
+# worst at -- and kind is only meaningful to /api/render.
+pre_envelope() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+doc = {"content": open(sys.argv[1]).read()}
+if sys.argv[3]:
+    doc["kind"] = sys.argv[3]
+open(sys.argv[2], "w").write(json.dumps(doc))
+PY
+}
+
+pre_wait_server() {  # <log> <label>
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Listening for control and proxy connections" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: ngrokd never came up:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+echo "[e2e] starting the presets group's ngrokd (admin :19105 only; no public legs, ephemeral tunnel port)"
+./bin/ngrokd -domain=localhost -httpAddr= -httpsAddr= \
+  -tunnelAddr=127.0.0.1:0 -adminAddr="$PRE_ADMIN" \
+  -adminAuth=preset-admin:preset-pass -adminRate=1200 \
+  >"$PRESETS_DIR/ngrokd.log" 2>&1 &
+PRESETS_NGROKD_PID=$!
+pre_wait_server "$PRESETS_DIR/ngrokd.log" "presets (ngrokd)"
+
+echo "[e2e] presets 1: POST /api/presets answers 405 -- the route serves GET and nothing else"
+PRE_CODE="$(pre_curl -o /dev/null -H 'Content-Type: application/json' \
+  --data-binary '{"content":"x"}' "http://$PRE_ADMIN/api/presets")"
+if [[ "$PRE_CODE" != "405" ]]; then
+  echo "[e2e] POST /api/presets answered $PRE_CODE, want 405"
+  exit 1
+fi
+
+echo "[e2e] presets 2: GET /api/presets without credentials answers 401"
+PRE_CODE="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "http://$PRE_ADMIN/api/presets" || true)"
+if [[ "$PRE_CODE" != "401" ]]; then
+  echo "[e2e] /api/presets without credentials answered $PRE_CODE, want 401"
+  exit 1
+fi
+
+echo "[e2e] presets 3: the payload is the bare nine-preset array, sorted and complete"
+PRE_CODE="$(pre_curl -o "$PRESETS_DIR/presets.json" "http://$PRE_ADMIN/api/presets")"
+if [[ "$PRE_CODE" != "200" ]]; then
+  echo "[e2e] /api/presets answered $PRE_CODE, want 200"
+  exit 1
+fi
+if ! python3 - "$PRESETS_DIR/presets.json" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+# The bare array, not a wrapper object: the handler is one json.Encode of the
+# table, and the SPA iterates exactly this.
+assert isinstance(rows, list), f"payload is {type(rows).__name__}, want a bare array"
+assert len(rows) == 9, f"payload carries {len(rows)} presets, want the table's nine"
+names = [r.get("name", "") for r in rows]
+assert names == sorted(names), f"presets not sorted by name: {names}"
+assert len(set(names)) == len(names), f"duplicate names: {names}"
+for r in rows:
+    for f in ("name", "title", "phase", "description", "yaml"):
+        v = r.get(f, "")
+        assert isinstance(v, str) and v, f"{r.get('name')}: field {f} missing or empty"
+    assert r.get("kind") == "policy", f"{r['name']}: kind {r.get('kind')!r}, want 'policy'"
+    notes = r.get("notes")
+    if notes is not None:
+        assert isinstance(notes, list) and all(isinstance(n, str) for n in notes), \
+            f"{r['name']}: notes is {type(notes).__name__}, want a list of strings"
+    # Metadata-vs-bytes coherence, checked structurally: the fragment's first
+    # line must BE its phase key, and the fragment must be single-phase (a
+    # second top-level key would be a line at column 0 after the rules). The
+    # DEEP parse is not done here on purpose -- no pyyaml dependency enters
+    # this harness -- because scenario 6 feeds the fragment to the validator,
+    # which is the authority on whether the bytes are a policy document.
+    lines = r["yaml"].splitlines()
+    assert lines[0] == r["phase"] + ":", \
+        f"{r['name']}: first line {lines[0]!r}, want the phase key {r['phase']!r}"
+    body = [ln for ln in lines[1:] if ln.strip()]
+    assert not any(ln and not ln[0].isspace() for ln in body), \
+        f"{r['name']}: fragment carries a second top-level key; a preset teaches one phase"
+print(f"    nine presets, sorted: {', '.join(names)}")
+PY
+then
+  echo "[e2e] /api/presets payload failed its shape checks"
+  exit 1
+fi
+
+echo "[e2e] presets 4: the whole served payload greps clean of secret("
+# The non-goal, live: the workbench's raw scan 422s secret( at insert, so a
+# payload carrying one would land red in the panel the moment it shipped.
+if grep -q 'secret(' "$PRESETS_DIR/presets.json"; then
+  echo "[e2e] the served payload contains secret(; the workbench would 422 that insert"
+  grep -n 'secret(' "$PRESETS_DIR/presets.json" | head -3
+  exit 1
+fi
+
+echo "[e2e] presets 5: the payload is byte-stable -- two fetches, identical bytes"
+pre_curl -o "$PRESETS_DIR/presets-again.json" "http://$PRE_ADMIN/api/presets" >/dev/null
+if ! python3 - "$PRESETS_DIR/presets.json" "$PRESETS_DIR/presets-again.json" <<'PY'
+import hashlib, sys
+a, b = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
+assert a == b, (
+    "two GETs answered different bytes:\n"
+    f"  first  sha256 {hashlib.sha256(a).hexdigest()}\n"
+    f"  second sha256 {hashlib.sha256(b).hexdigest()}"
+)
+print(f"    identical, sha256 {hashlib.sha256(a).hexdigest()[:16]}..., {len(a)} bytes")
+PY
+then
+  echo "[e2e] /api/presets is not byte-stable across fetches"
+  exit 1
+fi
+
+echo "[e2e] presets 6: every served fragment validates live (the war path, run for real)"
+# One POST per preset through /api/validate/policy -- the same oracle the
+# operator's insert hits after the panel writes the fragment into the editor.
+# The engine's verdict, not this script's parse, is what makes a preset good.
+# The loop is bounded by the payload scenario 3 just admitted (nine), not by
+# a second hand-copied count.
+PRE_N="$(python3 - "$PRESETS_DIR/presets.json" <<'PY'
+import json, sys
+print(len(json.load(open(sys.argv[1]))))
+PY
+)"
+PRE_COUNT=0
+for i in $(seq 0 $((PRE_N - 1))); do
+  PRE_COUNT=$((PRE_COUNT + 1))
+  python3 - "$PRESETS_DIR/presets.json" "$PRESETS_DIR/frag-$i.yml" "$i" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+open(sys.argv[2], "w").write(rows[int(sys.argv[3])]["yaml"])
+PY
+  PRE_NAME="$(python3 - "$PRESETS_DIR/frag-$i.yml" <<'PY'
+import sys
+for ln in open(sys.argv[1]):
+    if ln.strip().startswith("- name: "):
+        print(ln.strip()[len("- name: "):])
+        break
+PY
+)"
+  pre_envelope "$PRESETS_DIR/frag-$i.yml" "$PRESETS_DIR/frag-$i.json"
+  PRE_CODE="$(pre_curl -o "$PRESETS_DIR/frag-$i.out" -H 'Content-Type: application/json' \
+    --data-binary @"$PRESETS_DIR/frag-$i.json" "http://$PRE_ADMIN/api/validate/policy")"
+  if [[ "$PRE_CODE" != "200" ]]; then
+    echo "[e2e] preset $PRE_NAME: validate answered $PRE_CODE, want 200:"
+    cat "$PRESETS_DIR/frag-$i.out"
+    exit 1
+  fi
+  if ! python3 - "$PRESETS_DIR/frag-$i.out" "$PRE_NAME" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is True, f"{sys.argv[2]}: expected valid:true, got {v}"
+PY
+  then
+    echo "[e2e] preset $PRE_NAME did not come back valid:true:"
+    cat "$PRESETS_DIR/frag-$i.out"
+    exit 1
+  fi
+done
+echo "[e2e]     all $PRE_COUNT served fragments validated"
+
+echo "[e2e] presets 7: every served fragment renders, and the canonical form re-validates"
+# /api/render kind=policy is what the workbench's Render + download button
+# runs on the editor's bytes after an insert; the canonical re-marshal must
+# come back non-empty and survive its own second trip through the validator
+# (the admin2 9 reasoning, per preset).
+for i in $(seq 0 $((PRE_N - 1))); do
+  pre_envelope "$PRESETS_DIR/frag-$i.yml" "$PRESETS_DIR/frag-$i-render.json" policy
+  PRE_CODE="$(pre_curl -o "$PRESETS_DIR/frag-$i-render.out" -H 'Content-Type: application/json' \
+    --data-binary @"$PRESETS_DIR/frag-$i-render.json" "http://$PRE_ADMIN/api/render")"
+  if [[ "$PRE_CODE" != "200" ]]; then
+    echo "[e2e] preset $i: render answered $PRE_CODE, want 200:"
+    cat "$PRESETS_DIR/frag-$i-render.out"
+    exit 1
+  fi
+  if ! python3 - "$PRESETS_DIR/frag-$i-render.out" "$PRESETS_DIR/frag-$i-rendered.yml" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v.get("valid") is True, f"render said valid:false: {v}"
+rendered = v.get("rendered", "")
+assert rendered.strip(), "render returned an empty document"
+open(sys.argv[2], "w").write(rendered)
+PY
+  then
+    echo "[e2e] preset $i did not render to a non-empty canonical document:"
+    cat "$PRESETS_DIR/frag-$i-render.out"
+    exit 1
+  fi
+  pre_envelope "$PRESETS_DIR/frag-$i-rendered.yml" "$PRESETS_DIR/frag-$i-rendered.json"
+  PRE_CODE="$(pre_curl -o "$PRESETS_DIR/frag-$i-rendered.out" -H 'Content-Type: application/json' \
+    --data-binary @"$PRESETS_DIR/frag-$i-rendered.json" "http://$PRE_ADMIN/api/validate/policy")"
+  if [[ "$PRE_CODE" != "200" ]] || ! python3 - "$PRESETS_DIR/frag-$i-rendered.out" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1])).get("valid") is True
+PY
+  then
+    echo "[e2e] preset $i: the rendered form did not re-validate:"
+    cat "$PRESETS_DIR/frag-$i-rendered.out" 2>/dev/null || true
+    exit 1
+  fi
+done
+echo "[e2e]     all $PRE_COUNT rendered and re-validated"
+
+echo "[e2e] presets 8: schema cross-join -- every preset sits inside what /api/schema advertises"
+# The divergence catcher: a preset whose phase is not a schema phases key, or
+# whose action is missing from that phase's schema action list, is a preset
+# the schema cannot explain to the operator looking at it.
+PRE_CODE="$(pre_curl -o "$PRESETS_DIR/schema.json" "http://$PRE_ADMIN/api/schema")"
+if [[ "$PRE_CODE" != "200" ]]; then
+  echo "[e2e] /api/schema answered $PRE_CODE, want 200"
+  exit 1
+fi
+if ! python3 - "$PRESETS_DIR/presets.json" "$PRESETS_DIR/schema.json" <<'PY'
+import json, sys
+presets = json.load(open(sys.argv[1]))
+schema = json.load(open(sys.argv[2]))
+phases = schema["policy"]["phases"]
+for r in presets:
+    phase = r["phase"]
+    assert phase in phases, \
+        f"{r['name']}: phase {phase!r} is not a /api/schema phases key: {sorted(phases)}"
+    actions = phases[phase]
+    names = [ln.strip()[len("- name: "):] for ln in r["yaml"].splitlines()
+             if ln.strip().startswith("- name: ")]
+    assert names, f"{r['name']}: no rule names found in the fragment"
+    for n in names:
+        assert n in actions, \
+            f"{r['name']}: action {n!r} is not in schema phase {phase!r}'s list: {actions}"
+    print(f"    {r['name']}: {phase} -> {', '.join(names)}")
+PY
+then
+  echo "[e2e] the presets and /api/schema disagree"
+  exit 1
+fi
+
+echo "[e2e] presets 9: the SPA's served bytes carry the panel and keep the textContent discipline"
+PRE_CODE="$(pre_curl -o "$PRESETS_DIR/app.js" "http://$PRE_ADMIN/static/app.js")"
+if [[ "$PRE_CODE" != "200" ]]; then
+  echo "[e2e] /static/app.js answered $PRE_CODE, want 200"
+  exit 1
+fi
+if ! grep -q 'presetsCache' "$PRESETS_DIR/app.js" || ! grep -q 'togglePresets' "$PRESETS_DIR/app.js"; then
+  echo "[e2e] the served app.js carries no presets panel"
+  exit 1
+fi
+# The load-bearing SPA rule, on the bytes a real browser would execute: no
+# innerHTML property access, no localStorage identifier at all (the workbench
+# is ephemeral by design; the panel caches per visit in memory, like
+# schemaCache). The patterns are the code shapes, not the bare words -- the
+# file's own comments legitimately SAY "innerHTML" while never using it, and
+# a grep that cannot tell those apart fails on the rule's own documentation.
+if grep -Eq '\.innerHTML|localStorage[.\[]' "$PRESETS_DIR/app.js"; then
+  echo "[e2e] the served app.js grew an innerHTML property access or a localStorage use:"
+  grep -nE '\.innerHTML|localStorage[.\[]' "$PRESETS_DIR/app.js" | head -3
+  exit 1
+fi
+# The exactly-three-files rule (the non-goal this cluster operates under):
+# the panel is data the app fetches over /api/presets, never a fourth file.
+PRE_CODE="$(pre_curl -o /dev/null "http://$PRE_ADMIN/static/presets.js")"
+if [[ "$PRE_CODE" != "404" ]]; then
+  echo "[e2e] /static/presets.js answered $PRE_CODE, want 404 (the static set stays three)"
+  exit 1
+fi
+
+kill "$PRESETS_NGROKD_PID" 2>/dev/null || true
+wait "$PRESETS_NGROKD_PID" 2>/dev/null || true
+echo "[e2e] presets group: 9/9 scenarios passed"
+
 echo "[e2e] PASS"

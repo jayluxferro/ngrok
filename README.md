@@ -18,7 +18,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting
 - **QUIC agent transport** — the agent↔server multiplexed connection rides QUIC when enabled (no TCP head-of-line blocking across streams), with automatic smux fallback
 - **Carrier dedup (experimental)** — `carrier_dedup: true` cuts a tunnel's agent↔server carrier into content-defined chunks and replaces repeats with ~10-byte references (~82% wire reduction on repeated-prompt LLM traffic); pass-through unless the server confirms, with a `-disableCarrierDedup` kill switch
-- **Admin web UI** — ngrokd's admin listener serves a dashboard with live metrics, the tunnel table and the event stream, plus a workbench that validates and renders agent configs and traffic policies against the same code that consumes them
+- **Admin web UI** — ngrokd's admin listener serves a dashboard with live metrics, the tunnel table and the event stream, plus a workbench that validates and renders agent configs and traffic policies against the same code that consumes them, with curated policy presets (`/api/presets`) pinned valid against the real validator so engine drift breaks the build, not the operator's insert
 - **Endpoint pooling & compression** — share one public endpoint across agents; gzip response compression
 - **Web inspector & terminal UI** — inspect HTTP traffic in real time
 
