@@ -98,3 +98,62 @@ func TestLogToRejectedLevelLeavesLoggerUntouched(t *testing.T) {
 		t.Fatalf("after a refused LogTo, installed level = %v (present: %v), want INFO untouched", got, ok)
 	}
 }
+
+// --- the prefix rename race -------------------------------------------------
+//
+// A PrefixLogger's prefix is written by the connection-lifecycle path
+// (loggedConn.SetType's ClearLogPrefixes+AddLogPrefix pair, AddLogPrefix at
+// wrap time) and read by every log call through it. The two run on different
+// goroutines -- a conn can be handed across the server's proxy pool while its
+// accept side is still logging to it -- and the string header they share is
+// not self-synchronizing. This test is the one that would have caught the
+// class: it logs from one goroutine while another re-types the logger, and it
+// is only honest under -race, where an unsynchronized read/write pair on the
+// prefix is reported rather than survived.
+
+// hammerPrefixLogger runs the race shape once: a logger goroutine emits a few
+// thousand lines while the test's own goroutine re-types the logger in a tight
+// ClearLogPrefixes+AddLogPrefix loop -- the exact pair loggedConn.SetType
+// runs. The filter sits at ERROR so log4go drops the emitted lines (quiet
+// test output): the prefix read the race lives on happens in pfx() -- or in
+// the json branch's tag field -- before log4go ever sees the call, on every
+// line, in either format.
+func hammerPrefixLogger(t *testing.T, format string) {
+	t.Helper()
+
+	if err := LogTo("stdout", "ERROR", format); err != nil {
+		t.Fatalf("setting up: LogTo(ERROR, %q) failed: %v", format, err)
+	}
+
+	pl := NewPrefixLogger("start").(*PrefixLogger)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			pl.Debug("hammer debug %d", i)
+			pl.Info("hammer info %d", i)
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			// Leave the level and format the LogTo tests above expect: each
+			// of them sets its own, but the teardown keeps this test from
+			// leaking jsonFormat or an ERROR filter into whatever runs next.
+			if err := LogTo("stdout", "INFO", "text"); err != nil {
+				t.Errorf("teardown: LogTo(INFO, text) failed: %v", err)
+			}
+			return
+		default:
+		}
+		pl.ClearLogPrefixes()
+		pl.AddLogPrefix("renamed")
+	}
+}
+
+func TestPrefixLoggerConcurrentRenameAndLog(t *testing.T) {
+	t.Run("text", func(t *testing.T) { hammerPrefixLogger(t, "text") })
+	t.Run("json", func(t *testing.T) { hammerPrefixLogger(t, "json") })
+}

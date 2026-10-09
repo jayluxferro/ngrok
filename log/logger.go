@@ -91,6 +91,25 @@ type Logger interface {
 
 type PrefixLogger struct {
 	*log.Logger
+
+	// mu guards prefix. The prefix is written by the connection-lifecycle
+	// path -- loggedConn.SetType's ClearLogPrefixes+AddLogPrefix pair, and
+	// AddLogPrefix at wrap time -- and read by every log call through the
+	// logger, and the two run on different goroutines: RegisterProxy logs
+	// "Registered" after handing the conn to the proxy pool, whose handout
+	// side re-types it. pfx() therefore takes this lock on every log line,
+	// and the cost is deliberate: one uncontended Lock/Unlock pair (~20ns)
+	// is noise next to what the same call already pays -- the rootMu.RLock
+	// pair in log(), the Sprintf, and log4go's handoff to its writer
+	// goroutine. A plain Mutex rather than RWMutex (the critical sections on
+	// either side are nanoseconds and the writers are per-conn-lifecycle
+	// rare) or atomic.Value (AddLogPrefix's append is a read-modify-write;
+	// plain atomics would leave two concurrent Adds free to silently lose
+	// one, where the mutex linearizes every pair). It must not be rootMu:
+	// log() already holds that read-lock when it calls pfx(), and recursive
+	// read acquisition against a queued writer is RWMutex's documented
+	// deadlock.
+	mu     sync.Mutex
 	prefix string
 }
 
@@ -104,8 +123,17 @@ func NewPrefixLogger(prefixes ...string) Logger {
 	return logger
 }
 
+// snapshotPrefix reads the prefix under the same lock the mutators hold, so a
+// rename concurrent with a log call is observed whole or not at all -- never a
+// torn string header.
+func (pl *PrefixLogger) snapshotPrefix() string {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return pl.prefix
+}
+
 func (pl *PrefixLogger) pfx(fmtstr string) interface{} {
-	return fmt.Sprintf("%s %s", pl.prefix, fmtstr)
+	return fmt.Sprintf("%s %s", pl.snapshotPrefix(), fmtstr)
 }
 
 func (pl *PrefixLogger) Debug(arg0 string, args ...interface{}) {
@@ -125,6 +153,9 @@ func (pl *PrefixLogger) Error(arg0 string, args ...interface{}) error {
 }
 
 func (pl *PrefixLogger) AddLogPrefix(prefix string) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+
 	if len(pl.prefix) > 0 {
 		pl.prefix += " "
 	}
@@ -133,6 +164,8 @@ func (pl *PrefixLogger) AddLogPrefix(prefix string) {
 }
 
 func (pl *PrefixLogger) ClearLogPrefixes() {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
 	pl.prefix = ""
 }
 
@@ -145,7 +178,7 @@ func (pl *PrefixLogger) log(level string, format string, args ...interface{}) er
 		payload, _ := json.Marshal(map[string]string{
 			"level": level,
 			"time":  time.Now().UTC().Format(time.RFC3339Nano),
-			"tag":   pl.prefix,
+			"tag":   pl.snapshotPrefix(),
 			"msg":   msg,
 		})
 		switch level {
