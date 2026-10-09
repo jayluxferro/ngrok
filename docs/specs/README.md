@@ -46,6 +46,7 @@ rounds with no feature spec — their record is the changelog.
 | [15-admin-web-ui.md](15-admin-web-ui.md) | ngrokd admin web UI: config workbench + observability SPA, `/api` validate/schema/render, snapshot enrichment | v1.0.19 | shipped |
 | [16-telegram-ops-bot.md](16-telegram-ops-bot.md) | `ngrok-bot`: read-only Telegram commands + event alerts over the admin API | v1.0.20 | shipped |
 | [17-carrier-dedup.md](17-carrier-dedup.md) | `carrier_dedup`: experimental per-stream CDC+Blake2b chunk dedup on the agent↔server carrier | v1.0.21 | shipped |
+| [18-dedup-telemetry.md](18-dedup-telemetry.md) | carrier_dedup telemetry: per-tunnel + global counters (incl. the read direction, where the win lands), desyncs counted, v2 gate made evaluable | draft | draft |
 
 ## Not specced here
 
