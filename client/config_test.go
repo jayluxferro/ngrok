@@ -2316,6 +2316,33 @@ tunnels:
       ftp: 127.0.0.1:8080
 `,
 		},
+		{
+			// carrier_dedup's refusals (SPEC-CLUSTER21 §4) live inside the
+			// extracted traversal -- the fb697c3 lesson. Before that placement
+			// is pinned by these two cases, the workbench is exactly the road
+			// that would wave a udp (or agent-terminated) dedup tunnel through
+			// while the agent refuses it at startup.
+			name: "carrier_dedup with a udp protocol",
+			doc: `
+tunnels:
+  web:
+    proto:
+      http: 127.0.0.1:8080
+      udp: 127.0.0.1:7100
+    carrier_dedup: true
+`,
+		},
+		{
+			name: "carrier_dedup with agent_tls_termination",
+			doc: `
+tunnels:
+  web:
+    proto:
+      https: 127.0.0.1:7100
+    agent_tls_termination: true
+    carrier_dedup: true
+`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2563,5 +2590,188 @@ tunnels:
 	}
 	if config.ProxyMaxConcurrent != 64 {
 		t.Errorf("ProxyMaxConcurrent: expected the default 64, got %d", config.ProxyMaxConcurrent)
+	}
+}
+
+// carrierDedupTunnelYAML is the carrier_dedup test base (SPEC-CLUSTER21): an
+// http tunnel with the key on, plus whatever a case adds. The port is its own
+// so a typo'd copy-paste between this base and the others cannot cancel out.
+func carrierDedupTunnelYAML(extraLines ...string) string {
+	lines := []string{
+		"tunnels:",
+		"  web:",
+		"    proto:",
+		"      http: 127.0.0.1:7100",
+		"    carrier_dedup: true",
+	}
+	lines = append(lines, extraLines...)
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// TestLoadConfigurationCarrierDedupValidation is the refusal corpus of
+// SPEC-CLUSTER21 §4: the two combinations the feature cannot serve -- any udp
+// protocol, agent_tls_termination -- refused at load, naming the tunnel, and
+// the shapes around them that must keep loading.
+func TestLoadConfigurationCarrierDedupValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string // the full refusal, verbatim; empty means it loads
+	}{
+		{
+			name:   "an http tunnel with the key loads",
+			config: carrierDedupTunnelYAML(),
+		},
+		{
+			// The default is spelled false and means the same thing as the
+			// key's absence: neither is a refusal, neither is normalized away.
+			name:   "explicit false is the default and loads",
+			config: strings.Replace(carrierDedupTunnelYAML(), "carrier_dedup: true", "carrier_dedup: false", 1),
+		},
+		{
+			// The codec is protocol-agnostic once engaged, so a plain byte
+			// stream may opt in even though the feature's shape of the win is
+			// an http tunnel.
+			name:   "a tcp tunnel with the key loads",
+			config: strings.Replace(carrierDedupTunnelYAML(), "http: 127.0.0.1:7100", "tcp: 127.0.0.1:7100", 1),
+		},
+		{
+			name:    "a udp-only tunnel is refused",
+			config:  strings.Replace(carrierDedupTunnelYAML(), "http: 127.0.0.1:7100", "udp: 127.0.0.1:7100", 1),
+			wantErr: `Tunnel web: carrier_dedup cannot be combined with a udp protocol (got udp): a udp leg's proxy conn is never acked, so the key would be silently un-honored on that leg, and a length-framed datagram stream is not the repeated-payload shape the feature exists for -- the refusal covers mixed tunnels too, because carrier_dedup is the tunnel's and the negotiation cannot exempt one leg`,
+		},
+		{
+			// The mixed case is refused for the udp leg's sake, and the
+			// refusal says why the http leg does not exempt the tunnel: the
+			// negotiation cannot express "these legs dedup, those don't".
+			name: "a mixed http+udp tunnel is refused",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				"      http: 127.0.0.1:8080",
+				"      udp: 127.0.0.1:7100",
+				"    carrier_dedup: true",
+			}, "\n") + "\n",
+			wantErr: `Tunnel web: carrier_dedup cannot be combined with a udp protocol (got http, udp): a udp leg's proxy conn is never acked, so the key would be silently un-honored on that leg, and a length-framed datagram stream is not the repeated-payload shape the feature exists for -- the refusal covers mixed tunnels too, because carrier_dedup is the tunnel's and the negotiation cannot exempt one leg`,
+		},
+		{
+			// Same mixed shape with the http leg https: "any udp protocol"
+			// includes the tunnels with encrypted legs.
+			name: "a mixed https+udp tunnel is refused",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				"      https: 127.0.0.1:8080",
+				"      udp: 127.0.0.1:7100",
+				"    carrier_dedup: true",
+			}, "\n") + "\n",
+			wantErr: `Tunnel web: carrier_dedup cannot be combined with a udp protocol (got https, udp): a udp leg's proxy conn is never acked, so the key would be silently un-honored on that leg, and a length-framed datagram stream is not the repeated-payload shape the feature exists for -- the refusal covers mixed tunnels too, because carrier_dedup is the tunnel's and the negotiation cannot exempt one leg`,
+		},
+		{
+			// The combined-key spelling ("http+https") is ONE map key; a udp
+			// leg beside it must be caught the same way the single-key cases
+			// are. This is the only case that can catch the leg split in
+			// validateCarrierDedup regressing to a whole-key comparison.
+			name: "a combined http+https key beside a udp leg is refused",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				`      "http+https": 127.0.0.1:8080`,
+				"      udp: 127.0.0.1:7100",
+				"    carrier_dedup: true",
+			}, "\n") + "\n",
+			wantErr: `Tunnel web: carrier_dedup cannot be combined with a udp protocol (got http+https, udp): a udp leg's proxy conn is never acked, so the key would be silently un-honored on that leg, and a length-framed datagram stream is not the repeated-payload shape the feature exists for -- the refusal covers mixed tunnels too, because carrier_dedup is the tunnel's and the negotiation cannot exempt one leg`,
+		},
+		{
+			// The zero-value refusal: the carrier holds ciphertext, the codec
+			// would frame noise. The https leg is there so validateAgentTLS's
+			// own "requires https" refusal does not fire first -- this case is
+			// about the combination's refusal, not that one. (asHTTPS swaps the
+			// 7000 spelling the other bases use; this base is on 7100, so the
+			// leg is swapped here directly.)
+			name: "agent_tls_termination is refused",
+			config: strings.Replace(carrierDedupTunnelYAML(
+				"    agent_tls_termination: true",
+			), "http: 127.0.0.1:7100", "https: 127.0.0.1:7100", 1),
+			wantErr: `Tunnel web: carrier_dedup cannot be combined with agent_tls_termination: an agent-terminated tunnel's carrier holds TLS ciphertext, whose fresh AEAD nonces never repeat, so the codec would be pure overhead`,
+		},
+		{
+			// Control for the refusals above: udp alone was never the problem,
+			// the combination is.
+			name: "a udp tunnel without the key loads",
+			config: strings.Join([]string{
+				"tunnels:",
+				"  web:",
+				"    proto:",
+				"      udp: 127.0.0.1:7100",
+			}, "\n") + "\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, tt.config)
+
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the config to load, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadConfigurationCarrierDedupTunnel pins the key arriving on the loaded
+// tunnel struct, and -- the round-trip reason, upstream_protocol's rule -- the
+// default staying ABSENT: a config that does not say carrier_dedup must not
+// grow the key when SaveAuthToken re-marshals it.
+func TestLoadConfigurationCarrierDedupTunnel(t *testing.T) {
+	configPath := writeConfig(t, carrierDedupTunnelYAML())
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if !config.Tunnels["web"].CarrierDedup {
+		t.Fatalf("carrier_dedup arrived as false, want true")
+	}
+
+	// The explicit key survives the SaveAuthToken rewrite, spelled as written.
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	if !strings.Contains(string(marshaled), "carrier_dedup: true") {
+		t.Fatalf("marshaled config lost the key:\n%s", marshaled)
+	}
+
+	// And a config without the key stays without it.
+	without := writeConfig(t, tunnelYAML())
+	config, err = LoadConfiguration(&Options{config: without, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if config.Tunnels["web"].CarrierDedup {
+		t.Fatalf("a tunnel without the key loaded with carrier_dedup set")
+	}
+
+	marshaled, err = yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	if strings.Contains(string(marshaled), "carrier_dedup") {
+		t.Fatalf("a config without the key grew one on re-marshal:\n%s", marshaled)
 	}
 }

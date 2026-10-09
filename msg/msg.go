@@ -208,6 +208,14 @@ type RegProxy struct {
 	// client that does not send it is refused -- this is deliberate, and it
 	// means a server upgrade requires the clients to be upgraded with it.
 	Secret string
+
+	// Dedup is the carrier_dedup proposal (SPEC-CLUSTER21 §1): the client sets
+	// it only on streams of tunnels configured with carrier_dedup: true. It is
+	// additive on purpose -- these messages are encoding/json with default
+	// marshaling, so a binary that predates the field ignores it on read, and
+	// an unacked proposal (a server that never sets StartProxy.DedupAck) stays
+	// pass-through. No capability exchange was touched.
+	Dedup bool
 }
 
 // This message is sent by the server to the client over a *proxy* connection before it
@@ -215,6 +223,13 @@ type RegProxy struct {
 type StartProxy struct {
 	Url        string // URL of the tunnel this connection connection is being proxied for
 	ClientAddr string // Network address of the client initiating the connection to the tunnel
+
+	// DedupAck confirms the RegProxy.Dedup proposal (SPEC-CLUSTER21 §1): the
+	// server sets it only when it wrapped the stream with the carrier_dedup
+	// codec, and it does so only after the kill switch is off. The client
+	// engages on reading it; an old binary ignores the field and reads the
+	// raw bytes it always did.
+	DedupAck bool
 }
 
 // A client or server may send this message periodically over

@@ -45,7 +45,7 @@ rounds with no feature spec — their record is the changelog.
 | [14-oidc-identity.md](14-oidc-identity.md) | `oidc` policy action: PKCE authorization-code flow at the routing layer, signed-cookie sessions | v1.0.17 | shipped |
 | [15-admin-web-ui.md](15-admin-web-ui.md) | ngrokd admin web UI: config workbench + observability SPA, `/api` validate/schema/render, snapshot enrichment | v1.0.19 | shipped |
 | [16-telegram-ops-bot.md](16-telegram-ops-bot.md) | `ngrok-bot`: read-only Telegram commands + event alerts over the admin API | v1.0.20 | shipped |
-| [17-carrier-dedup.md](17-carrier-dedup.md) | `carrier_dedup`: experimental per-stream CDC+Blake2b chunk dedup on the agent↔server carrier | v1.0.21 | draft |
+| [17-carrier-dedup.md](17-carrier-dedup.md) | `carrier_dedup`: experimental per-stream CDC+Blake2b chunk dedup on the agent↔server carrier | v1.0.21 | shipped |
 
 ## Not specced here
 

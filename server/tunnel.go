@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"ngrok/conn"
+	"ngrok/dedup"
 	"ngrok/log"
 	"ngrok/msg"
 	"ngrok/policy"
@@ -938,7 +939,20 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 
 	var proxyConn conn.Conn
 	var err error
+
+	// carrier_dedup (SPEC-CLUSTER21 §1): the codec of the conn that is finally
+	// served, if any. Declared here because the ack (inside the loop) and the
+	// engage and close line (after it) are one story about one conn.
+	var codec *dedup.Conn
+
 	for i := 0; i < (2 * proxyMaxPoolSize); i++ {
+		// Fresh per attempt: a dedup conn whose StartProxy write failed is
+		// closed and never joined, so its codec must not survive into the
+		// success path -- the next attempt may be a plain conn, and engaging
+		// (or logging counters for) a dead conn's codec would tell an
+		// operator a story about a stream that never served.
+		codec = nil
+
 		// get a proxy connection
 		if proxyConn, err = t.ctl.GetProxy(); err != nil {
 			t.Warn("Failed to get proxy connection: %v", err)
@@ -951,6 +965,17 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 		startPxyMsg := &msg.StartProxy{
 			Url:        t.url,
 			ClientAddr: publicConn.RemoteAddr().String(),
+		}
+
+		// carrier_dedup (SPEC-CLUSTER21 §1): the ack rides the StartProxy the
+		// handout is already paying for. Only a stream the wrap site flagged
+		// carries a codec -- a dialed proxy conn pools a plain conn and never
+		// acks, which leaves the client's proposal unacked and it stays
+		// pass-through: the version-safe fallback, one Info log per tunnel
+		// client-side, never per stream.
+		if dc, ok := proxyConn.(*dedupProxyConn); ok {
+			codec = dc.codec
+			startPxyMsg.DedupAck = true
 		}
 
 		if err = msg.WriteMsg(proxyConn, startPxyMsg); err != nil {
@@ -977,6 +1002,17 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 	}
 	defer proxyConn.Close()
 
+	// carrier_dedup (SPEC-CLUSTER21 §1): the server engages AFTER the ack is
+	// written, and this line's position is what makes the flip race-free. The
+	// engage and the join below run in this goroutine, so no read of the
+	// stream can be issued before the codec is encoding; and the client
+	// engages only after it has READ the ack, so nothing it writes afterwards
+	// is ever decoded by an unengaged server -- its early frames simply wait
+	// in the stream until the join reads them.
+	if codec != nil {
+		codec.Engage()
+	}
+
 	// To reduce latency handling tunnel connections, we employ the following curde heuristic:
 	// Whenever we take a proxy connection from the pool, replace it with a new one
 	//
@@ -994,6 +1030,17 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 
 	// join the public and proxy connections
 	bytesIn, bytesOut := t.join(publicConn, proxyConn, pol)
+
+	// carrier_dedup close line (SPEC-CLUSTER21 §5): the honest win number, at
+	// the join's teardown -- the same moment the join's own "Copied N bytes"
+	// line is written, one line per stream, and only for streams that were
+	// actually engaged (the counters are the codec's write direction, i.e.
+	// what this server encoded toward the agent). A pass-through stream --
+	// kill switch on, no proposal, dialed conn -- logs nothing here.
+	if codec != nil {
+		proxyConn.Info("carrier_dedup: offered=%d framed=%d refs=%d", codec.Offered(), codec.Framed(), codec.Refs())
+	}
+
 	metrics.CloseConnection(t, publicConn, startTime, bytesIn, bytesOut)
 	observe.onConnClose(t, bytesIn, bytesOut)
 }

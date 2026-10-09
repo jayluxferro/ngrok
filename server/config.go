@@ -41,6 +41,13 @@ type serverConfig struct {
 	MaxConnPerIP *int     `yaml:"max_conn_per_ip"`
 	EnablePprof  bool     `yaml:"pprof"`
 
+	// DisableCarrierDedup is the config spelling of -disableCarrierDedup
+	// (SPEC-CLUSTER21 §4), the kill switch that stops the server confirming
+	// carrier_dedup proposals. Like every bool here it can only be turned ON
+	// from the file (overrides.yes), which matches its meaning: the switch is
+	// a lever an operator pulls to say "stop", never a hidden default.
+	DisableCarrierDedup bool `yaml:"disable_carrier_dedup"`
+
 	EventDestinations []eventDestinationConfig `yaml:"event_destinations"`
 
 	// Vaults is the server's secret vaults block (SPEC-CLUSTER9 3), the twin

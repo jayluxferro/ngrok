@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"ngrok/conn"
+	"ngrok/dedup"
 	"ngrok/log"
 	"ngrok/msg"
 
@@ -263,7 +264,47 @@ func registerProxyStream(sessionId string, ctl *Control, stream net.Conn) {
 		return
 	}
 
+	// carrier_dedup (SPEC-CLUSTER21 §1/§3): an accepted proposal -- and a kill
+	// switch that is off -- installs the codec PASS-THROUGH here; it engages
+	// only after the StartProxy ack is written (HandlePublicConnection), which
+	// is the flip order the spec pins: the RegProxy/StartProxy handshake
+	// frames ride raw, and engagement strictly follows the ack. With the
+	// switch on, or no proposal, nothing is installed and nothing is logged
+	// per stream -- a stream that will stay pass-through is the normal case
+	// and must look like one.
+	//
+	// The wrapper is rebuilt rather than reused because the codec must sit
+	// BETWEEN the stream and the logged conn: conn.Wrap's zero-copy fallbacks
+	// read and write through the immediate inner conn, and loggedConn is also
+	// what the pool, the logger prefixes and the ack site expect a pooled conn
+	// to be. The first wrapper's job -- logging the RegProxy exchange and the
+	// rejections above -- is done by then; the codec's placement is worth one
+	// discarded wrapper.
+	if regPxy.Dedup && !carrierDedupDisabled.Load() {
+		codec := dedup.NewPassThrough(stream)
+		ctl.RegisterProxy(&dedupProxyConn{Conn: conn.Wrap(codec, "pxy"), codec: codec})
+		return
+	}
+
 	ctl.RegisterProxy(pxyConn)
+}
+
+// dedupProxyConn is what the pool holds for a proxy stream whose carrier
+// carries the carrier_dedup codec (SPEC-CLUSTER21 §3). It adds no behavior:
+// the codec rides under the embedded logged conn, so msg framing, Join, the
+// rewriter's connpair and the tee all see the same conn they always did, and
+// neither direction can route around the codec (embedding the conn.Conn
+// *interface* promotes no ReadFrom/WriterTo, and loggedConn's own fallbacks
+// go through its Read/Write, which are the codec's).
+//
+// The type exists so the ack site (HandlePublicConnection) can find the codec
+// -- to engage it once the StartProxy ack is on the wire, and to read the
+// counters for the close line -- without the pool growing a parallel
+// structure. A dialed proxy conn (NewProxy) never arrives as one, and so
+// never acks: that is the version-safe fallback, not an omission.
+type dedupProxyConn struct {
+	conn.Conn
+	codec *dedup.Conn
 }
 
 // Close tears the session down: the smux session (and with it every stream) and

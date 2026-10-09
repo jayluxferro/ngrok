@@ -130,6 +130,17 @@ type TunnelConfiguration struct {
 	// did not have it. validateUpstreamProtocol owns the rules.
 	UpstreamProtocol string `yaml:"upstream_protocol,omitempty"`
 
+	// CarrierDedup opts the tunnel's agent<->server carrier into the
+	// experimental content-defined chunk dedup (SPEC-CLUSTER21): repeated
+	// chunks -- a re-sent 32 KiB LLM system prompt is the shape of the win --
+	// cross the carrier as 10-byte references instead of as themselves. Like
+	// UpstreamProtocol, the default is never written back into the field: the
+	// bool's zero value IS the default and omitempty keeps it out of every
+	// config SaveAuthToken re-marshals, so a document without the key
+	// round-trips without growing one. What may not keep the key company is
+	// validateCarrierDedup's business, judged at load, tunnel named.
+	CarrierDedup bool `yaml:"carrier_dedup,omitempty"`
+
 	// Endpoint settings (SPEC 3.2/3.3/3.4). Binding is normalized at load time
 	// ("public" becomes the empty string the wire protocol uses) and, together
 	// with ForwardTo, validated by validateEndpointPolicy; Pooling is carried
@@ -618,6 +629,18 @@ func (config *Configuration) applyDefaultsAndValidate(loadVaults, loadFileRefs b
 		// refusal fires only against an alpn list that is otherwise valid --
 		// an invalid list is alpn's refusal to give, about alpn.
 		if err = validateUpstreamProtocol(name, t); err != nil {
+			return
+		}
+
+		// carrier_dedup is judged last (SPEC-CLUSTER21): its two cross-key
+		// rules read the protocol set validateProtocol has already judged and
+		// the agent_tls_termination switch validateAgentTLS has already had
+		// its say on, so a tunnel with several problems hears about the others
+		// in their own words first. It lives inside the extracted traversal on
+		// purpose -- the fb697c3 lesson -- so BOTH roads (the loader and the
+		// workbench's ValidateConfigurationDoc) refuse the combination with
+		// the same error; the parity corpus in config_test.go pins that.
+		if err = validateCarrierDedup(name, t); err != nil {
 			return
 		}
 
@@ -1403,6 +1426,57 @@ func validateUpstreamProtocol(tunnelName string, t *TunnelConfiguration) error {
 			return fmt.Errorf("Tunnel %s: upstream_protocol cannot be combined with an alpn list containing %q: the two h2 features own the local leg incompatibly -- alpn passes h2 visitors through raw, so the local service must speak h2c itself, while upstream_protocol keeps the visitor leg h1 and transcodes it to h2c. Use alpn for h2 visitors, upstream_protocol for h1 visitors, never both on one tunnel",
 				tunnelName, alpnH2)
 		}
+	}
+
+	return nil
+}
+
+// validateCarrierDedup checks a tunnel's carrier_dedup key (SPEC-CLUSTER21):
+// the experimental content-defined chunk dedup on the agent<->server carrier.
+// Like the validators around it, it runs for every tunnel applyDefaultsAndValidate
+// walks, so the loader and the workbench road refuse the same document with the
+// same error.
+//
+// There is deliberately no command-line flag for the key (the spec offers only
+// the config-file spelling), so the CLI-synthesized "default" tunnel can never
+// carry it and LoadConfiguration's flag branch needs no call here.
+//
+// The refusals are the spec's non-goals made loud. A tunnel with ANY udp
+// protocol is refused -- mixed tunnels included -- for two honest reasons.
+// First, the key would be silently half-honored: the udp flow path's
+// StartProxy carries no DedupAck (server/udp.go), so that leg's codec never
+// engages and never could -- "the http legs dedup, the udp legs don't" is not
+// a distinction the negotiation can express, because the proposal is per
+// client and the config key is the tunnel's, and an operator reading
+// carrier_dedup: true on a mixed tunnel would be right to expect it means the
+// tunnel. Second, a length-framed datagram stream is not the shape the
+// feature exists for -- payloads are small (often below the codec's own
+// 512-byte minimum chunk) and rarely repeated in bulk. agent_tls_termination
+// is the zero-value case: the carrier holds TLS ciphertext, whose fresh AEAD
+// nonces mean zero repeats, so the codec would be pure overhead plus a second
+// framing layer over encrypted bytes.
+func validateCarrierDedup(tunnelName string, t *TunnelConfiguration) error {
+	if !t.CarrierDedup {
+		return nil
+	}
+
+	// The keys are split the way tunnelAllPortRouted splits them: a proto key
+	// may be a "+"-joined combination, and a udp leg must not hide behind one
+	// (validateProtocol accepts only the enumerated spellings today, so the
+	// only udp-bearing key is "udp" -- the split keeps that true by
+	// construction rather than by current enum).
+	for k := range t.Protocols {
+		for _, leg := range strings.Split(k, "+") {
+			if leg == msg.ProtoUDP {
+				return fmt.Errorf("Tunnel %s: carrier_dedup cannot be combined with a udp protocol (got %s): a udp leg's proxy conn is never acked, so the key would be silently un-honored on that leg, and a length-framed datagram stream is not the repeated-payload shape the feature exists for -- the refusal covers mixed tunnels too, because carrier_dedup is the tunnel's and the negotiation cannot exempt one leg",
+					tunnelName, protoNames(t.Protocols))
+			}
+		}
+	}
+
+	if t.AgentTLSTermination {
+		return fmt.Errorf("Tunnel %s: carrier_dedup cannot be combined with agent_tls_termination: an agent-terminated tunnel's carrier holds TLS ciphertext, whose fresh AEAD nonces never repeat, so the codec would be pure overhead",
+			tunnelName)
 	}
 
 	return nil

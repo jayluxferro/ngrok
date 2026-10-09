@@ -176,6 +176,7 @@ var configTunnelSchema = []apiSchemaRow{
 	{"compression", "bool", "true", "allow gzip of responses; on by default, false turns it off."},
 	{"traffic_policy", "mapping", "none", "inline traffic policy document (on_tcp_connect / on_http_request / on_http_response); the action set is the changelog's to list."},
 	{"traffic_policy_file", "path", "none", "file holding the traffic policy document, read once at load; naming both this and traffic_policy is refused."},
+	{"carrier_dedup", "bool", "false", "experimental: carry repeated chunks on the agent-server proxy stream as references (content-defined chunking, blake2b); refused with any udp protocol or agent_tls_termination."},
 }
 
 // policyActionSummaries is the one line per action the schema serves beside

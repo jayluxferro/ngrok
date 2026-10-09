@@ -5061,4 +5061,797 @@ bot_wait_msg '/help -- what the bot can do' "the /help listing"
 bot_inject 105 "$BOT_CHAT" "/nonsense"
 bot_wait_msg 'unknown command; send /help' "the unknown-command hint"
 
+# ---------------------------------------------------------------------------
+# carrier_dedup (SPEC-CLUSTER21): six scenarios for the experimental
+# per-tunnel content-defined chunk dedup on the agent<->server carrier. The
+# feature rides the RegProxy/StartProxy handshake with additive json fields,
+# so an UNACKED proposal -- which is what an old server gives, and what the
+# kill switch gives -- is byte-for-byte the old wire from the client's
+# point of view; scenario 3 stands in for the spec's old-binary interop
+# case on exactly that ground.
+#
+# Two facts of the design shape every payload below, so they are stated
+# here once instead of six times:
+#
+#   - Tables are PER STREAM (cross-stream tables are the spec's binding
+#     non-goal), so repetition only pays within one keep-alive connection:
+#     a REF can only name a chunk stored on the same stream it rides. The
+#     repeated-body scenarios therefore drive all their POSTs through one
+#     connection, the way the real shape of the win (many LLM requests over
+#     one keep-alive agent session) does.
+#
+#   - The codec's minimum chunk is 512 B and the boundary scan restarts per
+#     Write, so a payload below ~1 KiB legitimately produces zero REFs no
+#     matter how often it repeats. Every payload here is multi-KiB; at
+#     these sizes refs==0 is a failure, not the design working.
+#
+# Ports grepped across the whole file before picking, the standing rule: the
+# other groups hold public http :18080-:18088, https :18443-:18446, tunnel
+# :14443-:14453, admin :19090-:19103, local upstreams :19001-:19019, and
+# claimed remote ports :14877-:14879 (scripts/bench.sh holds 18180/18480/
+# 15443/19101/19190). This group takes public http :18089-:18092 (one per
+# stack), tunnel :14454-:14457 (the QUIC stack's listener rides the UDP side
+# of its tunnel port, like every -quicAddr stack in this file), local
+# upstreams :19021 (http echo) and :19022 (udp echo), and the mixed client's
+# claimed public udp port :14880 -- none of which appear anywhere else in
+# the file. The stacks' ngrokds disable the admin listener; nothing here
+# reads it.
+#
+# Logs go to /tmp/ngrok-e2e-dedup/ -- deliberately OUTSIDE the
+# /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks -- and the group
+# clears its own directory first, for the same O_APPEND reason that makes
+# every other group do it.
+# ---------------------------------------------------------------------------
+
+DEDUP_DIR=/tmp/ngrok-e2e-dedup
+DEDUP_UP=127.0.0.1:19021
+DEDUP_UDP_UP=127.0.0.1:19022
+mkdir -p "$DEDUP_DIR"
+rm -f "$DEDUP_DIR"/*.log
+
+# The http echo upstream. /echo answers with the sha256 of the exact bytes
+# it read, so every POST in this group asserts byte-correctness through the
+# codec per request rather than sampling one. HTTP/1.1 with an explicit
+# Content-Length, so keep-alive chains survive the whole group (the same
+# property the bench fixture documents at length).
+cat > "$TMPDIR/dedup_http_upstream.py" <<'PY'
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = b"dedup-e2e-ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        want = int(self.headers.get("Content-Length", "0") or "0")
+        data = b""
+        while len(data) < want:
+            chunk = self.rfile.read(want - len(data))
+            if not chunk:
+                break
+            data += chunk
+        body = ("sha256:%s:%d" % (hashlib.sha256(data).hexdigest(), len(data))).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+HTTPServer(("127.0.0.1", 19021), H).serve_forever()
+PY
+python3 "$TMPDIR/dedup_http_upstream.py" >"$DEDUP_DIR/http-upstream.log" 2>&1 &
+DEDUP_HTTP_UP_PID=$!
+
+# The udp echo upstream, for the mixed client's plain-udp tunnel.
+cat > "$TMPDIR/dedup_udp_upstream.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 19022))
+while True:
+    data, addr = s.recvfrom(65535)
+    s.sendto(data, addr)
+PY
+python3 "$TMPDIR/dedup_udp_upstream.py" >"$DEDUP_DIR/udp-upstream.log" 2>&1 &
+DEDUP_UDP_UP_PID=$!
+
+# dedup_udp_probe.py <host> <port> <payload> <timeout-sec>: one datagram in,
+# its echo back. Exit 0 = the payload came back WHOLE from the public port;
+# 3 = silence; 4 = a reply from somewhere that is not the public port;
+# 5 = damaged. The shape (and the exit codes) are the udp group's probe.
+cat > "$TMPDIR/dedup_udp_probe.py" <<'PY'
+import socket, sys
+
+host, port, payload, timeout = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode(), float(sys.argv[4])
+target = (host, port)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(timeout)
+s.sendto(payload, target)
+try:
+    data, addr = s.recvfrom(65535)
+except socket.timeout:
+    print("TIMEOUT")
+    sys.exit(3)
+if addr != target:
+    print("WRONG-SOURCE %s:%s" % addr)
+    sys.exit(4)
+if data != payload:
+    print("MISMATCH sent=%d got=%d" % (len(payload), len(data)))
+    sys.exit(5)
+print("ECHO-OK %d" % len(data))
+PY
+
+dedup_udp_probe_expect() {
+  local label="$1" host="$2" port="$3" payload="$4" tmo="${5:-5}" out rc=0
+  out="$(python3 "$TMPDIR/dedup_udp_probe.py" "$host" "$port" "$payload" "$tmo")" || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    echo "[e2e] $label: datagram did not round-trip (rc=$rc): $out"
+    return 1
+  fi
+  echo "[e2e] $label: $out"
+}
+
+# dedup_post.py <port> <hostheader> <count> <mode>: ONE keep-alive connection
+# to the public port, <count> POSTs to /echo. Mode "repeat" sends <count>
+# identical ~8 KiB bodies (the within-stream repetition case); mode "llm" is
+# the SPEC-CLUSTER21 payload: a ~200-byte head carrying a fresh timestamp and
+# nonce, the shared 32 KiB system prompt, and a ~200-byte varying suffix --
+# the head mutation is what forces the CDC to resync, which is precisely why
+# content-defined (not fixed-size) chunking is the design. Every response
+# must name the sha256 of the exact bytes this driver sent, so
+# byte-correctness across the whole chain (visitor -> ngrokd -> carrier ->
+# agent -> upstream) is asserted per request. Prints one SUMMARY line.
+#
+# Why the bodies are built from a fixed vocabulary with a seeded xorshift,
+# and why the first thing the driver does is hash-check its own construction:
+# this group's FIRST draft built the prompt by repeating one sentence and the
+# repeat body from one 17-byte pattern, and both are PERIODIC -- periodic text
+# cycles the Gear hash through a handful of distinct 12-byte windows, the
+# trigger never fires, every batch rides as an unsaved TAIL, and the very
+# scenario meant to prove dedup works proves nothing (refs=0). Real prompts
+# have thousands of distinct windows; so does diverse word text. The pinned
+# digests below were computed by a Go program running the same construction,
+# and the codec was probe-measured on exactly those bytes (llm payload:
+# 82.8% saved over 100 requests), so any drift between this python port and
+# the measured truth -- word list, PRNG, framing -- fails loudly here instead
+# of quietly benchmarking a different payload. (The vocabulary is 184 words:
+# a once-200-word list that lost sixteen to a transcription slip before the
+# payload constants were pinned, so 184 is what the pins attest to; the count
+# assert is drift-detection, not a design number.)
+cat > "$TMPDIR/dedup_post.py" <<'PY'
+import hashlib, http.client, sys, time
+
+port, host_header, count, mode = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+VOCAB = (
+    "the of and a to in is you that it he was for on are as with his they at be this have from or one had by word but not what all were we when your can said there use an each which she do how their if will up other about out many then them these so some her would make like him into time has look two more write go see number no way could people my than first water been call who oil its now find long down day did get come made may part over new sound take only little work know place year live me back give most very after thing our just name good sentence man think say great where help through much before line right too mean old any same tell boy follow came want show also around form three small set put end does another well large must big even such because turn here why ask went light kind off need house picture try us again animal point mother world near build self earth father"
+).split()
+assert len(VOCAB) == 184, "fixture vocabulary drifted; the pinned payload digests no longer mean what they measured"
+MASK = (1 << 64) - 1
+
+
+class Xorshift:
+    # The Go fixture source's exact pattern: s ^= s<<13; s ^= s>>7;
+    # s ^= s<<17, draw taken from the post-update state.
+    def __init__(self, seed):
+        self.s = seed & MASK
+
+    def next(self):
+        self.s ^= (self.s << 13) & MASK
+        self.s ^= self.s >> 7
+        self.s ^= (self.s << 17) & MASK
+        return self.s
+
+
+def build_words(seed, n):
+    x = Xorshift(seed)
+    return "".join(VOCAB[x.next() % len(VOCAB)] + " " for _ in range(n)).encode()
+
+
+PROMPT = build_words(0xC0FFEE, 6800)
+REPEAT = b"repeat-payload marker for the dedup e2e: " + PROMPT[:8192 - 40] + b"\x00"
+
+
+def llm_body(i):
+    head = ('{"ts":"2026-10-09T12:00:%02d.%03dZ","nonce":"%08x","model":"llama3.1:8b",'
+            '"stream":false,"messages":[{"role":"system","content":"'
+            % (i % 60, i, (i * 2654435761) & 0xFFFFFFFF))
+    suffix = ('turn %04d: summarize the context above in one sentence and end with the '
+              'unique tag zzz-%04d plus this padding phrase so the varying suffix stays '
+              'near two hundred bytes: %04d."}]}' % (i, i, i))
+    return (head + PROMPT.decode() + '"},{"role":"user","content":"' + suffix).encode()
+
+
+def body(i):
+    return REPEAT if mode == "repeat" else llm_body(i)
+
+
+for name, blob, want_len, want_sha in (
+    ("prompt", PROMPT, 32715,
+     "23fddb87539329f58e564df10ded84f67f0d085db6c36f732980044187a767e8"),
+    ("repeat", REPEAT, 8194,
+     "aa98ab887c124557e5d61b454dd4c6f731860f9b6e69c69bb8d9a5b0fab43111"),
+    ("llm0", llm_body(0), 33051,
+     "1dbdbb3d89ab7f892a38f41768124675eab34c4f03d28f66a8e7c22f18fc7cca"),
+):
+    got = hashlib.sha256(blob).hexdigest()
+    if len(blob) != want_len or got != want_sha:
+        sys.exit("%s fixture drifted: len=%d sha=%s, wanted len=%d sha=%s"
+                 % (name, len(blob), got, want_len, want_sha))
+
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+times = []
+for i in range(count):
+    payload = body(i)
+    digest = hashlib.sha256(payload).hexdigest()
+    started = time.perf_counter()
+    conn.request("POST", "/echo", body=payload, headers={"Host": host_header})
+    resp = conn.getresponse()
+    answer = resp.read()
+    times.append(time.perf_counter() - started)
+    want = ("sha256:%s:%d" % (digest, len(payload))).encode()
+    if resp.status != 200 or answer != want:
+        print("req %d: answered %d %r; wanted %r" % (i, resp.status, answer[:96], want[:96]))
+        sys.exit(1)
+conn.close()
+
+ordered = sorted(times)
+import math
+p50 = ordered[max(0, math.ceil(0.50 * count) - 1)]
+p95 = ordered[max(0, math.ceil(0.95 * count) - 1)]
+print("SUMMARY count=%d bytes_each=%d wall_s=%.3f p50_ms=%.2f p95_ms=%.2f"
+      % (count, len(body(0)), sum(times), p50 * 1000, p95 * 1000))
+PY
+
+# Close-line helpers. The line -- carrier_dedup: offered=X framed=Y refs=Z --
+# is the feature's honest win number, written once per proxy stream at
+# teardown: server log = request direction (what ngrokd encoded toward the
+# agent), client log = response direction (what the agent encoded back).
+dedup_close_count() {  # <log> -> engaged close lines in the file (0 when none)
+  grep -c 'carrier_dedup: offered=' "$1" 2>/dev/null || true
+}
+
+# dedup_wait_close_lines <log> <want> <label>: the line lands at stream
+# teardown, which can lag the last response by a beat -- bounded retry on a
+# count, never a bare sleep.
+dedup_wait_close_lines() {
+  local log="$1" want="$2" label="$3" i
+  for i in $(seq 1 40); do
+    if [[ "$(dedup_close_count "$log")" -ge "$want" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: only $(dedup_close_count "$log") of $want carrier_dedup close lines in $log"
+  return 1
+}
+
+# dedup_assert_refs <log> <label>: at least one stream must have sent a REF.
+# Zero refs at multi-KiB repeated payloads means the codec never engaged or
+# never deduplicated -- either is a failure here (see the min-chunk note in
+# the banner for why small payloads would NOT be).
+dedup_assert_refs() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+path, label = sys.argv[1], sys.argv[2]
+best = 0
+for line in open(path, errors="replace"):
+    m = re.search(r"carrier_dedup: offered=(\d+) framed=(\d+) refs=(\d+)", line)
+    if m:
+        best = max(best, int(m.group(3)))
+if best <= 0:
+    sys.exit("%s: no stream ever sent a REF in %s -- repetition did not engage" % (label, path))
+print("    %s: best stream sent %d refs" % (label, best))
+PY
+}
+
+dedup_wait_server() {  # <log> <label>: the carrier listener is up
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Listening for control and proxy connections" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: ngrokd never came up:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+dedup_wait_quic_listener() {  # <log> <label>
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Listening for QUIC proxy sessions" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the QUIC listener never came up:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+dedup_wait_tunnel() {  # <log> <want> <label>
+  local log="$1" want="$2" label="$3" i
+  for i in $(seq 1 40); do
+    if [[ "$(grep -c 'Tunnel established' "$log" 2>/dev/null || true)" -ge "$want" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "[e2e] $label: only $(grep -c 'Tunnel established' "$log" 2>/dev/null || true) of $want tunnels established:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+# dedup_wait_mux <log> <label>: the client pre-dials a small pool of proxy
+# connections BEFORE the mux carrier exists, and a dialed conn never carries
+# a DedupAck -- the ack rides StartProxy on a mux stream -- so traffic put on
+# one logs the pass-through notice and zero refs no matter how healthy the
+# codec is. This group's first red run taught the race: dedup 1's opening GET
+# landed in the pre-mux window, got reaped mid-flight, and curl silently
+# retried. Waiting for the carrier line pins every request after it to the
+# mux path. (The QUIC scenario needs no separate call: "(quic carrier)" is
+# this same line with QUIC as the transport, and it already gates that leg.)
+dedup_wait_mux() {
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Mux session established with" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the client never established a mux carrier:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+# dedup_wait_public <port> <host> <label>: ngrokd answers 404 for a hostname
+# it has no tunnel for and 404 while the registry is still catching up, so
+# the wait is on the first non-404 -- the same reasoning bench.sh's
+# wait_for_public documents. Bounded curl (-m) everywhere.
+dedup_wait_public() {
+  local port="$1" host="$2" label="$3" code i
+  for i in $(seq 1 40); do
+    code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Host: $host" "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the public listener never learned $host"
+  return 1
+}
+
+# dedup_stop <client-pid> <ngrokd-pid>: the client goes first so the server's
+# registry lets the hostnames go before any later stack reuses them.
+dedup_stop() {
+  kill "$1" "$2" 2>/dev/null || true
+  wait "$1" "$2" 2>/dev/null || true
+}
+
+echo "[e2e] starting the dedup group's local upstreams (http :19021, udp :19022)"
+
+# dedup 1: a dedup tunnel serves real HTTP through the codec over the smux
+# carrier. Correctness first (curl GET, then five identical ~8 KiB POSTs over
+# ONE keep-alive connection -- per-stream tables, so the repetition that
+# feeds the refs must ride a single stream), then the engagement witness:
+# close lines on both sides, and refs>0 server-side.
+echo "[e2e] dedup 1: dedup tunnel over the smux carrier (correctness + repetition)"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18089 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14454 >"$DEDUP_DIR/a-ngrokd.log" 2>&1 &
+DEDUP_A_NGROKD_PID=$!
+dedup_wait_server "$DEDUP_DIR/a-ngrokd.log" "dedup 1 (ngrokd)"
+
+cat > "$TMPDIR/dedup-a.yml" <<'YAML'
+server_addr: 127.0.0.1:14454
+trust_host_root_certs: true
+tunnels:
+  dedup:
+    hostname: dedup
+    proto:
+      http: 19021
+    carrier_dedup: true
+YAML
+./bin/ngrok -config="$TMPDIR/dedup-a.yml" -log="$DEDUP_DIR/a-client.log" \
+  start dedup >"$DEDUP_DIR/a-client-stdout.log" 2>&1 &
+DEDUP_A_CLIENT_PID=$!
+dedup_wait_tunnel "$DEDUP_DIR/a-client.log" 1 "dedup 1 (client)"
+dedup_wait_mux "$DEDUP_DIR/a-client.log" "dedup 1 (client)"
+dedup_wait_public 18089 dedup "dedup 1 (public)"
+
+DEDUP_GET="$(curl -fsS -m 10 -H 'Host: dedup' http://127.0.0.1:18089/)"
+if [[ "$DEDUP_GET" != "dedup-e2e-ok" ]]; then
+  echo "[e2e] dedup 1: GET through the codec did not serve the upstream: $DEDUP_GET"
+  exit 1
+fi
+python3 "$TMPDIR/dedup_post.py" 18089 dedup 5 repeat | sed 's/^/[e2e] dedup 1: /'
+dedup_wait_close_lines "$DEDUP_DIR/a-ngrokd.log" 2 "dedup 1 (server close lines)"
+dedup_wait_close_lines "$DEDUP_DIR/a-client.log" 2 "dedup 1 (client close lines)"
+dedup_assert_refs "$DEDUP_DIR/a-ngrokd.log" "dedup 1"
+dedup_stop "$DEDUP_A_CLIENT_PID" "$DEDUP_A_NGROKD_PID"
+
+# dedup 2: the same correctness over the QUIC carrier. proxy_transport is
+# PINNED (auto would likely pick QUIC here too, but a pin cannot drift), and
+# the "(quic carrier)" line is the assertion that the number really rode
+# QUIC -- the same honesty gate the bench's QUIC leg uses, because a silent
+# degrade to smux would make this scenario pass while proving nothing.
+echo "[e2e] dedup 2: dedup tunnel over the QUIC carrier"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18090 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14455 -quicAddr=127.0.0.1:14455 \
+  >"$DEDUP_DIR/b-ngrokd.log" 2>&1 &
+DEDUP_B_NGROKD_PID=$!
+dedup_wait_server "$DEDUP_DIR/b-ngrokd.log" "dedup 2 (ngrokd)"
+dedup_wait_quic_listener "$DEDUP_DIR/b-ngrokd.log" "dedup 2 (quic listener)"
+
+cat > "$TMPDIR/dedup-b.yml" <<'YAML'
+server_addr: 127.0.0.1:14455
+trust_host_root_certs: true
+proxy_transport: quic
+tunnels:
+  dedup-q:
+    hostname: dedup-q
+    proto:
+      http: 19021
+    carrier_dedup: true
+YAML
+./bin/ngrok -config="$TMPDIR/dedup-b.yml" -log="$DEDUP_DIR/b-client.log" \
+  start dedup-q >"$DEDUP_DIR/b-client-stdout.log" 2>&1 &
+DEDUP_B_CLIENT_PID=$!
+dedup_wait_tunnel "$DEDUP_DIR/b-client.log" 1 "dedup 2 (client)"
+if ! grep -q "(quic carrier)" "$DEDUP_DIR/b-client.log" 2>/dev/null; then
+  sleep 2
+fi
+if ! grep -q "(quic carrier)" "$DEDUP_DIR/b-client.log" 2>/dev/null; then
+  echo "[e2e] dedup 2: the client never established a QUIC carrier (degraded to smux?):"
+  tail -n 20 "$DEDUP_DIR/b-client.log" || true
+  exit 1
+fi
+dedup_wait_public 18090 dedup-q "dedup 2 (public)"
+
+DEDUP_GET="$(curl -fsS -m 10 -H 'Host: dedup-q' http://127.0.0.1:18090/)"
+if [[ "$DEDUP_GET" != "dedup-e2e-ok" ]]; then
+  echo "[e2e] dedup 2: GET over the QUIC carrier did not serve the upstream: $DEDUP_GET"
+  exit 1
+fi
+python3 "$TMPDIR/dedup_post.py" 18090 dedup-q 5 repeat | sed 's/^/[e2e] dedup 2: /'
+dedup_wait_close_lines "$DEDUP_DIR/b-ngrokd.log" 2 "dedup 2 (server close lines)"
+dedup_wait_close_lines "$DEDUP_DIR/b-client.log" 2 "dedup 2 (client close lines)"
+dedup_assert_refs "$DEDUP_DIR/b-ngrokd.log" "dedup 2"
+dedup_stop "$DEDUP_B_CLIENT_PID" "$DEDUP_B_NGROKD_PID"
+
+# dedup 3: the kill switch. -disableCarrierDedup stops the server
+# CONFIRMING proposals, which from the client's side is byte-for-byte what
+# an old (pre-21) server does -- RegProxy/StartProxy are additive json, and
+# "no DedupAck" IS the old wire -- so this scenario is also the spec's
+# old-binary interop case, exercised without standing up a stale binary.
+# Assert all three halves of the contract: traffic stays correct
+# (pass-through, four requests across several streams), the client logs
+# EXACTLY ONE "stays pass-through" notice per tunnel no matter how many
+# streams asked, and NEITHER side logs a close line (kill switch on = the
+# server installs nothing at all; there is no codec to count bytes).
+echo "[e2e] dedup 3: kill switch -- pass-through, one notice, zero close lines"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18091 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14456 -disableCarrierDedup \
+  >"$DEDUP_DIR/c-ngrokd.log" 2>&1 &
+DEDUP_C_NGROKD_PID=$!
+dedup_wait_server "$DEDUP_DIR/c-ngrokd.log" "dedup 3 (ngrokd)"
+
+cat > "$TMPDIR/dedup-c.yml" <<'YAML'
+server_addr: 127.0.0.1:14456
+trust_host_root_certs: true
+tunnels:
+  dedup-kill:
+    hostname: dedup-kill
+    proto:
+      http: 19021
+    carrier_dedup: true
+YAML
+./bin/ngrok -config="$TMPDIR/dedup-c.yml" -log="$DEDUP_DIR/c-client.log" \
+  start dedup-kill >"$DEDUP_DIR/c-client-stdout.log" 2>&1 &
+DEDUP_C_CLIENT_PID=$!
+dedup_wait_tunnel "$DEDUP_DIR/c-client.log" 1 "dedup 3 (client)"
+dedup_wait_public 18091 dedup-kill "dedup 3 (public)"
+
+DEDUP_GET="$(curl -fsS -m 10 -H 'Host: dedup-kill' http://127.0.0.1:18091/)"
+if [[ "$DEDUP_GET" != "dedup-e2e-ok" ]]; then
+  echo "[e2e] dedup 3: GET with the kill switch on did not serve the upstream: $DEDUP_GET"
+  exit 1
+fi
+python3 "$TMPDIR/dedup_post.py" 18091 dedup-kill 3 repeat | sed 's/^/[e2e] dedup 3: /'
+
+DEDUP_NOTICES=0
+for i in $(seq 1 40); do
+  DEDUP_NOTICES="$(grep -c 'stays pass-through' "$DEDUP_DIR/c-client.log" 2>/dev/null || true)"
+  if [[ "$DEDUP_NOTICES" -ge 1 ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$DEDUP_NOTICES" != "1" ]]; then
+  echo "[e2e] dedup 3: expected EXACTLY ONE pass-through notice per tunnel, found $DEDUP_NOTICES:"
+  grep 'carrier_dedup' "$DEDUP_DIR/c-client.log" || true
+  exit 1
+fi
+for f in "$DEDUP_DIR/c-ngrokd.log" "$DEDUP_DIR/c-client.log"; do
+  if [[ "$(dedup_close_count "$f")" != "0" ]]; then
+    echo "[e2e] dedup 3: pass-through streams must not log close lines, but $f has $(dedup_close_count "$f")"
+    exit 1
+  fi
+done
+echo "[e2e] dedup 3: 4 requests correct, exactly 1 notice, 0 close lines"
+dedup_stop "$DEDUP_C_CLIENT_PID" "$DEDUP_C_NGROKD_PID"
+
+# dedup 4: the SPEC-CLUSTER21 payload end to end, and the kill criterion
+# made executable. 100 POSTs over ONE keep-alive connection, each with a
+# fresh timestamp+nonce near the head (the CDC resync case), the shared
+# 32 KiB system prompt, and a ~200-byte varying suffix. The assertion is on
+# the SERVER's close lines -- the request direction, the direction the
+# feature exists for -- and it is the spec's pre-registered kill line:
+# framed bytes must be at most half of offered, i.e. saved >= 50%. Below
+# that the feature is not earning its complexity; if this assert ever
+# fires, the numbers are the report, not something to massage.
+echo "[e2e] dedup 4: llm-json payload end to end (100 POSTs, one keep-alive connection)"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18092 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14457 >"$DEDUP_DIR/d-ngrokd.log" 2>&1 &
+DEDUP_D_NGROKD_PID=$!
+dedup_wait_server "$DEDUP_DIR/d-ngrokd.log" "dedup 4 (ngrokd)"
+
+cat > "$TMPDIR/dedup-d.yml" <<'YAML'
+server_addr: 127.0.0.1:14457
+trust_host_root_certs: true
+tunnels:
+  dedup-llm:
+    hostname: dedup-llm
+    proto:
+      http: 19021
+    carrier_dedup: true
+YAML
+./bin/ngrok -config="$TMPDIR/dedup-d.yml" -log="$DEDUP_DIR/d-client.log" \
+  start dedup-llm >"$DEDUP_DIR/d-client-stdout.log" 2>&1 &
+DEDUP_D_CLIENT_PID=$!
+dedup_wait_tunnel "$DEDUP_DIR/d-client.log" 1 "dedup 4 (client)"
+dedup_wait_mux "$DEDUP_DIR/d-client.log" "dedup 4 (client)"
+dedup_wait_public 18092 dedup-llm "dedup 4 (public)"
+
+python3 "$TMPDIR/dedup_post.py" 18092 dedup-llm 100 llm | sed 's/^/[e2e] dedup 4: /'
+dedup_wait_close_lines "$DEDUP_DIR/d-ngrokd.log" 1 "dedup 4 (server close lines)"
+
+python3 - "$DEDUP_DIR/d-ngrokd.log" "$DEDUP_DIR/d-client.log" <<'PY'
+import re, sys
+
+
+def totals(path):
+    offered = framed = refs = lines = 0
+    for line in open(path, errors="replace"):
+        m = re.search(r"carrier_dedup: offered=(\d+) framed=(\d+) refs=(\d+)", line)
+        if m:
+            a, b, c = (int(x) for x in m.groups())
+            offered += a
+            framed += b
+            refs += c
+            lines += 1
+    return offered, framed, refs, lines
+
+
+req = totals(sys.argv[1])
+resp = totals(sys.argv[2])
+o, f, r, n = req
+assert n >= 1, "the server logged no carrier_dedup close lines"
+assert r > 0, "no REF ever fired across the 100-request payload"
+assert f * 2 <= o, (
+    "KILL CRITERION: framed %.1f%% of offered across %d streams -- "
+    "the spec requires saved >= 50%%" % (100.0 * f / o, n)
+)
+print("    request  direction (ngrokd): offered=%d framed=%d refs=%d streams=%d -> %.1f%% saved"
+      % (o, f, r, n, 100.0 - 100.0 * f / o))
+ro, rf, rr, rn = resp
+print("    response direction (client): offered=%d framed=%d refs=%d streams=%d -> %.1f%% saved"
+      % (ro, rf, rr, rn, 100.0 - 100.0 * rf / max(ro, 1)))
+PY
+echo "[e2e] dedup 4: kill criterion holds (framed <= offered/2 on the request direction)"
+dedup_stop "$DEDUP_D_CLIENT_PID" "$DEDUP_D_NGROKD_PID"
+
+# dedup 5: the mixed client. One client process, TWO tunnels: a dedup http
+# tunnel and a plain udp tunnel. Separate tunnels are exactly what the
+# config refusal deliberately still allows -- the refusal fires only when
+# ONE tunnel carries both the key and a udp leg. The as-built facts pinned
+# here: a proposing client wraps every proxy stream, but a udp leg's
+# flow-path StartProxy carries no DedupAck, so udp legs never engage (and
+# are never NOTED either -- a note names the tunnel whose proposal went
+# unacked, and the udp tunnel never proposes). The http leg engages and
+# deduplicates on every stream we drive while the udp leg keeps
+# round-tripping datagrams on the very same client.
+echo "[e2e] dedup 5: mixed client -- dedup http tunnel + plain udp tunnel, one process"
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18089 -httpsAddr= \
+  -tunnelAddr=127.0.0.1:14454 >"$DEDUP_DIR/a2-ngrokd.log" 2>&1 &
+DEDUP_A2_NGROKD_PID=$!
+dedup_wait_server "$DEDUP_DIR/a2-ngrokd.log" "dedup 5 (ngrokd)"
+
+cat > "$TMPDIR/dedup-a2.yml" <<'YAML'
+server_addr: 127.0.0.1:14454
+trust_host_root_certs: true
+tunnels:
+  mix-http:
+    hostname: dedup-mix
+    proto:
+      http: 19021
+    carrier_dedup: true
+  mix-udp:
+    proto:
+      udp: "127.0.0.1:19022"
+    remote_port: 14880
+YAML
+./bin/ngrok -config="$TMPDIR/dedup-a2.yml" -log="$DEDUP_DIR/a2-client.log" \
+  start mix-http mix-udp >"$DEDUP_DIR/a2-client-stdout.log" 2>&1 &
+DEDUP_A2_CLIENT_PID=$!
+dedup_wait_tunnel "$DEDUP_DIR/a2-client.log" 2 "dedup 5 (mixed client)"
+dedup_wait_mux "$DEDUP_DIR/a2-client.log" "dedup 5 (mixed client)"
+dedup_wait_public 18089 dedup-mix "dedup 5 (http leg)"
+if ! grep -q "^udp://localhost:14880$" <(sed -n 's/.*Tunnel established at \([^ ]*\).*/\1/p' "$DEDUP_DIR/a2-client.log"); then
+  echo "[e2e] dedup 5: the udp tunnel did not come up on its claimed public port 14880:"
+  grep 'Tunnel established' "$DEDUP_DIR/a2-client.log" || true
+  exit 1
+fi
+
+# The legs are driven in this order so the udp round-trip happens on a
+# client whose http leg is demonstrably engaged: coexistence, not sequence.
+python3 "$TMPDIR/dedup_post.py" 18089 dedup-mix 3 repeat | sed 's/^/[e2e] dedup 5: http leg /'
+dedup_udp_probe_expect "dedup 5: udp leg" 127.0.0.1 14880 "dedup-e2e-udp-on-proposing-client"
+dedup_wait_close_lines "$DEDUP_DIR/a2-ngrokd.log" 1 "dedup 5 (server close lines)"
+dedup_assert_refs "$DEDUP_DIR/a2-ngrokd.log" "dedup 5 (http leg)"
+if [[ "$(dedup_close_count "$DEDUP_DIR/a2-client.log")" -lt 1 ]]; then
+  echo "[e2e] dedup 5: the http leg's client-side close lines are missing"
+  exit 1
+fi
+# The pass-through note. This scenario's first draft asserted ZERO notes,
+# and two runs proved that wrong -- scenario 1's client logs the same
+# single note. The mechanism: the proxy conns the client dialed BEFORE the
+# mux carrier existed can never be acked (the ack rides StartProxy on a mux
+# stream), the client notes a tunnel once when any of its streams rides
+# unacked, and so a proposing client notes its tunnel exactly once no
+# matter how healthily the driven traffic engages afterwards. The pin is
+# therefore: at most one note, naming the proposing http tunnel, never the
+# udp tunnel. Its ARRIVAL is pool-reap timing, so the wait is bounded and
+# zero notes is not a failure.
+DEDUP_A2_NOTICES=0
+for i in $(seq 1 40); do
+  DEDUP_A2_NOTICES="$(grep -c 'stays pass-through' "$DEDUP_DIR/a2-client.log" 2>/dev/null || true)"
+  if [[ "$DEDUP_A2_NOTICES" -ge 1 ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$DEDUP_A2_NOTICES" -gt 1 ]]; then
+  echo "[e2e] dedup 5: a pass-through note is once per tunnel, but the log carries $DEDUP_A2_NOTICES:"
+  grep 'stays pass-through' "$DEDUP_DIR/a2-client.log" || true
+  exit 1
+fi
+if [[ "$DEDUP_A2_NOTICES" == "1" ]] && ! grep 'stays pass-through' "$DEDUP_DIR/a2-client.log" | grep -q 'http://dedup-mix'; then
+  echo "[e2e] dedup 5: the pass-through note does not name the proposing http tunnel:"
+  grep 'stays pass-through' "$DEDUP_DIR/a2-client.log" || true
+  exit 1
+fi
+if grep 'stays pass-through' "$DEDUP_DIR/a2-client.log" 2>/dev/null | grep -q 'udp://'; then
+  echo "[e2e] dedup 5: the udp tunnel was named in a pass-through note, but it never proposes:"
+  grep 'stays pass-through' "$DEDUP_DIR/a2-client.log" || true
+  exit 1
+fi
+echo "[e2e] dedup 5: http leg engaged (refs fired), udp leg round-tripped, notes name the http tunnel only"
+dedup_stop "$DEDUP_A2_CLIENT_PID" "$DEDUP_A2_NGROKD_PID"
+
+# dedup 6: the refusals at load. Both are config-load errors -- the client
+# must refuse to START (exit nonzero, before any connection) and must name
+# the tunnel. The texts quoted in the asserts are the binary's own words
+# (client/config.go validateCarrierDedup); if the wording ever moves, this
+# scenario fails and the new words get quoted here. The mixed-udp case is
+# the mixed tunnel -- carrier_dedup + {http, udp} on ONE tunnel -- because
+# that is the composition an operator could believe means "the http legs
+# dedup"; the refusal exists precisely because the negotiation cannot
+# express that. The agent-TLS case needs a valid CA pair so config loading
+# reaches the carrier_dedup judgment (it is deliberately judged LAST, after
+# every other validator has accepted the rest of the tunnel).
+echo "[e2e] dedup 6: config refusals name the tunnel and refuse to start"
+
+cat > "$TMPDIR/dedup-refusal-udp.yml" <<'YAML'
+server_addr: 127.0.0.1:14454
+trust_host_root_certs: true
+tunnels:
+  bad-mixed:
+    proto:
+      http: "127.0.0.1:19021"
+      udp: "127.0.0.1:19022"
+    carrier_dedup: true
+YAML
+
+cat > "$TMPDIR/dedup-ca.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+CN = dedup-e2e-ca
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+# -subj and </dev/null are load-bearing (the openssl DN prompt parks the
+# whole run; the tls and bench groups document the same trap).
+openssl req -x509 -newkey rsa:2048 -nodes -config "$TMPDIR/dedup-ca.cnf" \
+  -keyout "$TMPDIR/dedup-ca.key" -out "$TMPDIR/dedup-ca.crt" -days 2 \
+  -subj "/CN=dedup-e2e-ca" </dev/null >/dev/null 2>&1
+if [[ ! -s "$TMPDIR/dedup-ca.crt" ]]; then
+  echo "[e2e] dedup 6: could not generate the refusal scenario's CA pair"
+  exit 1
+fi
+
+cat > "$TMPDIR/dedup-refusal-tls.yml" <<YAML
+server_addr: 127.0.0.1:14454
+trust_host_root_certs: true
+tunnels:
+  bad-tls:
+    proto:
+      https: "127.0.0.1:19021"
+    agent_tls_termination: true
+    carrier_dedup: true
+    tls:
+      ca_crt: $TMPDIR/dedup-ca.crt
+      ca_key: $TMPDIR/dedup-ca.key
+YAML
+
+dedup_expect_refusal() {  # <config> <tunnel> <expected-substring> <label>
+  # Two local statements on purpose: every RHS of ONE local expands before
+  # ANY of its assignments run, so out=... below would read $name unset and
+  # set -u (this suite's pin) aborts the run -- the first draft tripped it.
+  local cfg="$1" name="$2" want="$3" label="$4" pid rc=0 i
+  local out="$DEDUP_DIR/refusal-$name.log"
+  ./bin/ngrok -config="$cfg" start "$name" >"$out" 2>&1 &
+  pid=$!
+  for i in $(seq 1 40); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[e2e] $label: the client did not exit on the refused config:"
+    cat "$out" || true
+    kill "$pid" 2>/dev/null || true
+    return 1
+  fi
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  if [[ "$rc" == "0" ]]; then
+    echo "[e2e] $label: the client exited 0 on a config it must refuse:"
+    cat "$out" || true
+    return 1
+  fi
+  if ! grep -qF "$want" "$out"; then
+    echo "[e2e] $label: the client exited $rc but its output does not carry the expected refusal:"
+    cat "$out" || true
+    return 1
+  fi
+  echo "[e2e] $label: refused at load (exit $rc), naming the tunnel:"
+  grep -F "$want" "$out" | head -n 1 | sed 's/^/[e2e]     /'
+}
+
+dedup_expect_refusal "$TMPDIR/dedup-refusal-udp.yml" bad-mixed \
+  "Tunnel bad-mixed: carrier_dedup cannot be combined with a udp protocol" "dedup 6 (udp)"
+dedup_expect_refusal "$TMPDIR/dedup-refusal-tls.yml" bad-tls \
+  "Tunnel bad-tls: carrier_dedup cannot be combined with agent_tls_termination" "dedup 6 (agent-tls)"
+
+kill "$DEDUP_HTTP_UP_PID" "$DEDUP_UDP_UP_PID" 2>/dev/null || true
+echo "[e2e] dedup group: 6/6 scenarios passed"
+
 echo "[e2e] PASS"

@@ -13,6 +13,7 @@ import (
 	"net"
 	"ngrok/client/mvc"
 	"ngrok/conn"
+	"ngrok/dedup"
 	"ngrok/log"
 	"ngrok/msg"
 	"ngrok/policy"
@@ -251,6 +252,25 @@ type ClientModel struct {
 	agentTLS         map[string]*tls.Config
 	tunnelPoliciesMu sync.Mutex
 	tunnelPolicies   map[string]*policy.Compiled
+
+	// carrier_dedup (SPEC-CLUSTER21) state, keyed by public URL like
+	// c.tunnels and guarded by the same mutex, because the one write happens
+	// at tunnel establishment under that lock already:
+	//
+	//   - carrierDedup records the resolved carrier_dedup key of every
+	//     established tunnel. The proxy path consults it for the RegProxy
+	//     proposal and for attributing the no-ack notice -- the config key is
+	//     the tunnel's, but a proxy connection is opened before StartProxy
+	//     names its tunnel, so the proposal itself is per client (any
+	//     configured tunnel) and this map is the finest thing the decision
+	//     can be made from.
+	//   - dedupNoAckSeen records which tunnels have had their one "server did
+	//     not ack" Info (spec §1: once per tunnel, never per stream -- a
+	//     tunnel opens a proxy connection per visitor, and the notice would
+	//     otherwise be the loudest line in the log exactly when the feature
+	//     is quietly doing nothing).
+	carrierDedup   map[string]bool
+	dedupNoAckSeen map[string]bool
 }
 
 // sessionSecretValue returns the session secret the server handed out, or ""
@@ -349,6 +369,12 @@ func newClientModel(config *Configuration, ctl mvc.Controller) *ClientModel {
 		// populated per tunnel session by establishTunnelRuntime
 		agentTLS:       make(map[string]*tls.Config),
 		tunnelPolicies: make(map[string]*policy.Compiled),
+
+		// per-tunnel carrier_dedup state (SPEC-CLUSTER21), written when a
+		// tunnel is established; dedupNoAckSeen is read on the proxy path and
+		// lazy-init'd there, because a directly-constructed model (tests)
+		// has neither map and only the notice ever writes
+		carrierDedup: make(map[string]bool),
 	}
 
 	// configure TLS
@@ -672,6 +698,11 @@ func (c *ClientModel) control() {
 
 			c.tunnelsMu.Lock()
 			c.tunnels[tunnel.PublicUrl] = tunnel
+			// The carrier_dedup resolution rides the same lock hold as the
+			// tunnel it describes: a proxy stream answered in the same
+			// instant sees one or the other, never a tunnel without its key
+			// (SPEC-CLUSTER21).
+			c.carrierDedup[tunnel.PublicUrl] = tunnelCfg.CarrierDedup
 			c.tunnelsMu.Unlock()
 			c.connStatus = mvc.ConnOnline
 			c.Info("Tunnel established at %v", tunnel.PublicUrl)
@@ -810,6 +841,88 @@ func (c *ClientModel) proxy() {
 	c.proxyDial()
 }
 
+// dedupWrap installs the carrier_dedup codec on a proxy connection's carrier
+// (SPEC-CLUSTER21 §3): pass-through, and nil when no established tunnel asked
+// for the feature. Pass-through is byte-identical to no wrapper at all -- that
+// is what makes install-then-engage the right shape here -- so over-installing
+// on a connection that turns out to serve a non-dedup tunnel costs nothing and
+// engages nothing.
+func (c *ClientModel) dedupWrap(inner net.Conn) *dedup.Conn {
+	if !c.dedupProposed() {
+		return nil
+	}
+	return dedup.NewPassThrough(inner)
+}
+
+// dedupProposed reports whether any established tunnel configured
+// carrier_dedup: true. This is the granularity the RegProxy proposal actually
+// has, and the reason is structural: a proxy connection is opened in answer to
+// a ReqProxy, before any StartProxy has named the tunnel it will serve, so
+// there is nothing finer for the client to propose about. The per-stream
+// half of the negotiation is the server's ack (see proxyStream); the per-tunnel
+// half is this client's own refusal to register a tunnel the feature cannot
+// serve (validateCarrierDedup).
+func (c *ClientModel) dedupProposed() bool {
+	c.tunnelsMu.RLock()
+	defer c.tunnelsMu.RUnlock()
+
+	for _, want := range c.carrierDedup {
+		if want {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupTunnel reports whether the tunnel registered under publicUrl configured
+// carrier_dedup: true.
+func (c *ClientModel) dedupTunnel(publicUrl string) bool {
+	c.tunnelsMu.RLock()
+	defer c.tunnelsMu.RUnlock()
+	return c.carrierDedup[publicUrl]
+}
+
+// noticeDedupUnacked emits the one Info an unacked proposal owes its operator
+// (spec §1: one per tunnel, never per stream). The dedup lives in
+// dedupNoAckSeen, keyed by tunnel URL; entries live for the model's life, the
+// same lifetime c.tunnels has.
+func (c *ClientModel) noticeDedupUnacked(publicUrl string) {
+	c.tunnelsMu.Lock()
+	defer c.tunnelsMu.Unlock()
+
+	if c.dedupNoAckSeen == nil {
+		c.dedupNoAckSeen = make(map[string]bool)
+	}
+	if c.dedupNoAckSeen[publicUrl] {
+		return
+	}
+	c.dedupNoAckSeen[publicUrl] = true
+	c.Info("carrier_dedup: the server did not acknowledge the proposal for %s; the carrier stays pass-through (noted once per tunnel, not per connection)", publicUrl)
+}
+
+// closeCarrierDedup runs at proxy-connection teardown with the connection's
+// codec (nil when the client never proposed). This is the client's equivalent
+// of the close hook the "Copied %d bytes" line lives behind: conn.Join logs
+// that line from inside the join with no hook to ride, so the honest equivalent
+// is "after the join has wound down" -- by the time serveProxyConnection
+// returns, both directions are finished and the counters are final.
+//
+// Engaged: the spec's one close line, the honest win number. Unacked: the
+// no-ack notice, for tunnels that asked for the feature -- a tunnel that never
+// configured it logs nothing here, whatever the server did.
+func (c *ClientModel) closeCarrierDedup(carrier *dedup.Conn, startPxy *msg.StartProxy) {
+	if carrier == nil {
+		return
+	}
+	if !startPxy.DedupAck {
+		if c.dedupTunnel(startPxy.Url) {
+			c.noticeDedupUnacked(startPxy.Url)
+		}
+		return
+	}
+	c.Info("carrier_dedup: offered=%d framed=%d refs=%d", carrier.Offered(), carrier.Framed(), carrier.Refs())
+}
+
 // proxyDial is the original per-connection path: dial the server, register, and
 // relay what the server sends. It is what a server without the mux capability
 // gets, and what serves the window before the mux session is up, while it is
@@ -832,7 +945,18 @@ func (c *ClientModel) proxyDial() {
 	}
 	defer remoteConn.Close()
 
-	err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue()})
+	// The codec goes under a second logged wrapper here because conn.Dial
+	// hands back a finished *loggedConn and nothing can be inserted beneath
+	// it. The extra layer is inert: only the outer conn is ever spoken to,
+	// so the inner one logs nothing, and it exists only for connections of
+	// proposing clients on this fallback path (proxyStream, the steady-state
+	// path, keeps its single wrapper by wrapping before conn.Wrap).
+	carrier := c.dedupWrap(remoteConn)
+	if carrier != nil {
+		remoteConn = conn.Wrap(carrier, "pxy")
+	}
+
+	err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue(), Dedup: carrier != nil})
 	if err != nil {
 		remoteConn.Error("Failed to write RegProxy: %v", err)
 		return
@@ -845,7 +969,18 @@ func (c *ClientModel) proxyDial() {
 		return
 	}
 
+	// The flip point, exactly as proxyStream pins it: an acked StartProxy
+	// means the server framed everything it wrote after this very message, so
+	// the codec engages before another byte is read. A missing engage here is
+	// not a quiet miss -- the client reads framed bytes as if they were plain
+	// and the connection dies as garbage -- which is why the engaged dialed
+	// test runs this path and not only the mux one.
+	if carrier != nil && startPxy.DedupAck {
+		carrier.Engage()
+	}
+
 	c.serveProxyConnection(remoteConn, &startPxy)
+	c.closeCarrierDedup(carrier, &startPxy)
 }
 
 // proxyStream answers one ReqProxy with a stream on the mux session: the same
@@ -864,17 +999,29 @@ func (c *ClientModel) proxyStream(sess *muxSession) error {
 		return fmt.Errorf("failed to open a proxy stream: %v", err)
 	}
 
+	// carrier_dedup (SPEC-CLUSTER21 §3): the codec is installed pass-through
+	// at the wrap site, BEFORE the handshake crosses it, because the flip is
+	// only coherent at the handshake boundary -- the server may frame from
+	// the moment it writes the ack, so the wrapper must already be sitting on
+	// the stream when those framed bytes are read, and nothing before the ack
+	// is ever framed (pass-through is byte-identical to no wrapper).
+	carrier := c.dedupWrap(stream)
+
 	// conn.Wrap's default case is what makes a stream a conn.Conn; after this
 	// line the msg framing, the deadlines and the join are the code the dialed
 	// path runs, unmodified.
-	remoteConn := conn.Wrap(stream, "pxy")
+	var inner net.Conn = stream
+	if carrier != nil {
+		inner = carrier
+	}
+	remoteConn := conn.Wrap(inner, "pxy")
 	if remoteConn == nil {
 		stream.Close()
 		return fmt.Errorf("failed to wrap the proxy stream")
 	}
 	defer remoteConn.Close()
 
-	if err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue()}); err != nil {
+	if err = msg.WriteMsg(remoteConn, &msg.RegProxy{ClientId: c.id, Secret: c.sessionSecretValue(), Dedup: carrier != nil}); err != nil {
 		return fmt.Errorf("failed to write RegProxy: %v", err)
 	}
 
@@ -884,7 +1031,18 @@ func (c *ClientModel) proxyStream(sess *muxSession) error {
 		return fmt.Errorf("server failed to write StartProxy: %v", err)
 	}
 
+	// The flip point: an acked StartProxy means the server wrapped its side
+	// after writing this very message, so every byte from here on is framed
+	// and the codec engages both directions now, before anything else is read
+	// or written. No ack means pass-through stays -- the notice (once per
+	// tunnel, in closeCarrierDedup) says so, not the log-per-stream noise a
+	// re-warning here would make of it.
+	if carrier != nil && startPxy.DedupAck {
+		carrier.Engage()
+	}
+
 	c.serveProxyConnection(remoteConn, &startPxy)
+	c.closeCarrierDedup(carrier, &startPxy)
 	return nil
 }
 

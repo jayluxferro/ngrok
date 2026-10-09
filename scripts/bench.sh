@@ -73,6 +73,72 @@
 #               happy path (and the cost of the QUIC handshake on
 #               conn-rate's fresh sessions), not superiority.
 #
+#   dedup columns  a third leg per variant, for the carrier_dedup cluster:
+#               the same stack shape run TWICE per carrier -- once over smux
+#               (keys dedup_*) and once over QUIC (keys quic_dedup_, with
+#               -quicAddr and proxy_transport: quic, gated on the carrier
+#               line like the quic leg). The honest ON/OFF shape needs two
+#               CLIENT processes on one ngrokd, not a flag flip: the dedup
+#               proposal is client-granular (any carrier_dedup tunnel makes
+#               the client propose on every stream it sends), so a single
+#               client cannot be its own control. A plain client registers
+#               `bench` (the OFF side); a second client registers `bench-dd`
+#               with carrier_dedup: true (the ON side); both serve the same
+#               upstream fixture. Three payloads:
+#
+#                 dedup-llm    100 POSTs over ONE keep-alive connection, each
+#                              a ~200-byte timestamped head + shared ~32 KiB
+#                              prompt + ~200-byte varying suffix (the head
+#                              mutation is what forces the CDC resync). THE
+#                              KILL CRITERION lives here: the pre-registered
+#                              expectation is >= ~50% offered-bytes reduction
+#                              on the request direction, read from the codec's
+#                              per-stream close lines (server log = request
+#                              direction, client log = response direction).
+#                 dedup-sse    200 text/event-stream events of static
+#                              boilerplate in one response, with and without
+#                              Accept-Encoding: gzip. The no-gzip leg shows
+#                              the win; the gzip leg shows its boundary --
+#                              gzip'd bytes are incompressible fresh AEAD
+#                              output to the codec, so saved% should collapse
+#                              toward zero, which is the honest result, not a
+#                              failure. (The upstream gzips only when asked.)
+#                 dedup-bulk   the control: the same 64 MiB random body
+#                              through both tunnels. Random bytes never
+#                              repeat, so the codec can only add framing; the
+#                              pre-registered expectation is <= ~1% wire
+#                              overhead, measured as (framed-offered)/offered
+#                              from the close lines -- a RATIO, and therefore
+#                              exact -- not from wall-clock MiB/s, where this
+#                              box's run-to-run spread (up to ~15%, documented
+#                              above) dwarfs the quantity.
+#
+#               The close-line ratio (framed vs offered bytes) is the honest
+#               measured quantity throughout because it is not a timing
+#               measurement: loopback noise cannot move it. Wall-clock and
+#               p95 numbers are recorded beside them for context, with the
+#               standing admission that loopback p95 is expected neutral-
+#               to-slightly-worse under the codec. CPU time of all three
+#               processes (ngrokd, plain client, dedup client) is captured at
+#               stack teardown; the readable delta is plain client vs dedup
+#               client (same traffic shape, one running the codec). The ngrokd
+#               figure mixes both clients' traffic in one process and cannot
+#               be attributed -- reported as-is for completeness.
+#
+#   netem variant  the bandwidth-constrained run, where the byte win is
+#               allowed to show as wall time. tc cannot do it in the target
+#               environment (the container VM's kernel ships fq_codel only --
+#               no htb/tbf/netem -- and its tc binary cannot load modules),
+#               so the shaping lives in a userspace token-bucket relay
+#               (scripts/bench-netem/relay.py, 10 Mbit/s) that owns the
+#               dialed carrier address: it listens on 127.0.0.1:<tunnel
+#               port> and forwards to ngrokd, which BENCH_TUNNEL_BIND parks
+#               on 127.0.0.2. Clients still dial 127.0.0.1, the harness is
+#               otherwise untouched, and OFF/ON traverse the same relay, so
+#               the leg delta still isolates the codec. The whole run sits
+#               in one `unshare -Urn` netns, so the relay's extra listener
+#               and the 127.0.0.2 alias never outlive it.
+#
 # Honesty rules this script tries to keep:
 #
 #   - No knobs for the numbers. Fixed body size, fixed request counts, fixed
@@ -108,9 +174,14 @@ cd "$ROOT"
 # empty /tmp directory: a hermetic-looking /tmp module cache is just a cold
 # one -- every run re-downloads every module, and a sandbox whose /tmp lacks
 # them fails the build outright. An inherited environment still wins.
-export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
-export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
-export GOPATH="${GOPATH:-$(go env GOPATH)}"
+# Guarded on the toolchain existing: the two-directory form runs prebuilt
+# binaries and needs no Go -- on a machine without one (the bench VM), `go
+# env` would abort under set -e before a single binary was even looked at.
+if command -v go >/dev/null 2>&1; then
+  export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
+  export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
+  export GOPATH="${GOPATH:-$(go env GOPATH)}"
+fi
 export NGROK_INSECURE_SKIP_VERIFY="${NGROK_INSECURE_SKIP_VERIFY:-1}"
 
 # Fixed parameters. Keeping these as constants rather than flags is deliberate.
@@ -120,6 +191,11 @@ BENCH_HTTP_PORT=18180         # public listener         (e2e.sh uses 18080)
 BENCH_HTTPS_PORT=18480        # public https listener   (e2e.sh uses 18443)
 BENCH_TUNNEL_PORT=15443       # client <-> server       (e2e.sh uses 14443)
 BENCH_ADMIN_PORT=19190        # admin                   (e2e.sh uses 19090)
+# What ngrokd BINDS the tunnel listener on. Clients always dial 127.0.0.1, so
+# the default is exactly what it always was; the netem variant sets 127.0.0.2
+# so the shaping relay can own 127.0.0.1:<tunnel port> on the carrier path.
+# It changes no measured quantity -- it exists so the harness needs no fork.
+BENCH_TUNNEL_BIND="${BENCH_TUNNEL_BIND:-127.0.0.1}"
 BASE_URL="http://127.0.0.1:${BENCH_HTTP_PORT}"
 
 # The tls-conn-rate scenario's two endpoints: same upstream, same listener,
@@ -136,6 +212,14 @@ CONN_RATE_REQUESTS=200
 KEEPALIVE_REQUESTS=1000
 TLS_REQUESTS=200
 
+# The dedup leg's knobs (constants for the same reason everything above is):
+# payload sizes and request counts match the e2e group's fixtures so the two
+# harnesses' numbers describe the same workload, and the OFF/ON hostnames are
+# fixed so a table row is reproducible.
+DEDUP_LLM_REQUESTS=100
+DEDUP_SSE_EVENTS=200
+DEDUP_DD_HOST="bench-dd"
+
 RESULT_JSON="${BENCH_RESULT_JSON:-/tmp/ngrok-bench-result.json}"
 
 WORKDIR="$(mktemp -d)"
@@ -144,6 +228,7 @@ CLIENT_PID=""
 NGROKD_PID=""
 UPSTREAM_PID=""
 CURRENT_LABEL=""
+VARIANT_LABEL=""   # the result file the dedup leg appends to (set by run_variant_dedup)
 
 cleanup() {
   local pid
@@ -348,6 +433,386 @@ EOF
     -subj "/CN=bench-zk-ca" </dev/null >/dev/null 2>&1
   [[ -s "$WORKDIR/bench-ca.crt" ]] || die "could not generate the bench CA"
 }
+
+# The dedup leg's fixtures. Same layout as write_fixtures: an upstream with
+# the routes the payloads need, a driver that speaks them, and a parser for
+# the codec's close lines. The payload vocabulary and its history are
+# documented once, in the driver, and both python files build payloads with
+# the same pinned construction the e2e group uses (the digests below are the
+# same pins).
+write_dedup_fixtures() {
+  cat > "$WORKDIR/dedup_upstream.py" <<'PY'
+# The dedup leg's upstream. Same rules as bench_upstream.py: HTTP/1.1 with an
+# explicit Content-Length on every response, because that is what keeps the
+# keep-alive chain (and therefore the per-stream codec tables) alive. Routes:
+#
+#   /small             a handful of bytes, for warmup
+#   POST /echo         answers "sha256:<hex>:<len>" of the exact bytes read,
+#                      so the llm driver can assert byte-correctness through
+#                      the whole chain on every request
+#   /sse?events=N      N text/event-stream events of STATIC boilerplate (the
+#                      payload's point: the repeated text is what the codec
+#                      can reference) with a fixed-width varying id/seq near
+#                      each event's head. Asked with Accept-Encoding: gzip,
+#                      the whole stream comes back gzipped -- the
+#                      dedup-under-gzip leg needs genuinely compressed bytes
+#                      on the carrier, not a stub.
+#   /bulk              BULK_BYTES of seeded random bytes -- the control
+#                      payload, same seed discipline as bench_upstream.py.
+import gzip
+import hashlib
+import random
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT = int(sys.argv[1])
+BULK = random.Random(0xB3C4).randbytes(int(sys.argv[2]))
+SMALL = b"bench-ok"
+
+# Must stay byte-identical to the driver's construction below -- the driver
+# asserts the response equals its own build, so drift fails the run instead
+# of benchmarking a different payload.
+VOCAB = (
+    "the of and a to in is you that it he was for on are as with his they at be this have from or one had by word but not what all were we when your can said there use an each which she do how their if will up other about out many then them these so some her would make like him into time has look two more write go see number no way could people my than first water been call who oil its now find long down day did get come made may part over new sound take only little work know place year live me back give most very after thing our just name good sentence man think say great where help through much before line right too mean old any same tell boy follow came want show also around form three small set put end does another well large must big even such because turn here why ask went light kind off need house picture try us again animal point mother world near build self earth father"
+).split()
+MASK = (1 << 64) - 1
+
+
+class Xorshift:
+    def __init__(self, seed):
+        self.s = seed & MASK
+
+    def next(self):
+        self.s ^= (self.s << 13) & MASK
+        self.s ^= self.s >> 7
+        self.s ^= (self.s << 17) & MASK
+        return self.s
+
+
+def build_words(seed, n):
+    x = Xorshift(seed)
+    return "".join(VOCAB[x.next() % len(VOCAB)] + " " for _ in range(n)).encode()
+
+
+SSE_STATIC = build_words(0x5EED, 1900)
+
+
+def sse_payload(n):
+    out = []
+    for i in range(n):
+        out.append(
+            (
+                'id: %04d\nevent: message\ndata: {"seq":%04d,"text":"' % (i, i)
+            ).encode()
+            + SSE_STATIC
+            + b'"}\n\n'
+        )
+    return b"".join(out)
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def send_body(self, body, content_type, encoding=None):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/bulk":
+            self.send_body(BULK, "application/octet-stream")
+        elif url.path == "/sse":
+            n = int(parse_qs(url.query).get("events", ["200"])[0])
+            payload = sse_payload(n)
+            if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                self.send_body(gzip.compress(payload), "text/event-stream", "gzip")
+            else:
+                self.send_body(payload, "text/event-stream")
+        else:
+            self.send_body(SMALL, "text/plain")
+
+    def do_POST(self):
+        want = int(self.headers.get("Content-Length", "0") or "0")
+        data = b""
+        while len(data) < want:
+            chunk = self.rfile.read(want - len(data))
+            if not chunk:
+                break
+            data += chunk
+        body = ("sha256:%s:%d" % (hashlib.sha256(data).hexdigest(), len(data))).encode()
+        self.send_body(body, "text/plain")
+
+    def log_message(self, *_):
+        pass
+
+
+HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PY
+
+  cat > "$WORKDIR/dedup_driver.py" <<'PY'
+# The dedup leg's driver: one process per OFF/ON leg of one payload, printing
+# its numbers as key=value lines that scenario_dedup_* appends to the result
+# file. The payload construction is the SAME pinned one the e2e group uses
+# (same vocabulary, same xorshift, same digests), and for the same reason:
+#
+# The first draft of the e2e fixtures built bodies by repeating one sentence,
+# and strictly periodic text walks the Gear hash through a handful of
+# distinct 12-byte windows -- the trigger never fires, every batch rides as
+# an unsaved TAIL, and the payload meant to prove dedup works proves nothing.
+# Real prompts have thousands of distinct windows; so does diverse word
+# text. The digests asserted below were computed by a Go program running this
+# exact construction, and the codec was probe-measured on those bytes (llm
+# payload: ~83% saved over 100 requests), so any drift fails here instead of
+# quietly benchmarking a different payload. (The vocabulary is 184 words: a
+# once-200-word list that lost sixteen to a transcription slip before the
+# constants were pinned; 184 is what the pins attest to.)
+import hashlib
+import http.client
+import gzip as gzip_mod
+import math
+import sys
+import time
+
+mode, host, port, n, result_path, prefix = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
+    sys.argv[5], sys.argv[6],
+)
+gzip_wanted = len(sys.argv) > 7 and sys.argv[7] == "gzip"
+
+VOCAB = (
+    "the of and a to in is you that it he was for on are as with his they at be this have from or one had by word but not what all were we when your can said there use an each which she do how their if will up other about out many then them these so some her would make like him into time has look two more write go see number no way could people my than first water been call who oil its now find long down day did get come made may part over new sound take only little work know place year live me back give most very after thing our just name good sentence man think say great where help through much before line right too mean old any same tell boy follow came want show also around form three small set put end does another well large must big even such because turn here why ask went light kind off need house picture try us again animal point mother world near build self earth father"
+).split()
+assert len(VOCAB) == 184
+MASK = (1 << 64) - 1
+
+
+class Xorshift:
+    def __init__(self, seed):
+        self.s = seed & MASK
+
+    def next(self):
+        self.s ^= (self.s << 13) & MASK
+        self.s ^= self.s >> 7
+        self.s ^= (self.s << 17) & MASK
+        return self.s
+
+
+def build_words(seed, n_words):
+    x = Xorshift(seed)
+    return "".join(VOCAB[x.next() % len(VOCAB)] + " " for _ in range(n_words)).encode()
+
+
+PROMPT = build_words(0xC0FFEE, 6800)
+SSE_STATIC = build_words(0x5EED, 1900)
+
+for name, blob, want_len, want_sha in (
+    ("prompt", PROMPT, 32715,
+     "23fddb87539329f58e564df10ded84f67f0d085db6c36f732980044187a767e8"),
+    ("sse-static", SSE_STATIC, 9128,
+     "2d8a90a5986d36b2ec88f63130c89e011cc21f8257ed73314c5c114767c22fa9"),
+):
+    got = hashlib.sha256(blob).hexdigest()
+    if len(blob) != want_len or got != want_sha:
+        sys.exit("%s payload drifted: len=%d sha=%s, wanted len=%d sha=%s"
+                 % (name, len(blob), got, want_len, want_sha))
+
+
+def llm_body(i):
+    head = ('{"ts":"2026-10-09T12:00:%02d.%03dZ","nonce":"%08x","model":"llama3.1:8b",'
+            '"stream":false,"messages":[{"role":"system","content":"'
+            % (i % 60, i, (i * 2654435761) & 0xFFFFFFFF))
+    suffix = ('turn %04d: summarize the context above in one sentence and end with the '
+              'unique tag zzz-%04d plus this padding phrase so the varying suffix stays '
+              'near two hundred bytes: %04d."}]}' % (i, i, i))
+    return (head + PROMPT.decode() + '"},{"role":"user","content":"' + suffix).encode()
+
+
+_l0 = llm_body(0)
+if len(_l0) != 33051 or hashlib.sha256(_l0).hexdigest() != (
+    "1dbdbb3d89ab7f892a38f41768124675eab34c4f03d28f66a8e7c22f18fc7cca"
+):
+    sys.exit("llm payload drifted: len=%d sha=%s" % (len(_l0), hashlib.sha256(_l0).hexdigest()))
+
+
+def sse_payload(count):
+    out = []
+    for i in range(count):
+        out.append(
+            (
+                'id: %04d\nevent: message\ndata: {"seq":%04d,"text":"' % (i, i)
+            ).encode()
+            + SSE_STATIC
+            + b'"}\n\n'
+        )
+    return b"".join(out)
+
+
+out = open(result_path, "a")
+
+
+def emit(key, val):
+    out.write("%s%s=%s\n" % (prefix, key, val))
+
+
+def p95(times):
+    ordered = sorted(times)
+    return ordered[max(0, math.ceil(0.95 * len(times)) - 1)]
+
+
+if mode == "llm":
+    # 100 POSTs over ONE keep-alive connection: the per-stream codec tables
+    # only pay off within a stream, so the payload must ride one.
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    times = []
+    for i in range(n):
+        payload = llm_body(i)
+        want = ("sha256:%s:%d" % (
+            hashlib.sha256(payload).hexdigest(), len(payload)
+        )).encode()
+        started = time.perf_counter()
+        conn.request("POST", "/echo", body=payload, headers={"Host": host})
+        resp = conn.getresponse()
+        answer = resp.read()
+        times.append(time.perf_counter() - started)
+        if resp.status != 200 or answer != want:
+            sys.exit("llm: request %d answered %d %r" % (i, resp.status, answer[:96]))
+    conn.close()
+    emit("rps", "%.1f" % (n / sum(times)))
+    emit("p95_ms", "%.2f" % (p95(times) * 1000))
+    emit("wall_s", "%.3f" % sum(times))
+    emit("n", n)
+    emit("bytes_each", len(llm_body(0)))
+
+elif mode == "sse":
+    # One GET, one response of n events -- the honest unit for a stream
+    # payload is events/s over the response, not requests/s.
+    expected = sse_payload(n)
+    headers = {"Host": host}
+    if gzip_wanted:
+        headers["Accept-Encoding"] = "gzip"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    started = time.perf_counter()
+    conn.request("GET", "/sse?events=%d" % n, headers=headers)
+    resp = conn.getresponse()
+    wire = resp.read()
+    wall = time.perf_counter() - started
+    conn.close()
+    body = wire
+    encoding = resp.getheader("Content-Encoding") or ""
+    if gzip_wanted:
+        if encoding != "gzip":
+            sys.exit("sse: asked for gzip, answered Content-Encoding=%r" % encoding)
+        body = gzip_mod.decompress(wire)
+    elif encoding:
+        sys.exit("sse: unanswered Content-Encoding=%r" % encoding)
+    if body != expected:
+        sys.exit("sse: body mismatch: got %d bytes, built %d" % (len(body), len(expected)))
+    emit("events_per_s", "%.1f" % (n / wall))
+    emit("mib_s", "%.2f" % (len(expected) / 1048576.0 / wall))
+    emit("events", n)
+    emit("plain_bytes", len(expected))
+    emit("wire_bytes", len(wire))
+    emit("gzip", 1 if gzip_wanted else 0)
+
+elif mode == "bulk":
+    # The control payload: n fresh-connection GETs of the random bulk, like
+    # scenario_bulk's runs. Size-validated per run; a short body is a failed
+    # run, never a fast one.
+    bulk_bytes = int(sys.argv[7])
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
+    rates = []
+    for i in range(n):
+        started = time.perf_counter()
+        conn.request("GET", "/bulk", headers={"Host": host})
+        resp = conn.getresponse()
+        data = resp.read()
+        rates.append(time.perf_counter() - started)
+        if resp.status != 200 or len(data) != bulk_bytes:
+            sys.exit("bulk: run %d answered %d with %d of %d bytes"
+                     % (i, resp.status, len(data), bulk_bytes))
+    conn.close()
+    mibs = sorted(bulk_bytes / 1048576.0 / t for t in rates)
+    emit("mib_s", "%.2f" % mibs[len(mibs) // 2])
+    emit("runs", ",".join("%.2f" % v for v in mibs))
+    emit("n", n)
+else:
+    sys.exit("dedup_driver: unknown mode %r" % mode)
+
+out.close()
+PY
+
+  cat > "$WORKDIR/dedup_close.py" <<'PY'
+# Parses the codec's per-stream close lines -- carrier_dedup: offered=X
+# framed=Y refs=Z -- out of one side's log, from a base offset the caller
+# took BEFORE the scenario ran (logs accumulate across scenarios; offsets
+# keep one scenario's numbers from reading another's streams). The ratio is
+# the honest measured quantity of the whole leg: it is a byte count, not a
+# timing measurement, so loopback noise cannot move it.
+import re
+import sys
+
+log_path, base, want, result_path, prefix, metric = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+    sys.argv[4], sys.argv[5], sys.argv[6],
+)
+# Optional exclusive end bound: the sse scenario parses its two ON legs (the
+# no-gzip connection and the gzip connection) SEPARATELY, so each needs a
+# half-open slice of the log rather than everything from base onward.
+#
+# base and end are ORDINALS OF CLOSE LINES -- the same unit dd_close_count's
+# `grep -c` produces -- NOT file line numbers. The first draft indexed file
+# lines and mixed the two units; it survived the llm scenario (whose slice
+# happened to start at file line 0) and died on the sse scenario, whose
+# streams close hundreds of file lines apart. Indexed by ordinal, a warmup
+# stream's close line before the offset is simply skipped.
+end = int(sys.argv[7]) if len(sys.argv) > 7 else None
+
+offered = framed = refs = lines = seen = 0
+with open(log_path, errors="replace") as fh:
+    for line in fh:
+        m = re.search(r"carrier_dedup: offered=(\d+) framed=(\d+) refs=(\d+)", line)
+        if not m:
+            continue
+        if seen < base or (end is not None and seen >= end):
+            seen += 1
+            continue
+        a, b, c = (int(x) for x in m.groups())
+        offered += a
+        framed += b
+        refs += c
+        lines += 1
+        seen += 1
+
+if lines < want:
+    sys.exit("%s: only %d of %d expected close lines from ordinal %d in %s"
+             % (prefix, lines, want, base, log_path))
+
+with open(result_path, "a") as out:
+    out.write("%soffered=%d\n" % (prefix, offered))
+    out.write("%sframed=%d\n" % (prefix, framed))
+    out.write("%srefs=%d\n" % (prefix, refs))
+    if metric == "saved":
+        # saved = 1 - framed/offered, the share of the wire the codec did
+        # not have to send; the kill criterion reads this on the llm
+        # payload's request direction.
+        pct = 100.0 * (1.0 - framed / offered) if offered else 0.0
+        out.write("%ssaved_pct=%.2f\n" % (prefix, pct))
+    elif metric == "overhead":
+        # the control's quantity: framing bytes ADDed to the wire when
+        # nothing can be referenced; the pre-registered bound is <= ~1%.
+        pct = 100.0 * (framed - offered) / offered if offered else 0.0
+        out.write("%soverhead_pct=%.3f\n" % (prefix, pct))
+    else:
+        sys.exit("dedup_close: unknown metric %r" % metric)
+PY
+}
+
 
 # --- scenarios ---------------------------------------------------------------
 
@@ -632,7 +1097,17 @@ PY
 start_stack() {
   local label="$1" dir="$2" port
 
-  for port in "$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_TUNNEL_PORT" "$BENCH_ADMIN_PORT"; do
+  local guard_ports=("$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_ADMIN_PORT")
+  # The tunnel port joins the guard only while the harness owns the dialed
+  # address. With BENCH_TUNNEL_BIND moved (the netem variant), a shaping
+  # relay is SUPPOSED to be listening on 127.0.0.1:<tunnel port> before the
+  # stack starts -- skipping the check is the point, not a hole: ngrokd's
+  # real bind on $BENCH_TUNNEL_BIND is still guarded transitively, because
+  # if something squats there the client's carrier simply never establishes.
+  if [[ "$BENCH_TUNNEL_BIND" == "127.0.0.1" ]]; then
+    guard_ports+=("$BENCH_TUNNEL_PORT")
+  fi
+  for port in "${guard_ports[@]}"; do
     if port_in_use "$port"; then
       die "port $port is already in use -- a previous bench run (or another service) still holds it; this harness owns 19101/18180/18480/15443/19190"
     fi
@@ -654,7 +1129,7 @@ start_stack() {
     -domain=localhost \
     -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
     -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
-    -tunnelAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
+    -tunnelAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
     -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
     > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
   NGROKD_PID=$!
@@ -763,7 +1238,17 @@ start_stack_quic() {
 
   # Same ownership check as start_stack: this harness owns these ports, and
   # anything already holding one belongs to a stale run.
-  for port in "$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_TUNNEL_PORT" "$BENCH_ADMIN_PORT"; do
+  local guard_ports=("$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_ADMIN_PORT")
+  # The tunnel port joins the guard only while the harness owns the dialed
+  # address. With BENCH_TUNNEL_BIND moved (the netem variant), a shaping
+  # relay is SUPPOSED to be listening on 127.0.0.1:<tunnel port> before the
+  # stack starts -- skipping the check is the point, not a hole: ngrokd's
+  # real bind on $BENCH_TUNNEL_BIND is still guarded transitively, because
+  # if something squats there the client's carrier simply never establishes.
+  if [[ "$BENCH_TUNNEL_BIND" == "127.0.0.1" ]]; then
+    guard_ports+=("$BENCH_TUNNEL_PORT")
+  fi
+  for port in "${guard_ports[@]}"; do
     if port_in_use "$port"; then
       die "port $port is already in use before the QUIC variant of '$label' -- stop_stack did not release it"
     fi
@@ -783,9 +1268,9 @@ start_stack_quic() {
     -domain=localhost \
     -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
     -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
-    -tunnelAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
+    -tunnelAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
     -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
-    -quicAddr="127.0.0.1:$BENCH_TUNNEL_PORT" \
+    -quicAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
     > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
   NGROKD_PID=$!
   PIDS+=("$NGROKD_PID")
@@ -850,6 +1335,385 @@ warmup_quic() {
     || die "warmup request through variant '$label' (quic) failed"
 }
 
+# --- dedup leg lifecycle ------------------------------------------------------
+#
+# Two client processes on one ngrokd, because the proposal is client-granular
+# (see the header): the plain client's streams are the OFF side, the
+# carrier_dedup client's are the ON side. The close-line offsets are taken
+# BEFORE each measured run because the logs accumulate across scenarios --
+# the same discipline the e2e group uses, and for the same reason.
+
+DD_PLAIN_PID=""
+DD_CLIENT_PID=""
+DD_NGROKD_PID=""
+
+dd_wait_tunnel() {  # <log> <label>
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Tunnel established" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  log "tunnel did not establish for $label"
+  dump_logs "$label"
+  return 1
+}
+
+# dd_wait_carrier <log> <carrier> <label>: the honesty gate, same reasoning
+# as wait_for_quic_carrier but per-client-log and carrier-parameterized: a
+# pinned transport that silently degraded would put the wrong carrier's
+# numbers under this leg's keys.
+dd_wait_carrier() {
+  local log="$1" carrier="$2" label="$3" i
+  for i in $(seq 1 40); do
+    if grep -q "($carrier carrier)" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  log "the client never established a $carrier carrier for $label -- refusing to report"
+  dump_logs "$label"
+  return 1
+}
+
+# dd_wait_public <host> <label>: first non-404 on the http listener for this
+# hostname (404 is ngrokd's answer for an unknown tunnel AND a still-catching-
+# up registry, so neither can end the wait -- wait_for_public's reasoning,
+# with the hostname as a parameter because this leg has two).
+dd_wait_public() {
+  local host="$1" label="$2" code i
+  for i in $(seq 1 40); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $host" "$BASE_URL/" 2>/dev/null || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  log "the public listener never learned $host for $label"
+  dump_logs "$label"
+  return 1
+}
+
+dd_close_count() {  # <log> -> close lines so far (0 when none)
+  grep -c 'carrier_dedup: offered=' "$1" 2>/dev/null || true
+}
+
+# dd_wait_close_lines <log> <base> <want> <label>: close lines land at stream
+# teardown, which can lag the driver's exit by a beat -- bounded retry on a
+# count, never a bare sleep.
+dd_wait_close_lines() {
+  local log="$1" base="$2" want="$3" label="$4" i
+  for i in $(seq 1 40); do
+    if [[ "$(($(dd_close_count "$log") - base))" -ge "$want" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  log "$label: only $(($(dd_close_count "$log") - base)) of $want close lines in $log"
+  dump_logs "$label"
+  return 1
+}
+
+start_stack_dedup() {
+  local label="$1" dir="$2" carrier="$3" port
+
+  local guard_ports=("$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_ADMIN_PORT")
+  # The tunnel port joins the guard only while the harness owns the dialed
+  # address. With BENCH_TUNNEL_BIND moved (the netem variant), a shaping
+  # relay is SUPPOSED to be listening on 127.0.0.1:<tunnel port> before the
+  # stack starts -- skipping the check is the point, not a hole: ngrokd's
+  # real bind on $BENCH_TUNNEL_BIND is still guarded transitively, because
+  # if something squats there the client's carrier simply never establishes.
+  if [[ "$BENCH_TUNNEL_BIND" == "127.0.0.1" ]]; then
+    guard_ports+=("$BENCH_TUNNEL_PORT")
+  fi
+  for port in "${guard_ports[@]}"; do
+    if port_in_use "$port"; then
+      die "port $port is already in use before the dedup ($carrier) stack of '$label' -- a previous leg did not release it"
+    fi
+  done
+
+  rm -f /tmp/ngrok-bench-"$label"-*.log
+
+  python3 "$WORKDIR/dedup_upstream.py" "$BENCH_UPSTREAM_PORT" "$BULK_BYTES" \
+    > "/tmp/ngrok-bench-$label-upstream.log" 2>&1 &
+  UPSTREAM_PID=$!
+  PIDS+=("$UPSTREAM_PID")
+
+  if [[ "$carrier" == "quic" ]]; then
+    "$dir/ngrokd" \
+      -domain=localhost \
+      -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
+      -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
+      -tunnelAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
+      -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
+      -quicAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
+      > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
+  else
+    # No -quicAddr on the smux leg: with no QUIC listener advertised, auto
+    # transport cannot drift onto QUIC -- the smux gate below only has to
+    # catch a client-side surprise, not a server-side one.
+    "$dir/ngrokd" \
+      -domain=localhost \
+      -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
+      -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
+      -tunnelAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
+      -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
+      > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
+  fi
+  DD_NGROKD_PID=$!
+  PIDS+=("$DD_NGROKD_PID")
+
+  if [[ "$carrier" == "quic" ]]; then
+    local i
+    for i in $(seq 1 40); do
+      if grep -q "Listening for QUIC proxy sessions" "/tmp/ngrok-bench-$label-ngrokd.log" 2>/dev/null; then
+        break
+      fi
+      sleep 0.25
+    done
+    if ! grep -q "Listening for QUIC proxy sessions" "/tmp/ngrok-bench-$label-ngrokd.log" 2>/dev/null; then
+      dump_logs "$label"
+      die "the QUIC listener never came up for the dedup leg of '$label'"
+    fi
+  else
+    sleep 1
+  fi
+
+  # The OFF client: the plain bench tunnel, no dedup key anywhere in the
+  # config -- its streams never propose, which is what makes it a control.
+  # The ON client: one tunnel, same upstream, carrier_dedup: true. On the
+  # QUIC carrier both clients pin proxy_transport for the same reason the
+  # QUIC leg pins it (auto would likely pick QUIC; a pin cannot drift).
+  local transport_yaml=""
+  if [[ "$carrier" == "quic" ]]; then
+    transport_yaml=$'proxy_transport: quic\n'
+  fi
+
+  cat > "$WORKDIR/ngrok-dd-plain-$label.yml" <<YAML
+server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
+trust_host_root_certs: true
+${transport_yaml}tunnels:
+  bench:
+    hostname: $BENCH_HOST
+    proto:
+      http: $BENCH_UPSTREAM_PORT
+YAML
+
+  cat > "$WORKDIR/ngrok-dd-$label.yml" <<YAML
+server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
+trust_host_root_certs: true
+${transport_yaml}tunnels:
+  bench-dd:
+    hostname: $DEDUP_DD_HOST
+    proto:
+      http: $BENCH_UPSTREAM_PORT
+    carrier_dedup: true
+YAML
+
+  "$dir/ngrok" -config="$WORKDIR/ngrok-dd-plain-$label.yml" \
+    -log="/tmp/ngrok-bench-$label-client-plain.log" start bench \
+    > "/tmp/ngrok-bench-$label-client-plain-stdout.log" 2>&1 &
+  DD_PLAIN_PID=$!
+  PIDS+=("$DD_PLAIN_PID")
+
+  "$dir/ngrok" -config="$WORKDIR/ngrok-dd-$label.yml" \
+    -log="/tmp/ngrok-bench-$label-client-dd.log" start bench-dd \
+    > "/tmp/ngrok-bench-$label-client-dd-stdout.log" 2>&1 &
+  DD_CLIENT_PID=$!
+  PIDS+=("$DD_CLIENT_PID")
+}
+
+# stop_stack_dedup <label> <pfx>: captures the CPU clocks FIRST (the rows the
+# report carries), then tears down clients -> registry -> server, the same
+# order stop_stack uses. The readable CPU delta is plain vs dd client (same
+# traffic shape, one running the codec); the ngrokd figure mixes both
+# clients' traffic in one process and cannot be attributed -- reported
+# as-is (header note).
+stop_stack_dedup() {
+  local label="$1" pfx="$2" code code2 cpu i
+  # CPU via ps(1) when the box has one. The bench container VM ships no
+  # procps, and a failed substitution here kills the whole run SILENTLY
+  # (exit 127; neither set -e's death nor the ERR trap prints anything --
+  # verified on the VM with a minimal repro), so a missing ps must degrade
+  # to an explicit "unavailable" row, never to a dead harness.
+  if command -v ps >/dev/null 2>&1; then
+    {
+      cpu="$(ps -o cputime= -p "$DD_NGROKD_PID" 2>/dev/null | tr -d ' ')"
+      echo "${pfx}cpu_ngrokd=${cpu:-unknown}"
+      cpu="$(ps -o cputime= -p "$DD_PLAIN_PID" 2>/dev/null | tr -d ' ')"
+      echo "${pfx}cpu_plain_client=${cpu:-unknown}"
+      cpu="$(ps -o cputime= -p "$DD_CLIENT_PID" 2>/dev/null | tr -d ' ')"
+      echo "${pfx}cpu_dd_client=${cpu:-unknown}"
+    } >> "$WORKDIR/result-${VARIANT_LABEL}.env"
+  else
+    {
+      echo "${pfx}cpu_ngrokd=unavailable-no-ps"
+      echo "${pfx}cpu_plain_client=unavailable-no-ps"
+      echo "${pfx}cpu_dd_client=unavailable-no-ps"
+    } >> "$WORKDIR/result-${VARIANT_LABEL}.env"
+  fi
+
+  kill "$DD_CLIENT_PID" "$DD_PLAIN_PID" 2>/dev/null || true
+  wait "$DD_CLIENT_PID" "$DD_PLAIN_PID" 2>/dev/null || true
+  for i in $(seq 1 40); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $BENCH_HOST" "$BASE_URL/" 2>/dev/null || true)"
+    code2="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $DEDUP_DD_HOST" "$BASE_URL/" 2>/dev/null || true)"
+    if [[ "$code" == "404" && "$code2" == "404" ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  kill "$DD_NGROKD_PID" "$UPSTREAM_PID" 2>/dev/null || true
+  wait "$DD_NGROKD_PID" "$UPSTREAM_PID" 2>/dev/null || true
+  DD_CLIENT_PID=""
+  DD_PLAIN_PID=""
+  DD_NGROKD_PID=""
+  UPSTREAM_PID=""
+
+  sleep 0.5
+}
+
+# --- dedup scenarios -----------------------------------------------------------
+#
+# Each runs the OFF leg first (plain client), then the ON leg (dedup client),
+# then parses the close lines the ON side's streams wrote. The offsets are
+# taken before anything runs so one scenario can never read another's streams.
+
+scenario_dedup_llm() {  # <leg-label> <pfx>
+  local leg="$1" pfx="$2" base_s base_c
+  base_s="$(dd_close_count "/tmp/ngrok-bench-$leg-ngrokd.log")"
+  base_c="$(dd_close_count "/tmp/ngrok-bench-$leg-client-dd.log")"
+
+  python3 "$WORKDIR/dedup_driver.py" llm "$BENCH_HOST" "$BENCH_HTTP_PORT" \
+    "$DEDUP_LLM_REQUESTS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}llm_off_"
+  python3 "$WORKDIR/dedup_driver.py" llm "$DEDUP_DD_HOST" "$BENCH_HTTP_PORT" \
+    "$DEDUP_LLM_REQUESTS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}llm_on_"
+
+  # One keep-alive connection per leg -> one proxy stream -> one close line
+  # per direction: server log = request direction (the kill criterion's
+  # home), client log = response direction.
+  dd_wait_close_lines "/tmp/ngrok-bench-$leg-ngrokd.log" "$base_s" 1 "dedup-llm (server)"
+  dd_wait_close_lines "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 1 "dedup-llm (client)"
+  python3 "$WORKDIR/dedup_close.py" "/tmp/ngrok-bench-$leg-ngrokd.log" "$base_s" 1 \
+    "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}llm_" saved
+  python3 "$WORKDIR/dedup_close.py" "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 1 \
+    "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}llm_resp_" saved
+}
+
+scenario_dedup_sse() {  # <leg-label> <pfx>
+  local leg="$1" pfx="$2" base_c
+  # Only the response direction carries this payload (the requests are tiny
+  # GETs), so only the CLIENT log's close lines are parsed here.
+  base_c="$(dd_close_count "/tmp/ngrok-bench-$leg-client-dd.log")"
+
+  python3 "$WORKDIR/dedup_driver.py" sse "$BENCH_HOST" "$BENCH_HTTP_PORT" \
+    "$DEDUP_SSE_EVENTS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}sse_off_"
+  python3 "$WORKDIR/dedup_driver.py" sse "$DEDUP_DD_HOST" "$BENCH_HTTP_PORT" \
+    "$DEDUP_SSE_EVENTS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}sse_on_"
+  python3 "$WORKDIR/dedup_driver.py" sse "$DEDUP_DD_HOST" "$BENCH_HTTP_PORT" \
+    "$DEDUP_SSE_EVENTS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}sse_gzip_" gzip
+
+  # The two ON legs rode separate connections, so their close lines are
+  # separate: [base, base+1) is the no-gzip stream, [base+1, base+2) the
+  # gzip one -- the end bound keeps the gzip stream's numbers out of the
+  # no-gzip ratio, which matters because they are the two halves of the
+  # comparison (win, then the win's boundary).
+  dd_wait_close_lines "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 2 "dedup-sse (client)"
+  python3 "$WORKDIR/dedup_close.py" "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 1 \
+    "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}sse_resp_" saved "$((base_c + 1))"
+  python3 "$WORKDIR/dedup_close.py" "/tmp/ngrok-bench-$leg-client-dd.log" "$((base_c + 1))" 1 \
+    "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}sse_gzip_resp_" saved
+}
+
+scenario_dedup_bulk() {  # <leg-label> <pfx>
+  local leg="$1" pfx="$2" base_c
+  # The 64 MiB payload is the RESPONSE direction (upstream -> visitor), which
+  # the CLIENT encodes onto the carrier -- so the control's close lines live
+  # in the dd CLIENT log, not the server's. (The first run parsed the server
+  # log and got 4.6% "overhead": that was the framing on the ~70-byte GET
+  # requests, where a 3-byte frame header is not small -- a direction error,
+  # not a codec one.)
+  base_c="$(dd_close_count "/tmp/ngrok-bench-$leg-client-dd.log")"
+
+  python3 "$WORKDIR/dedup_driver.py" bulk "$BENCH_HOST" "$BENCH_HTTP_PORT" \
+    "$BULK_RUNS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}bulk_off_" "$BULK_BYTES"
+  python3 "$WORKDIR/dedup_driver.py" bulk "$DEDUP_DD_HOST" "$BENCH_HTTP_PORT" \
+    "$BULK_RUNS" "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}bulk_on_" "$BULK_BYTES"
+
+  # The ON driver's three GETs ride ONE connection, so one close line; the
+  # control's number is the ratio over that stream: random bytes never
+  # reference anything, so framed-offered is pure framing overhead.
+  dd_wait_close_lines "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 1 "dedup-bulk (client)"
+  python3 "$WORKDIR/dedup_close.py" "/tmp/ngrok-bench-$leg-client-dd.log" "$base_c" 1 \
+    "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}bulk_" overhead
+}
+
+run_variant_dedup() {  # <variant-label> <dir> <carrier>
+  local label="$1" dir="$2" carrier="$3"
+  local dlog pfx
+  if [[ "$carrier" == "quic" ]]; then
+    dlog="$label-ddq"
+    pfx="quic_dedup_"
+  else
+    dlog="$label-dd"
+    pfx="dedup_"
+  fi
+  CURRENT_LABEL="$dlog"
+  VARIANT_LABEL="$label"
+  log "=== variant '$dlog': $dir (dedup payloads, $carrier carrier) ==="
+
+  start_stack_dedup "$dlog" "$dir" "$carrier"
+  dd_wait_tunnel "/tmp/ngrok-bench-$dlog-client-plain.log" "$dlog (plain client)"
+  dd_wait_tunnel "/tmp/ngrok-bench-$dlog-client-dd.log" "$dlog (dedup client)"
+  if [[ "$carrier" == "quic" ]]; then
+    dd_wait_carrier "/tmp/ngrok-bench-$dlog-client-plain.log" quic "$dlog (plain client)"
+    dd_wait_carrier "/tmp/ngrok-bench-$dlog-client-dd.log" quic "$dlog (dedup client)"
+  else
+    dd_wait_carrier "/tmp/ngrok-bench-$dlog-client-dd.log" smux "$dlog (dedup client)"
+  fi
+  dd_wait_public "$BENCH_HOST" "$dlog (plain)"
+  dd_wait_public "$DEDUP_DD_HOST" "$dlog (dedup)"
+
+  # Warmups on BOTH tunnels (same one-time-cost rule as warmup(); on the ON
+  # side this also pays the codec's one-time negotiation, not the per-stream
+  # table fill -- tables are per stream, so each measured connection fills
+  # its own, and that cost is inside the ON numbers by design).
+  curl -sS --max-time 60 -o /dev/null -H "Host: $BENCH_HOST" "$BASE_URL/small" \
+    || die "warmup through variant '$dlog' failed (plain)"
+  curl -sS --max-time 60 -o /dev/null -H "Host: $DEDUP_DD_HOST" "$BASE_URL/small" \
+    || die "warmup through variant '$dlog' failed (dedup)"
+
+  # The warmups' OWN streams must tear down before the scenarios take their
+  # close-line offsets, or a late warmup line would land inside the first
+  # scenario's slice. (The first live run proved these lines exist: the dd
+  # warmup's response direction wrote offered=145 on its own stream.)
+  dd_wait_close_lines "/tmp/ngrok-bench-$dlog-ngrokd.log" 0 1 "$dlog warmup (server)"
+  dd_wait_close_lines "/tmp/ngrok-bench-$dlog-client-dd.log" 0 1 "$dlog warmup (client)"
+
+  local want
+  for want in ${BENCH_SCENARIOS:-dedup-llm dedup-sse dedup-bulk}; do
+    case "$want" in
+      dedup-llm)
+        log "dedup-llm ($carrier): $DEDUP_LLM_REQUESTS POSTs x {plain, carrier_dedup}, one conn each"
+        scenario_dedup_llm "$dlog" "$pfx" ;;
+      dedup-sse)
+        log "dedup-sse ($carrier): $DEDUP_SSE_EVENTS events x {plain, dedup, dedup+gzip}"
+        scenario_dedup_sse "$dlog" "$pfx" ;;
+      dedup-bulk)
+        log "dedup-bulk ($carrier): $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs x {plain, dedup}"
+        scenario_dedup_bulk "$dlog" "$pfx" ;;
+      *) ;; # not a dedup-leg scenario; the other legs own it
+    esac
+  done
+
+  stop_stack_dedup "$dlog" "$pfx"
+  log "variant '$dlog' done (logs: /tmp/ngrok-bench-$dlog-*.log)"
+}
+
+
 run_variant() {
   local label="$1" dir="$2"
   CURRENT_LABEL="$label"
@@ -866,12 +1730,13 @@ run_variant() {
   wait_for_public_tls "$label" "$BENCH_TLS_ZK_HOST" "$WORKDIR/bench-ca.crt"
   warmup "$label"
 
-  # BENCH_SCENARIOS selects a subset (default: all four) so a focused run --
+  # BENCH_SCENARIOS selects a subset (default: everything) so a focused run --
   # e.g. BENCH_SCENARIOS="bulk conn-rate keep-alive" for a QUIC-parity
-  # question -- fits a coffee break instead of the full suite's half hour.
-  # Unselected scenarios simply emit no keys; the report renders them n/a.
+  # question, or BENCH_SCENARIOS="dedup-llm" for a codec question -- fits a
+  # coffee break instead of the full suite's half hour. Each leg runs the
+  # scenarios it owns and skips the others'; an unknown name still exits 2.
   local want
-  for want in ${BENCH_SCENARIOS:-bulk conn-rate keep-alive tls-conn-rate}; do
+  for want in ${BENCH_SCENARIOS:-bulk conn-rate keep-alive tls-conn-rate dedup-llm dedup-sse dedup-bulk}; do
     case "$want" in
       bulk)
         log "bulk: $((BULK_BYTES / 1024 / 1024)) MiB x $BULK_RUNS runs"
@@ -885,8 +1750,9 @@ run_variant() {
       tls-conn-rate)
         log "tls-conn-rate: $TLS_REQUESTS requests x {edge, agent-terminated} over https"
         scenario_tls_conn_rate "$label" ;;
+      dedup-llm|dedup-sse|dedup-bulk) ;; # owned by the dedup legs, below
       *)
-        echo "unknown scenario '$want' (bulk | conn-rate | keep-alive | tls-conn-rate)" >&2
+        echo "unknown scenario '$want' (bulk | conn-rate | keep-alive | tls-conn-rate | dedup-llm | dedup-sse | dedup-bulk)" >&2
         exit 2 ;;
     esac
   done
@@ -898,7 +1764,11 @@ run_variant() {
   # both single and compare modes without a second pass. The legs run one
   # after the other because they need the same ports -- which puts them under
   # the same mid-run-drift caveat the header documents for the two-dir form.
+  # The dedup legs follow (spec 6: the payloads run on/off x smux/QUIC), the
+  # same ports again, for the same reason.
   run_variant_quic "$label" "$dir"
+  run_variant_dedup "$label" "$dir" smux
+  run_variant_dedup "$label" "$dir" quic
 
   log "variant '$label' done (logs: /tmp/ngrok-bench-$label-*.log)"
 }
@@ -920,7 +1790,8 @@ run_variant_quic() {
 
   # The QUIC leg honors the same BENCH_SCENARIOS selection (minus
   # tls-conn-rate, which the quic leg has never run -- its TLS endpoints
-  # ride the smux-carried stack by design; see the header note).
+  # ride the smux-carried stack by design, and the dedup- scenarios, which
+  # the dedup legs own; see the header note).
   local want
   for want in ${BENCH_SCENARIOS:-bulk conn-rate keep-alive}; do
     case "$want" in
@@ -933,7 +1804,7 @@ run_variant_quic() {
       keep-alive)
         log "quic keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
         scenario_keepalive "$label" "quic_" ;;
-      tls-conn-rate) ;; # not a quic-leg scenario; skipped by design
+      tls-conn-rate|dedup-llm|dedup-sse|dedup-bulk) ;; # owned by other legs
       *)
         echo "unknown scenario '$want'" >&2
         exit 2 ;;
@@ -954,6 +1825,7 @@ write_params() {
     echo "public_port=$BENCH_HTTP_PORT"
     echo "https_port=$BENCH_HTTPS_PORT"
     echo "tunnel_port=$BENCH_TUNNEL_PORT"
+    echo "tunnel_bind=$BENCH_TUNNEL_BIND"
     echo "upstream_port=$BENCH_UPSTREAM_PORT"
     echo "admin_port=$BENCH_ADMIN_PORT"
     echo "bulk_bytes=$BULK_BYTES"
@@ -967,6 +1839,12 @@ write_params() {
     # tunnel port (UDP beside TCP), and the client pins the carrier.
     echo "quic_addr_port=$BENCH_TUNNEL_PORT"
     echo "quic_client_proxy_transport=quic"
+    # The dedup legs' wiring: plain and carrier_dedup clients on one ngrokd,
+    # payload sizes matching the e2e group's pinned fixtures.
+    echo "dedup_plain_host=$BENCH_HOST"
+    echo "dedup_dd_host=$DEDUP_DD_HOST"
+    echo "dedup_llm_requests=$DEDUP_LLM_REQUESTS"
+    echo "dedup_sse_events=$DEDUP_SSE_EVENTS"
     if [[ "$mode" == "compare" ]]; then
       echo "baseline_dir=$first"
       echo "current_dir=$second"
@@ -1016,6 +1894,52 @@ ROWS = [
     ("quic conn-rate p95 ms (lower is better)", "quic_p95_ms", "%.2f"),
     ("quic keep-alive req/s (1000, one curl)", "quic_keepalive_rps", "%.1f"),
     ("NOTE quic rows: loopback has no packet loss, so QUIC's head-of-line-blocking win cannot show here -- these numbers establish parity with the smux rows, not superiority", "quic_caveat_row_marker", "%s"),
+    # The dedup rows (SPEC-CLUSTER21). The saved%/overhead% rows are codec
+    # close-line ratios -- exact byte counts, not timings, so loopback noise
+    # cannot move them; that is why the leg's claims live there. The req/s
+    # and p95 rows beside them are loopback timings and carry the standing
+    # admission: no bandwidth constraint means the win cannot show as wall
+    # time (the netem variant's job), and the codec's work on the hot path
+    # is expected to cost a little p95 -- "neutral-to-slightly-worse" is the
+    # pre-registered expectation, not a surprise to explain away.
+    ("dedup llm OFF req/s (plain client, 100 POSTs, one conn)", "dedup_llm_off_rps", "%.1f"),
+    ("dedup llm ON req/s (carrier_dedup client)", "dedup_llm_on_rps", "%.1f"),
+    ("dedup llm p95 ms OFF (lower is better)", "dedup_llm_off_p95_ms", "%.2f"),
+    ("dedup llm p95 ms ON (lower is better)", "dedup_llm_on_p95_ms", "%.2f"),
+    ("dedup llm saved % REQUESTS (server close lines; kill line >= 50)", "dedup_llm_saved_pct", "%.1f"),
+    ("dedup llm saved % responses (client close lines)", "dedup_llm_resp_saved_pct", "%.1f"),
+    ("dedup sse OFF events/s (plain, 200 events, one response)", "dedup_sse_off_events_per_s", "%.1f"),
+    ("dedup sse ON events/s (no gzip)", "dedup_sse_on_events_per_s", "%.1f"),
+    ("dedup sse ON events/s (Accept-Encoding: gzip)", "dedup_sse_gzip_events_per_s", "%.1f"),
+    ("dedup sse saved % responses, no gzip (client close lines)", "dedup_sse_resp_saved_pct", "%.1f"),
+    ("dedup sse saved % responses, gzip (the win's boundary; ~0 expected)", "dedup_sse_gzip_resp_saved_pct", "%.1f"),
+    ("dedup bulk control OFF MiB/s (median of 3)", "dedup_bulk_off_mib_s", "%.1f"),
+    ("dedup bulk control ON MiB/s (median of 3)", "dedup_bulk_on_mib_s", "%.1f"),
+    ("dedup bulk control overhead % (close-line framing; <= ~1 expected)", "dedup_bulk_overhead_pct", "%.3f"),
+    ("dedup CPU ngrokd (both clients' traffic; not attributable)", "dedup_cpu_ngrokd", "%s"),
+    ("dedup CPU plain client", "dedup_cpu_plain_client", "%s"),
+    ("dedup CPU dedup client (the codec's bill)", "dedup_cpu_dd_client", "%s"),
+    ("NOTE dedup rows: saved%/overhead% are exact byte ratios from the codec's close lines; the req/s, p95 and MiB/s rows are loopback timings (no bandwidth constraint, so the byte win cannot show as wall time -- the netem variant's job)", "dedup_caveat_row_marker", "%s"),
+    # The dedup payloads re-run over the QUIC carrier (spec 6: on/off x
+    # smux/QUIC), gated on the QUIC carrier line like the quic leg above.
+    ("quic dedup llm OFF req/s (plain client)", "quic_dedup_llm_off_rps", "%.1f"),
+    ("quic dedup llm ON req/s (carrier_dedup client)", "quic_dedup_llm_on_rps", "%.1f"),
+    ("quic dedup llm p95 ms OFF (lower is better)", "quic_dedup_llm_off_p95_ms", "%.2f"),
+    ("quic dedup llm p95 ms ON (lower is better)", "quic_dedup_llm_on_p95_ms", "%.2f"),
+    ("quic dedup llm saved % REQUESTS (kill line >= 50)", "quic_dedup_llm_saved_pct", "%.1f"),
+    ("quic dedup llm saved % responses", "quic_dedup_llm_resp_saved_pct", "%.1f"),
+    ("quic dedup sse OFF events/s", "quic_dedup_sse_off_events_per_s", "%.1f"),
+    ("quic dedup sse ON events/s (no gzip)", "quic_dedup_sse_on_events_per_s", "%.1f"),
+    ("quic dedup sse ON events/s (gzip)", "quic_dedup_sse_gzip_events_per_s", "%.1f"),
+    ("quic dedup sse saved % responses, no gzip", "quic_dedup_sse_resp_saved_pct", "%.1f"),
+    ("quic dedup sse saved % responses, gzip", "quic_dedup_sse_gzip_resp_saved_pct", "%.1f"),
+    ("quic dedup bulk control OFF MiB/s (median of 3)", "quic_dedup_bulk_off_mib_s", "%.1f"),
+    ("quic dedup bulk control ON MiB/s (median of 3)", "quic_dedup_bulk_on_mib_s", "%.1f"),
+    ("quic dedup bulk control overhead % (<= ~1 expected)", "quic_dedup_bulk_overhead_pct", "%.3f"),
+    ("quic dedup CPU ngrokd (mixed traffic)", "quic_dedup_cpu_ngrokd", "%s"),
+    ("quic dedup CPU plain client", "quic_dedup_cpu_plain_client", "%s"),
+    ("quic dedup CPU dedup client", "quic_dedup_cpu_dd_client", "%s"),
+    ("NOTE quic dedup rows: the dedup rows' caveat plus the quic rows' no-loss caveat both apply", "quic_dedup_caveat_row_marker", "%s"),
 ]
 
 
@@ -1067,7 +1991,7 @@ print(
     )
 )
 print(
-    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}; QUIC leg re-runs bulk/conn-rate/keep-alive with server -quicAddr + client proxy_transport=quic"
+    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}; QUIC leg re-runs bulk/conn-rate/keep-alive with server -quicAddr + client proxy_transport=quic; dedup legs (smux + QUIC) run llm/sse/control payloads through a plain client and a carrier_dedup client on one ngrokd"
     % (
         int(params.get("bulk_bytes", 0)) // 1024 // 1024,
         params.get("bulk_runs", "?"),
@@ -1142,12 +2066,14 @@ main() {
       go build -tags debug -o "$build_dir/ngrok" ./main/ngrok
       go build -tags debug -o "$build_dir/ngrokd" ./main/ngrokd
       write_fixtures
+      write_dedup_fixtures
       write_params "single" "$build_dir" ""
       run_variant "single" "$build_dir"
       emit_report "single" "$WORKDIR/params.env" "single=$WORKDIR/result-single.env"
       ;;
     2)
       write_fixtures
+      write_dedup_fixtures
       write_params "compare" "$1" "$2"
       run_variant "baseline" "$1"
       run_variant "current" "$2"

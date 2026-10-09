@@ -1,6 +1,6 @@
 # SPEC-CLUSTER21 — carrier_dedup: per-stream content-defined chunk dedup on the agent↔server carrier
 
-Status: draft (target v1.0.21)
+Status: shipped (v1.0.21)
 
 Every proxied connection crosses three legs: visitor↔ngrokd, ngrokd↔agent
 (the carrier), agent↔local service. Only the carrier has our binary on both
@@ -61,11 +61,17 @@ connection the visitor retries, not silently corrupted bytes.
   the win. Dedup is not a gzip replacement; the two are orthogonal
   (gzip: response bodies, visitor-negotiated; dedup: carrier bytes,
   operator-configured).
-- **UDP tunnels, agent-terminated tunnels.** UDP proxy streams carry
-  length-framed datagrams a byte-stream codec would corrupt;
-  agent-terminated tunnels carry TLS ciphertext (fresh AEAD nonces — zero
-  repeats, pure overhead). Both combinations are refused at config load,
-  loudly, naming the tunnel.
+- **UDP tunnels, agent-terminated tunnels.** UDP is excluded for two
+  honest reasons: the flow path's StartProxy carries no ack (§3), so a
+  udp leg's codec would never engage — the key would be silently
+  un-honored on that leg, and a mixed tunnel cannot exempt one leg when
+  the proposal is per client — and a length-framed datagram stream is not
+  the repeated-large-payload shape the feature exists for (datagrams are
+  small, often below the codec's 512-byte minimum chunk). The codec is
+  byte-transparent, so the combination is not corrupt, merely worthless;
+  the refusal names the real reasons. Agent-terminated tunnels carry TLS
+  ciphertext (fresh AEAD nonces — zero repeats, pure overhead). Both
+  combinations are refused at config load, loudly, naming the tunnel.
 - **Visitor-leg or local-leg dedup.** A filter there has a non-ours
   endpoint and kills splice on raw tcp tunnels. Disqualified by
   construction, not by effort.
@@ -270,9 +276,29 @@ against A's landed API + §1's field names; D last. No lane touches
    spellings (udp any, agent_tls_termination).
 5. **Additivity outside the design**: `git diff --stat v1.0.20..` touches
    no Go file outside `dedup/`, `client/model.go`, `client/config*.go`,
+   `client/carrier_dedup_test.go` (lane B's new test file, a disclosed
+   lane deviation — model-path tests do not belong in config_test.go),
    `server/mux.go`, `server/tunnel.go`, `server/cli.go`,
-   `server/config.go`, `msg/` (the two additive fields only),
-   `version/version.go`.
+   `server/config.go`, `server/carrier_dedup_test.go` and
+   `msg/dedup_test.go` (the lanes' new test files, same reasoning),
+   `server/admin_api.go` (one `configTunnelSchema` row for the new client
+   key — the cluster-19 reflection pin fails the build without a row, and
+   the workbench schema is the one surface a new config key owes a row to;
+   architect-wired at review as the cross-lane seam, neither lane owning
+   the file — named here so the gate stays checkable against the real
+   diff, the fb697c3 precedent),
+   `log/logger.go` and `log/logger_test.go` (a fix for a pre-existing
+   data race this cluster's test work surfaced — PrefixLogger's prefix
+   string, read on every log line and mutated by the SetType rename pair,
+   was unsynchronized; the fix guards it with a mutex and routes both
+   read sites through a snapshot accessor, and lands as its own commit
+   ahead of the release — disclosed here for the same reason as the
+   admin_api row above: the gate stays checkable against the real diff.
+   Within `log/logger.go` the diff is the mutex, the snapshot accessor,
+   and the struct comment stating the rejected alternatives — rootMu,
+   atomic.Value, RWMutex — and why),
+   `version/version.go`. Within `msg/msg.go` the diff is the two additive
+   fields and their doc comments only.
 6. **Full gates**: vet/test/-race on dedup, client, server; full e2e
    green incl. the new group; bench matrix run with expectations
    checked; `msg/` diff is exactly the two fields.

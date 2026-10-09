@@ -1,4 +1,166 @@
 # Changelog
+## 1.0.21 - 2026-10-09 - carrier_dedup: per-stream content-defined chunk dedup on the agent↔server carrier
+
+This release ships the first feature that changes what the carrier
+*carries* rather than how the tunnel is built, and it ships as what it is:
+an experiment with a pre-registered kill criterion, attached. The traffic
+that pays is traffic a connection spends sending bytes it has already
+sent — an LLM client that posts the same 32 KiB system prompt with every
+request over one keep-alive connection is the canonical case, and it is
+common enough to be worth a codec. `carrier_dedup: true` on a tunnel
+makes the client propose per-stream content-defined dedup on the
+agent↔server carrier: a Gear-hash chunker (512 B minimum / ~4 KiB average
+/ 16 KiB maximum) cuts each direction into content-defined chunks —
+boundaries decided by the bytes, so a mutation re-synchronizes after at
+most one chunk — and a per-stream, per-direction ring (256 slots, 4 MiB
+bound) lets a chunk the peer still hold ship as a ~10-byte reference
+frame instead of its bytes. Anything unconfirmed is pass-through:
+byte-identical, format-free, old-binary-safe.
+
+### The key, the negotiation, the scope
+
+```yaml
+tunnels:
+  ollama:
+    proto:
+      http: 11434
+    carrier_dedup: true
+```
+
+The proposal rides the existing registration messages as additive JSON
+fields, so the negotiation is three states: confirmed (codec engages on
+that stream), unconfirmed (pass-through), and never-asked. Scope is the
+mux and QUIC carriers only. One wrinkle is documented rather than hidden:
+the pool of proxy connections a client dials *before* its mux session is
+never confirmed — those streams were proposed before the tunnel's ack
+existed — so an engaged tunnel always produces exactly one Info notice
+for the pool streams. That notice is the feature saying "on, but not
+there", not a malfunction; the e2e group asserts it appears at most once
+per tunnel and never for un-proposing clients. Both processes log the
+per-stream win at close — `carrier_dedup: offered=X framed=Y refs=Z`,
+server line = request direction, client line = response direction — and
+`1 − framed/offered` is the honest share of the wire removed, exact
+because it is a byte count, immune to loopback noise.
+
+The server-side kill switch is `ngrokd -disableCarrierDedup` (config
+spelling `disable_carrier_dedup`): it stops confirming proposals and
+running tunnels fall back to pass-through with no client change. Both
+binaries ship together in this fork, but an experimental feature owes
+its operators a big red lever.
+
+Two combinations are refused at client config load, tunnel named, and
+the refusal strings carry the whole rationale: a `udp` protocol (a udp
+leg's proxy connection is never confirmed, so the key would be silently
+un-honored on that leg — and because the key belongs to the tunnel, the
+refusal covers mixed tunnels too; the negotiation cannot exempt one leg),
+and `agent_tls_termination` (an agent-terminated tunnel's carrier holds
+TLS ciphertext whose fresh AEAD nonces never repeat: the codec would be
+pure overhead).
+
+### The bench: the pre-registered scoreboard
+
+`scripts/bench.sh` grew three dedup payloads (spec §6), each run on/off ×
+smux/QUIC — the honest ON/OFF shape needs two client processes on one
+ngrokd, because the proposal is client-granular; a single client cannot
+be its own control. Expectations were stated before the runs:
+
+- **Kill criterion** — repeated-prompt payload, ≥50% offered-byte
+  reduction or the feature is not earning its complexity: **PASS at
+  80.2% (smux) / 82.3% (QUIC)** (offered 3,314,000 → framed ~578-656 KB
+  per 100-request leg, refs ~494). This is the number the release
+  stands on.
+- **Control** — the 64 MiB incompressible random body, dedup ON, ≤~1%
+  wire overhead: **PASS at 0.070% on both carriers** (a pure byte-ratio
+  check; the codec adds only framing when nothing can reference).
+- **p95 on loopback** — pre-registered as neutral-to-slightly-worse,
+  delivered exactly that on smux (0.60→0.65 ms) and better on QUIC
+  (0.87→0.68 ms); the QUIC number is recorded, not celebrated — the
+  carrier dominates there.
+- **CPU bounded and reported** — the codec's bill is visible: the dedup
+  client spent 1.08 s of CPU against the plain client's 0.67 s for the
+  same mixed workload (smux leg, macOS); the ngrokd figure mixes both
+  clients' traffic and is reported as-is (1.57 s smux, 14.71 s QUIC —
+  the QUIC carrier dominates that leg).
+- **The gzip boundary** — SSE boilerplate saved 34.6% / 34.4%
+  (smux/QUIC); under `Accept-Encoding: gzip` the saving collapsed to
+  −0.1% — gzipped bytes are fresh compressed output the chunker cannot
+  match, so the collapse is the boundary working, not a failure.
+
+Two negatives, reported straight because the scoreboard is worthless
+without them: on the incompressible control the codec roughly **halved
+smux loopback throughput** (542.5→223.1 MiB/s wall; QUIC 72.5→72.3,
+carrier-dominated) — the per-chunk hashing costs real time on traffic it
+cannot shrink, which is precisely what the kill-switch and the refusal
+list are for; and the tiny responses of the llm payload measured −2.8%
+(framing on ~80-byte sha256 answers — overhead where there is nothing to
+save). Loopback timings carry the standing caveat the 1.0.9 QUIC bench
+stated first: without a bandwidth constraint the byte win cannot show as
+wall time, so the ratios are the claims and the timings are context.
+
+Two fixture lessons are recorded in the harness comments where they bit:
+a strictly periodic fixture (one repeated sentence) walks the Gear hash
+through a handful of distinct windows and never fires — refs=0 at any
+size — so the payloads are built from diverse word text whose digests are
+pinned in the fixtures (the vocabulary is 184 words, a once-200-word list
+that lost sixteen to a transcription slip before the constants were
+pinned; 184 is what the pins attest to); and the measured trigger rate on
+that text (~1/4929-1/7111) sits below the 1/4096 design point, which the
+byte ratios say is harmless here but is not invisible.
+
+### The netem variant: two honest substitutions
+
+The spec's fourth payload asked for `tc` shaping on the daedalus VM so
+saved bytes become transfer time. The VM cannot: its kernel ships
+`CONFIG_NET_SCH_FQ_CODEL` and nothing else (no htb, no tbf, no netem —
+checked in `/proc/config.gz`), its tc binary cannot load modules, and the
+container holds no CAP_NET_ADMIN in its own netns. First substitution,
+disclosed: the whole bench runs in a throwaway `unshare -Urn` namespace
+behind a userspace token-bucket relay (`scripts/bench-netem/`) that owns
+the dialed carrier address — OFF and ON traverse it identically, so the
+leg delta still isolates the codec, but absolute numbers are
+relay-flavored, not tc-flavored. Second substitution: at the spec's
+~10 Mbit the carrier never bound — this small VM has a ~48 ms per-request
+floor across its five-process chain, above the 26 ms a 33 KiB request
+needs at 10 Mbit, so both legs measured an identical ~21 req/s and the
+run honestly showed nothing (byte ratio still 82.5%; the relay's own
+counter confirmed the ON wire at ~0.65 MB against OFF's 3.3 MB). Lowered
+to 2 Mbit so the carrier binds: **OFF 7.6 vs ON 20.6 req/s on smux (the
+same 100-prompt leg: 13.2 s vs 4.9 s), 7.4 vs 21.5 on QUIC, p95 142 ms
+vs ~50 ms — a 2.7-3.0× wall win**, reported as what it is: a
+floor-limited lower bound of the 5.7× byte ratio, because the ON leg
+cannot drop below the VM's own per-request floor. The same-binaries-twice
+control ran within ±3% on every row.
+
+### Also in this release
+
+The e2e harness gained a `dedup` group (six scenarios): codec
+correctness through a real tunnel on both carriers, the repeated-payload
+and llm-json fixtures with the offered/framed ratio asserted above the
+kill line, old-binary interop (a dedup client against a server that
+cannot ack → pass-through, traffic correct, exactly one notice), the
+kill switch, and both refusals — green twice consecutively. The bench
+harness learned to run on machines without a Go toolchain or `ps` (the
+two-directory, prebuilt-binaries form now degrades CPU rows to an
+explicit `unavailable-no-ps` instead of dying silently — the first netem
+run died at exactly that `ps` call, twice, before the repro made it
+visible). `scripts/bench-netem/netem-run.sh` + `relay.py` are the
+shaped-variant tooling.
+
+A pre-existing data race in the shared logger, surfaced by this release's
+test work, is fixed: PrefixLogger's prefix string was read on every log
+line and rewritten by the connection-rename path (SetType's
+ClearLogPrefixes+AddLogPrefix pair) with no synchronization, so a rename
+concurrent with a log call could read a torn string header. The fix
+guards the prefix with a mutex and routes both read sites (the text path
+and the JSON formatter's tag field) through a snapshot accessor; the
+rejected alternatives — recursive use of the logger's existing root
+lock, atomics that could silently lose a concurrent prefix add — are
+recorded in the struct's comment. The regression test logs from one
+goroutine while another spins the rename pair, and was verified to trip
+the race detector on the unfixed tree before the fix landed.
+
+Version is now 1.0.21.
+
 ## 1.0.20 - 2026-10-08 - ngrok-bot: a read-only Telegram ops surface over the admin API
 
 Cluster 19 made the admin listener programmable; this release adds the

@@ -16,6 +16,7 @@ ngrok is a self-hosted tool that creates secure tunnels to localhost: you run bo
 - **Secret vaults** — credentials sourced from files or the environment via `secret("vault/key")`, digests-only-on-disk supported
 - **Event export** — the server's event stream to HTTP collectors or JSONL files, with visible drop accounting
 - **QUIC agent transport** — the agent↔server multiplexed connection rides QUIC when enabled (no TCP head-of-line blocking across streams), with automatic smux fallback
+- **Carrier dedup (experimental)** — `carrier_dedup: true` cuts a tunnel's agent↔server carrier into content-defined chunks and replaces repeats with ~10-byte references (~82% wire reduction on repeated-prompt LLM traffic); pass-through unless the server confirms, with a `-disableCarrierDedup` kill switch
 - **Admin web UI** — ngrokd's admin listener serves a dashboard with live metrics, the tunnel table and the event stream, plus a workbench that validates and renders agent configs and traffic policies against the same code that consumes them
 - **Endpoint pooling & compression** — share one public endpoint across agents; gzip response compression
 - **Web inspector & terminal UI** — inspect HTTP traffic in real time
@@ -490,6 +491,74 @@ carry the UDP a QUIC session needs). **Firewall note:** the tunnel port's
 *UDP* side must be open end-to-end; a path that silently drops UDP degrades
 to smux on every attempt — never an outage, but never QUIC either.
 
+**Carrier dedup (experimental).** `carrier_dedup: true` on a tunnel opts its
+agent↔server carrier into per-stream content-defined chunk dedup: each
+direction's byte stream is cut by a Gear-hash chunker (512 B minimum /
+~4 KiB average / 16 KiB maximum, boundaries decided by content so shifts in
+the stream re-synchronize), a per-stream 256-slot / 4 MiB ring remembers
+recent chunks, and a chunk the other end still holds ships as a ~10-byte
+reference frame instead of its bytes. The traffic this is for re-sends its
+own earlier bytes within one connection's life — an LLM client posting the
+same 32 KiB system prompt with every request is the canonical case:
+
+```yaml
+tunnels:
+  ollama:
+    proto:
+      http: 11434
+    carrier_dedup: true
+```
+
+The feature is negotiated per stream and additive on the wire: the client
+proposes on streams of `carrier_dedup` tunnels, the server confirms, and an
+unconfirmed proposal means pass-through — byte-identical traffic and no
+format change, so a server binary without the feature simply never engages
+it (the client notes that once per tunnel, not per stream). Scope is the
+mux and QUIC carriers; the pre-mux pool connections a client dials before
+its mux session are never confirmed and stay pass-through — that is the
+one per-tunnel notice, not a malfunction. At stream close each process
+logs the honest win number, `carrier_dedup: offered=X framed=Y refs=Z`
+(server line = request direction, client line = response direction);
+`1 − framed/offered` is the share of the wire removed, exact because it is
+a byte count. The ops kill switch is `ngrokd -disableCarrierDedup` (or
+`disable_carrier_dedup: true` in server config): it stops confirming
+proposals and running tunnels fall back to pass-through with no client
+change — an experimental feature owes its operators a big red lever.
+
+Two combinations are refused at config load, tunnel named: a `udp`
+protocol (a udp leg's proxy connection is never confirmed, so the key
+would be silently un-honored on that leg; and because the key belongs to
+the whole tunnel, the refusal covers mixed tunnels too — the negotiation
+cannot exempt one leg), and `agent_tls_termination` (an agent-terminated
+tunnel's carrier holds TLS ciphertext, whose fresh AEAD nonces never
+repeat, so the codec would be pure overhead).
+
+What the bench found (`scripts/bench.sh`; the byte ratios are exact, the
+timings are loopback-only and will look different on your hardware): the
+repeated-prompt payload shed 80.2% (smux) / 82.3% (QUIC) of its request
+bytes; static SSE boilerplate shed ~34.6%, collapsing to −0.1% under
+`Accept-Encoding: gzip` — gzipped bytes are fresh compressed output the
+chunker cannot match, so the collapse is the boundary working, not a
+failure; the incompressible 64 MiB random control added 0.070% framing
+overhead (the pre-registered bound was ≤1%). On unconstrained loopback
+none of that converts to wall time, and per-request p95 measured slightly
+worse, as pre-registered (0.60→0.65 ms, smux). Two negatives reported
+straight: the codec's CPU bill is real (the dedup client used 1.08 s of
+CPU against the plain client's 0.67 s for the same mixed workload), and
+on the random control it roughly **halved** smux loopback throughput
+(542.5→223.1 MiB/s) — on incompressible traffic the hashing buys nothing
+and the QUIC carrier's own cost dominates (72.5→72.3 MiB/s). Under a
+bandwidth constraint the saving does convert: with the carrier shaped to
+2 Mbit/s (userspace token-bucket relay — the bench VM's kernel ships no
+shaping qdisc; see `scripts/bench.sh`), the same 100-prompt workload
+transferred in 13.2 s/leg without dedup and 4.9 s/leg with it on smux
+(QUIC: 7.4 vs 21.5+ req/s) — a 2.7× wall win, honestly a floor-limited
+lower bound of the 5.7× byte ratio. Whether the feature earns its keep on
+*tunnel-like* workloads (many small fresh connections, TLS ciphertext,
+already-compressed bodies) is exactly what the refusal list and the
+control payload encode: run the bench on your own workload before
+enabling it broadly.
+
 **Tunnel an IoT/TCP device.** A plain tcp tunnel forwards raw bytes to a
 local service port — e.g. a Levis IoT node listening on `127.0.0.1:5681`:
 
@@ -776,7 +845,15 @@ Optionally set `NGROK_ADMIN_TOKEN` for authenticated admin APIs.
 `scripts/bench.sh` measures bulk throughput, connection rate, keep-alive rate
 and TLS connection rate through a real tunnel stack, on both carrier legs
 (smux and QUIC) — `BENCH_SCENARIOS="bulk conn-rate keep-alive"` runs a focused
-subset. Two standing caveats the report carries in its own table: loopback has
+subset. The carrier_dedup payloads run the same way (`dedup-llm`,
+`dedup-sse`, `dedup-bulk`): each drives a plain client and a
+`carrier_dedup` client over one ngrokd per carrier, so OFF and ON differ
+by the codec and nothing else, and reports the codec's close-line byte
+ratios beside the timings. `scripts/bench-netem/netem-run.sh` is the
+bandwidth-constrained variant — it runs the whole bench inside a throwaway
+user/net namespace behind a token-bucket relay because the bench VM's
+kernel ships no shaping qdisc; `BENCH_NETEM_RATE` sets the rate. Two
+standing caveats the report carries in its own table: loopback has
 no packet loss, so QUIC's head-of-line-blocking win cannot show there (the
 numbers establish parity, not superiority), and on macOS the QUIC bulk rate
 measures well behind smux because quic-go batches UDP syscalls

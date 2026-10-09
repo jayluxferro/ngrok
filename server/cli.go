@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 type Options struct {
@@ -31,6 +32,14 @@ type Options struct {
 	publicRate   int
 	maxConnPerIP int
 	enablePprof  bool
+
+	// disableCarrierDedup is the carrier_dedup kill switch (SPEC-CLUSTER21
+	// §4): an ops lever that stops the server confirming Dedup proposals, so
+	// every tunnel falls back to pass-through without client changes. Both
+	// binaries ship together in this fork, but an experimental feature owes
+	// its operators a big red lever.
+	disableCarrierDedup bool
+
 	// eventDestinations is the server-side event export list
 	// (SPEC-CLUSTER9 §4). Deliberately config-only, with no flag: each entry
 	// is a small struct (type/url/auth_header/batch_size/flush_interval/path)
@@ -47,6 +56,20 @@ type Options struct {
 	// installOIDCSessionKey's, at startup, where a short key stops the boot.
 	oidcSessionKey string
 }
+
+// carrierDedupDisabled is the runtime form of -disableCarrierDedup: the
+// carrier_dedup kill switch (SPEC-CLUSTER21 §4), read at stream-registration
+// time (registerProxyStream) and at ack time (HandlePublicConnection). It is
+// an atomic rather than an Options field read through the opts global because
+// the opts global is nil outside Main() -- every test in this package builds
+// its streams without a Main -- and the quicServing atomic is the established
+// shape for exactly this kind of feature gate.
+//
+// It is stored by parseArgs, not Main: parseArgs is the one place argv and the
+// config file have been merged, and it runs before any listener starts, so
+// storing here is the same guarantee (the switch is settled before the first
+// stream can arrive) with the flag's plumbing kept in the file that owns it.
+var carrierDedupDisabled atomic.Bool
 
 func parseArgs() *Options {
 	configPath := flag.String("config", "", "Path to ngrokd YAML config file")
@@ -74,6 +97,7 @@ func parseArgs() *Options {
 	publicRate := flag.Int("publicRate", 0, "Max new public connections per second per IP (0 disables)")
 	maxConnPerIP := flag.Int("maxConnPerIP", 0, "Max concurrent public connections per IP (0 disables)")
 	enablePprof := flag.Bool("pprof", false, "Enable pprof handlers on admin server (requires -adminAddr)")
+	disableCarrierDedup := flag.Bool("disableCarrierDedup", false, "Stop confirming carrier_dedup proposals; proxied streams stay pass-through (SPEC-CLUSTER21)")
 	flag.Parse()
 
 	if *hashToken != "" {
@@ -134,6 +158,7 @@ func parseArgs() *Options {
 		seen.num(publicRate, cfg.PublicRate, "publicRate")
 		seen.num(maxConnPerIP, cfg.MaxConnPerIP, "maxConnPerIP")
 		seen.yes(enablePprof, cfg.EnablePprof, "pprof")
+		seen.yes(disableCarrierDedup, cfg.DisableCarrierDedup, "disableCarrierDedup")
 		if len(cfg.AuthTokens) > 0 && !seen["authToken"] {
 			*authTokensFlag = strings.Join(cfg.AuthTokens, ",")
 		}
@@ -160,32 +185,37 @@ func parseArgs() *Options {
 		}
 	}
 
+	// The kill switch settles here, before any listener exists to accept a
+	// stream (see carrierDedupDisabled for why parseArgs is the store point).
+	carrierDedupDisabled.Store(*disableCarrierDedup)
+
 	return &Options{
-		httpAddr:          *httpAddr,
-		httpsAddr:         *httpsAddr,
-		tunnelAddr:        *tunnelAddr,
-		quicAddr:          *quicAddr,
-		adminAddr:         *adminAddr,
-		adminAuth:         *adminAuth,
-		adminToken:        *adminToken,
-		adminRate:         *adminRate,
-		statusURL:         *statusURL,
-		statusAuth:        *statusAuth,
-		statusToken:       *statusToken,
-		domain:            *domain,
-		tlsCrt:            *tlsCrt,
-		tlsKey:            *tlsKey,
-		logto:             *logto,
-		loglevel:          *loglevel,
-		logformat:         *logformat,
-		authTokens:        authTokens,
-		maxMsgBytes:       *maxMsgBytes,
-		authRate:          *authRate,
-		publicRate:        *publicRate,
-		maxConnPerIP:      *maxConnPerIP,
-		enablePprof:       *enablePprof,
-		eventDestinations: eventDestinations,
-		oidcSessionKey:    oidcSessionKey,
+		httpAddr:            *httpAddr,
+		httpsAddr:           *httpsAddr,
+		tunnelAddr:          *tunnelAddr,
+		quicAddr:            *quicAddr,
+		adminAddr:           *adminAddr,
+		adminAuth:           *adminAuth,
+		adminToken:          *adminToken,
+		adminRate:           *adminRate,
+		statusURL:           *statusURL,
+		statusAuth:          *statusAuth,
+		statusToken:         *statusToken,
+		domain:              *domain,
+		tlsCrt:              *tlsCrt,
+		tlsKey:              *tlsKey,
+		logto:               *logto,
+		loglevel:            *loglevel,
+		logformat:           *logformat,
+		authTokens:          authTokens,
+		maxMsgBytes:         *maxMsgBytes,
+		authRate:            *authRate,
+		publicRate:          *publicRate,
+		maxConnPerIP:        *maxConnPerIP,
+		enablePprof:         *enablePprof,
+		disableCarrierDedup: *disableCarrierDedup,
+		eventDestinations:   eventDestinations,
+		oidcSessionKey:      oidcSessionKey,
 	}
 }
 
