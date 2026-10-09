@@ -48,6 +48,8 @@ rounds with no feature spec — their record is the changelog.
 | [17-carrier-dedup.md](17-carrier-dedup.md) | `carrier_dedup`: experimental per-stream CDC+Blake2b chunk dedup on the agent↔server carrier | v1.0.21 | shipped |
 | [18-dedup-telemetry.md](18-dedup-telemetry.md) | carrier_dedup telemetry: per-tunnel + global counters (incl. the read direction, where the win lands), desyncs counted, v2 gate made evaluable | draft | draft |
 | [19-upstream-connection-pooling.md](19-upstream-connection-pooling.md) | Opt-in `upstream_pool` for HTTP/HTTPS tunnels: parsed local leg over a shared per-address pool — the h1 twin of the cluster-17 transcoder; raw-socket reuse refused at the design level | draft | draft |
+| [20-workbench-policy-presets.md](20-workbench-policy-presets.md) | Workbench policy presets: `GET /api/presets` + curated fragments pinned valid against the real validator — engine drift breaks the build, not the operator's insert | draft | draft |
+| [21-workbench-snapshot-diffing.md](21-workbench-snapshot-diffing.md) | Workbench snapshot diffing: SPA-side added/removed/reconfigured/restarted classification of `/tunnels` polls, watched-field immutability pinned; zero Go changes | draft | draft |
 
 ## Not specced here
 

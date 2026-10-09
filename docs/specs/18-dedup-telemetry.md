@@ -161,7 +161,9 @@ Small enough for two lanes:
 
 ## Release
 
-v1.0.22. CHANGELOG states the win-direction rationale in one sentence (why
+v1.0.23 (v1.0.22 is the toolchain floor bump + quic-go uplift landing
+ahead of this cluster — its commits go first so new-toolchain behavior
+shifts stay attributable). CHANGELOG states the win-direction rationale in one sentence (why
 read counters are the point, not a nicety) and the honest scope: this measures
 the feature; it does not change it. v2 remains gated — now on counters an
 operator can actually read.

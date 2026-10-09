@@ -271,7 +271,7 @@ tunnels:
       on_tcp_connect:
         - name: restrict-ips
           config:
-            cidrs: ["203.0.113.0/24"]     # everyone else: connection refused
+            allow: ["203.0.113.0/24"]     # everyone else: connection refused
       on_http_request:
         - name: deny
           expressions: ['req.url.path.startsWith("/admin")']
