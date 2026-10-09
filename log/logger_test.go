@@ -102,22 +102,28 @@ func TestLogToRejectedLevelLeavesLoggerUntouched(t *testing.T) {
 // --- the prefix rename race -------------------------------------------------
 //
 // A PrefixLogger's prefix is written by the connection-lifecycle path
-// (loggedConn.SetType's ClearLogPrefixes+AddLogPrefix pair, AddLogPrefix at
-// wrap time) and read by every log call through it. The two run on different
-// goroutines -- a conn can be handed across the server's proxy pool while its
-// accept side is still logging to it -- and the string header they share is
-// not self-synchronizing. This test is the one that would have caught the
-// class: it logs from one goroutine while another re-types the logger, and it
-// is only honest under -race, where an unsynchronized read/write pair on the
-// prefix is reported rather than survived.
+// (loggedConn.SetType's SetLogPrefixes rename, AddLogPrefix at wrap time) and
+// read by every log call through it. The two run on different goroutines -- a
+// conn can be handed across the server's proxy pool while its accept side is
+// still logging to it -- and the string header they share is not
+// self-synchronizing. The race half of this test is only honest under -race,
+// where an unsynchronized read/write pair on the prefix is reported rather
+// than survived; the atomicity half needs no detector: a rename observed
+// through the mutex must be whole, so a reader snapshotting the prefix while
+// renames run can never find it empty.
 
 // hammerPrefixLogger runs the race shape once: a logger goroutine emits a few
-// thousand lines while the test's own goroutine re-types the logger in a tight
-// ClearLogPrefixes+AddLogPrefix loop -- the exact pair loggedConn.SetType
-// runs. The filter sits at ERROR so log4go drops the emitted lines (quiet
-// test output): the prefix read the race lives on happens in pfx() -- or in
-// the json branch's tag field -- before log4go ever sees the call, on every
-// line, in either format.
+// thousand lines while the test's own goroutine re-types the logger in a
+// tight SetLogPrefixes loop -- the exact call loggedConn.SetType runs. The
+// filter sits at ERROR so log4go drops the emitted lines (quiet test output):
+// the prefix read the race lives on happens in pfx() -- or in the json
+// branch's tag field -- before log4go ever sees the call, on every line, in
+// either format. A third goroutine snapshots the prefix throughout: the
+// ClearLogPrefixes+AddLogPrefix pair this rename path replaced held the lock
+// twice, and any log call landing in the window between the two saw a conn
+// with no prefix at all. SetLogPrefixes is one critical section, so an empty
+// snapshot here means the rename has stopped being atomic -- a regression,
+// not a scheduling accident.
 func hammerPrefixLogger(t *testing.T, format string) {
 	t.Helper()
 
@@ -136,9 +142,29 @@ func hammerPrefixLogger(t *testing.T, format string) {
 		}
 	}()
 
+	emptySeen := false
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if pl.snapshotPrefix() == "" {
+				emptySeen = true
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-done:
+			<-readerDone
+			if emptySeen {
+				t.Errorf("prefix was empty when snapshotted mid-rename: the rename is no longer one critical section")
+			}
 			// Leave the level and format the LogTo tests above expect: each
 			// of them sets its own, but the teardown keeps this test from
 			// leaking jsonFormat or an ERROR filter into whatever runs next.
@@ -148,8 +174,7 @@ func hammerPrefixLogger(t *testing.T, format string) {
 			return
 		default:
 		}
-		pl.ClearLogPrefixes()
-		pl.AddLogPrefix("renamed")
+		pl.SetLogPrefixes("renamed")
 	}
 }
 

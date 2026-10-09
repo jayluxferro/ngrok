@@ -64,7 +64,7 @@ type fzConn struct {
 func (c *fzConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func (c *fzConn) AddLogPrefix(string)          {}
-func (c *fzConn) ClearLogPrefixes()            {}
+func (c *fzConn) SetLogPrefixes(...string)     {}
 func (c *fzConn) Debug(string, ...interface{}) {}
 func (c *fzConn) Info(string, ...interface{})  {}
 func (c *fzConn) Warn(string, ...interface{}) error {

@@ -197,8 +197,11 @@ func (c *loggedConn) Id() string {
 func (c *loggedConn) SetType(typ string) {
 	oldId := c.Id()
 	c.typ = typ
-	c.ClearLogPrefixes()
-	c.AddLogPrefix(c.Id())
+	// One critical section: a log call concurrent with the rename must see
+	// the whole old prefix or the whole new one, never the momentary empty
+	// prefix the ClearLogPrefixes+AddLogPrefix pair this replaced exposed
+	// between its two locks.
+	c.SetLogPrefixes(c.Id())
 	c.Info("Renamed connection %s", oldId)
 }
 

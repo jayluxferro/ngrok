@@ -111,7 +111,7 @@ import (
 type fzQuiet struct{}
 
 func (fzQuiet) AddLogPrefix(string)                {}
-func (fzQuiet) ClearLogPrefixes()                  {}
+func (fzQuiet) SetLogPrefixes(...string)           {}
 func (fzQuiet) Debug(string, ...interface{})       {}
 func (fzQuiet) Info(string, ...interface{})        {}
 func (fzQuiet) Warn(string, ...interface{}) error  { return nil }
@@ -1703,7 +1703,7 @@ func TestPolicyCompileCostIsBounded(t *testing.T) {
 type fzRecord struct{ warns []string }
 
 func (l *fzRecord) AddLogPrefix(string)          {}
-func (l *fzRecord) ClearLogPrefixes()            {}
+func (l *fzRecord) SetLogPrefixes(...string)     {}
 func (l *fzRecord) Debug(string, ...interface{}) {}
 func (l *fzRecord) Info(string, ...interface{})  {}
 func (l *fzRecord) Warn(f string, a ...interface{}) error {

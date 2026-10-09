@@ -49,7 +49,7 @@ type recordingLogger struct {
 }
 
 func (l *recordingLogger) AddLogPrefix(string)          {}
-func (l *recordingLogger) ClearLogPrefixes()            {}
+func (l *recordingLogger) SetLogPrefixes(...string)     {}
 func (l *recordingLogger) Debug(string, ...interface{}) {}
 func (l *recordingLogger) Info(f string, args ...interface{}) {
 	l.record(f, args...)

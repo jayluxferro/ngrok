@@ -15,7 +15,7 @@ type testConn struct {
 }
 
 func (c *testConn) AddLogPrefix(string)          {}
-func (c *testConn) ClearLogPrefixes()            {}
+func (c *testConn) SetLogPrefixes(...string)     {}
 func (c *testConn) Debug(string, ...interface{}) {}
 func (c *testConn) Info(string, ...interface{})  {}
 func (c *testConn) Warn(string, ...interface{}) error {
@@ -37,7 +37,7 @@ type recordingConn struct {
 }
 
 func (c *recordingConn) AddLogPrefix(string)         {}
-func (c *recordingConn) ClearLogPrefixes()           {}
+func (c *recordingConn) SetLogPrefixes(...string)    {}
 func (c *recordingConn) Info(string, ...interface{}) {}
 func (c *recordingConn) Id() string                  { return "test" }
 func (c *recordingConn) SetType(string)              {}

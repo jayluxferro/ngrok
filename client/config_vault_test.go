@@ -61,7 +61,7 @@ func loadConfig(t *testing.T, contents string) (*Configuration, error) {
 type vaultTestLogger struct{}
 
 func (vaultTestLogger) AddLogPrefix(string)                {}
-func (vaultTestLogger) ClearLogPrefixes()                  {}
+func (vaultTestLogger) SetLogPrefixes(...string)           {}
 func (vaultTestLogger) Debug(string, ...interface{})       {}
 func (vaultTestLogger) Info(string, ...interface{})        {}
 func (vaultTestLogger) Warn(string, ...interface{}) error  { return nil }

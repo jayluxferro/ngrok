@@ -251,7 +251,7 @@ type oidcTestLogger struct {
 }
 
 func (l *oidcTestLogger) AddLogPrefix(string)          {}
-func (l *oidcTestLogger) ClearLogPrefixes()            {}
+func (l *oidcTestLogger) SetLogPrefixes(...string)     {}
 func (l *oidcTestLogger) Debug(string, ...interface{}) {}
 func (l *oidcTestLogger) Info(format string, args ...interface{}) {
 	l.mu.Lock()

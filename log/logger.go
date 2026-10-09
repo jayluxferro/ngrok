@@ -82,7 +82,7 @@ func LogTo(target string, level_name string, format string) error {
 
 type Logger interface {
 	AddLogPrefix(string)
-	ClearLogPrefixes()
+	SetLogPrefixes(...string)
 	Debug(string, ...interface{})
 	Info(string, ...interface{})
 	Warn(string, ...interface{}) error
@@ -93,8 +93,8 @@ type PrefixLogger struct {
 	*log.Logger
 
 	// mu guards prefix. The prefix is written by the connection-lifecycle
-	// path -- loggedConn.SetType's ClearLogPrefixes+AddLogPrefix pair, and
-	// AddLogPrefix at wrap time -- and read by every log call through the
+	// path -- loggedConn.SetType's SetLogPrefixes rename, and AddLogPrefix
+	// at wrap time -- and read by every log call through the
 	// logger, and the two run on different goroutines: RegisterProxy logs
 	// "Registered" after handing the conn to the proxy pool, whose handout
 	// side re-types it. pfx() therefore takes this lock on every log line,
@@ -115,11 +115,7 @@ type PrefixLogger struct {
 
 func NewPrefixLogger(prefixes ...string) Logger {
 	logger := &PrefixLogger{Logger: &root}
-
-	for _, p := range prefixes {
-		logger.AddLogPrefix(p)
-	}
-
+	logger.SetLogPrefixes(prefixes...)
 	return logger
 }
 
@@ -152,10 +148,9 @@ func (pl *PrefixLogger) Error(arg0 string, args ...interface{}) error {
 	return pl.log("ERROR", arg0, args...)
 }
 
-func (pl *PrefixLogger) AddLogPrefix(prefix string) {
-	pl.mu.Lock()
-	defer pl.mu.Unlock()
-
+// appendPrefixLocked joins one more prefix into the bracketed,
+// space-separated form every log line carries. Callers must hold mu.
+func (pl *PrefixLogger) appendPrefixLocked(prefix string) {
 	if len(pl.prefix) > 0 {
 		pl.prefix += " "
 	}
@@ -163,10 +158,28 @@ func (pl *PrefixLogger) AddLogPrefix(prefix string) {
 	pl.prefix += "[" + prefix + "]"
 }
 
-func (pl *PrefixLogger) ClearLogPrefixes() {
+func (pl *PrefixLogger) AddLogPrefix(prefix string) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
+
+	pl.appendPrefixLocked(prefix)
+}
+
+// SetLogPrefixes replaces the whole prefix set under one acquisition of mu.
+// The rename it exists for -- loggedConn.SetType -- used to run as a
+// ClearLogPrefixes+AddLogPrefix pair: two critical sections, with a window
+// between them where a concurrent log call observed a conn with no prefix at
+// all, a line that reads as if it belongs to nothing. Renames ride this
+// method so a reader sees the whole old prefix or the whole new one, never
+// the empty between. Clearing without replacing is the zero-arg call.
+func (pl *PrefixLogger) SetLogPrefixes(prefixes ...string) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+
 	pl.prefix = ""
+	for _, p := range prefixes {
+		pl.appendPrefixLocked(p)
+	}
 }
 
 func (pl *PrefixLogger) log(level string, format string, args ...interface{}) error {

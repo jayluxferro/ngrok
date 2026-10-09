@@ -39,8 +39,8 @@ func (l *testLogger) record(dst *[]string, format string, args ...interface{}) {
 	*dst = append(*dst, fmt.Sprintf(format, args...))
 }
 
-func (l *testLogger) AddLogPrefix(string) {}
-func (l *testLogger) ClearLogPrefixes()   {}
+func (l *testLogger) AddLogPrefix(string)      {}
+func (l *testLogger) SetLogPrefixes(...string) {}
 func (l *testLogger) Debug(string, ...interface{}) {
 }
 func (l *testLogger) Info(format string, args ...interface{}) {
