@@ -52,6 +52,15 @@ floor so its skip-class messages keep telling the truth, and the auto-updater
 stays pinned to GOTOOLCHAIN=local: a floor bump is still a deliberate change
 with its own review, never a weekly side effect.
 
+One release artifact changes with the toolchain itself: the binary matrix
+is generated from `go tool dist list`, and Go removed the windows/arm
+(32-bit) port after 1.23 — go 1.24 was the first release whose toolchain
+cannot build it at all (`GOOS=windows GOARCH=arm` errors "unsupported
+GOOS/GOARCH pair" under 1.26). v1.0.21, built under the 1.23 pin, was
+therefore the last release to ship `ngrok-windows-arm*`, `ngrokd-windows-arm.exe`,
+and `ngrok-bot-windows-arm.exe`; this and future releases carry 189 assets,
+not 198. windows/amd64 and windows/arm64 are unaffected.
+
 ## 1.0.21 - 2026-10-09 - carrier_dedup: per-stream content-defined chunk dedup on the agent↔server carrier
 
 This release ships the first feature that changes what the carrier
