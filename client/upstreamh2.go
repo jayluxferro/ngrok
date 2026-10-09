@@ -14,7 +14,11 @@ package client
 //     hand-roll framing on data paths, and the transcoder is a data path --
 //     which is also why the h1 half is a server and not a client: a client
 //     would need a fresh upstream connection per request or a request
-//     queue, both of which re-implement what a server already does.
+//     queue, both of which re-implement what a server already does. (Since
+//     SPEC-CLUSTER25 this half is shared scaffolding -- startPipeBridge in
+//     client/upstream_shared.go -- built by the h1 pool bridge's twin,
+//     client/upstreamh1.go; the handler below is what makes this leg the
+//     transcoder's.)
 //   - an h2 half: one http2.Transport per local address (AllowHTTP + a plain
 //     dial in DialTLSContext -- the h2c prior-knowledge shape), shared by
 //     every proxy connection of every tunnel that points at that address, so
@@ -257,88 +261,15 @@ func dialUpstreamH2(tunnel mvc.Tunnel) (conn.Conn, error) {
 		return nil, err
 	}
 
-	// The h1 half. One pipe, one server, one connection: the end given to the
-	// server reads what the relay writes and the relay reads what the server
-	// writes -- net.Pipe's two ends are the two sides of the local leg.
-	pipeLocal, pipeServer := net.Pipe()
-	ln := newOneConnListener(pipeServer)
-
-	srv := &http.Server{
-		Handler: &upstreamBridge{
-			pool:      pool,
-			publicUrl: tunnel.PublicUrl,
-			localAddr: tunnel.LocalAddr,
-		},
-	}
-	go srv.Serve(ln)
-
-	return &upstreamH2Conn{
-		Conn: conn.Wrap(pipeLocal, "prv"),
-		ln:   ln,
-	}, nil
+	// The h1 half -- one pipe, one server, one connection -- is shared
+	// scaffolding (client/upstream_shared.go); the handler is what makes this
+	// leg the transcoder's.
+	return startPipeBridge(&upstreamBridge{
+		pool:      pool,
+		publicUrl: tunnel.PublicUrl,
+		localAddr: tunnel.LocalAddr,
+	}), nil
 }
-
-// upstreamH2Conn is the local leg the relay sees. Its Close tears down both
-// halves of the bridge: the pipe end's close fails the server-side connection
-// (which cancels the in-flight request context, which cancels the h2 stream),
-// and the listener's close ends srv.Serve.
-type upstreamH2Conn struct {
-	conn.Conn
-	ln *oneConnListener
-}
-
-func (c *upstreamH2Conn) Close() error {
-	errLn := c.ln.Close()
-	errConn := c.Conn.Close()
-	// The pipe end's close is the one that matters (it is what unblocks the
-	// server); the listener's is bookkeeping. Report the pipe error first.
-	if errConn != nil {
-		return errConn
-	}
-	return errLn
-}
-
-// oneConnListener is the classic single-connection listener adapter: it
-// yields exactly the connection it was built with and then behaves as a closed
-// listener. http.Server.Serve needs a listener; this is the smallest thing
-// that is one.
-type oneConnListener struct {
-	ch   chan net.Conn
-	done chan struct{}
-	once sync.Once
-}
-
-func newOneConnListener(c net.Conn) *oneConnListener {
-	l := &oneConnListener{
-		ch:   make(chan net.Conn, 1),
-		done: make(chan struct{}),
-	}
-	l.ch <- c
-	return l
-}
-
-func (l *oneConnListener) Accept() (net.Conn, error) {
-	select {
-	case c := <-l.ch:
-		return c, nil
-	case <-l.done:
-		return nil, net.ErrClosed
-	}
-}
-
-func (l *oneConnListener) Close() error {
-	l.once.Do(func() { close(l.done) })
-	return nil
-}
-
-// Addr has no real value: the server asks for it only to attach addresses to
-// log lines, and a pipe connection has none. The tunnel's local address is the
-// honest label for where this leg goes.
-func (l *oneConnListener) Addr() net.Addr {
-	return &upstreamH2Addr
-}
-
-var upstreamH2Addr = net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
 
 // upstreamBridge is the h1 half's handler: one request at a time per proxy
 // connection (the proxy leg is serial h1, as it has always been), concurrent

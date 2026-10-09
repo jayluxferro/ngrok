@@ -59,6 +59,15 @@ type Tunnel struct {
 	// definite value. Carried the same way as the header policy above: pure
 	// data from the configuration; nothing in this package interprets it.
 	UpstreamProtocol string
+
+	// UpstreamPool reports that this tunnel's local leg opted into connection
+	// pooling (SPEC-CLUSTER25): the plain dial's place is taken by the h1 pool
+	// bridge (client/upstreamh1.go), an httputil.ReverseProxy behind a shared
+	// per-address keep-alive transport. A bool needs no resolving -- the zero
+	// value IS the default -- so unlike UpstreamProtocol it is carried as
+	// written. Pure data from the configuration; nothing in this package
+	// interprets it.
+	UpstreamPool bool
 }
 
 type ConnectionContext struct {

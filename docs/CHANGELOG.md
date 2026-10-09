@@ -1,4 +1,81 @@
 # Changelog
+## 1.0.24 - 2026-10-09 - upstream_pool: the h1 local leg learns to keep its connections
+
+Cluster 17 gave `upstream_protocol: http2` tunnels a parsed local leg and,
+with it, connection pooling for free. The default h1 leg still dials the
+upstream fresh on every visitor connection — deliberately: the client pipes
+bytes there, and pooling a raw socket is unsound (no message-boundary
+knowledge). This release adds the escape hatch as an opt-in key:
+`upstream_pool: true` on http/https tunnels puts an `httputil.ReverseProxy`
+bridge behind the local leg, serving every visitor connection from one
+per-address keep-alive pool (`client/upstreamh1.go`; the net.Pipe /
+one-conn-listener scaffolding it shares with the h2 transcoder moved to
+`client/upstream_shared.go`, mechanical, cluster 17's tests green
+unchanged). The default path is untouched — byte-identical — and the proxy
+leg keeps everything this fork exists for: the rewriter pair, policy hooks,
+inspector tee, compression. Only the local leg is parsed.
+
+### The structural change is the accept collapse
+
+The bench leg (`scripts/bench.sh`, new `pool` scenario) measures it in the
+upstream's own socket accepts, exact integers off a per-accept log: 200
+fresh-connection requests over the plain path cost exactly 200 accepts
+(validated — the run fails if the OFF leg is anything else); the same 200
+through `upstream_pool: true` cost **0 new accepts**, the warmup's pooled
+connection, inside its 90-second idle window, serving every one. That
+zero-over-one is the honest expectation, not a surprise: after the first
+dial the pool's job is to never dial again. Loopback timings are recorded
+beside them as measured (this run: 558→879 req/s, p95 2.22→1.49 ms) with
+the standing admission that the real win case is a real-RTT local leg — a
+container hop, accept queueing, per-connection upstream state — which
+loopback cannot exercise (spec 19's non-goal; not faked here).
+
+### Failure vocabulary parity, both ends of the lifecycle
+
+`http.Transport` cannot pre-seed its pool, so "eager dial" ships as a
+synchronous liveness dial on the tunnel's first use (`ensureWarm`): a dead
+upstream discovered cold fails into the existing `writeBadGateway` path,
+byte-identical to the plain dial's page (e2e-pinned modulo the hostname,
+whose substitution moves only the Content-Length digit writeBadGateway
+itself computes). A warm death — the upstream dies mid-run — answers the
+bridge's HTTP/1.1 502, a fingerprint deliberately distinct from the cold
+page, and the next request re-dials: restart on the same port heals with no
+operator action, no poisoned pool. Warm marking happens at ModifyResponse,
+the only moment the name is honest — it runs on success, including 101,
+never on a RoundTrip error.
+
+### The upgrade ruling, and what the e2e group caught
+
+Websocket passthrough SHIPPED: ReverseProxy's 101 handling (hijack + splice)
+works over the bridge, pinned by a raw-socket upgrade with a post-upgrade
+frame round-trip, and stated in the key's config comment. The refusal
+fallback the spec allowed was not needed. The e2e group also caught two of
+the harness's own wrong beliefs, kept here because they generalize: an SSE
+probe that asserted the visitor stream "ends with the last event's bytes"
+can never pass through ReverseProxy — it strips the upstream's hop-by-hop
+`Connection: close` and re-serializes unknown-length bodies as chunked, and
+the probe's early green runs were truncation accidents that a reset turned
+into false passes; it now asserts content membership plus a completed
+chunked stream. And the bench's single-threaded python upstream froze
+exactly the way a single-threaded service behind `upstream_pool` would in
+production — a pooled client holds idle keep-alive connections open by
+design, and the fixture served one response and blocked forever on the
+held conn; the pool leg's fixture is threaded now, accept counts still
+exact.
+
+### Opt-in, and refused where it has no meaning
+
+`validateUpstreamPool` refuses, in the family's established voice:
+non-http/https legs, `forward_to` (no local dial happens),
+`upstream_protocol: http2` (that leg already pools; both keys cannot own
+the local dial), and `alpn` containing "h2" (those visitors reach the local
+leg raw; the bridge would parse h2 bytes as h1). No new knobs, no CLI flag
+(pinned by test): fixed 90s idle timeout, fixed MaxIdleConnsPerHost of 100
+— the default of 2 would silently defeat pooling under concurrency. The
+SaveAuthToken rewrite marshals the whole config, so the release pins both
+directions live: a pooled tunnel's key survives the rewrite, a config that
+never said `upstream_pool` grows nothing.
+
 ## 1.0.23 - 2026-10-09 - carrier_dedup telemetry: the v2 gate becomes readable
 
 Cluster 21 shipped `carrier_dedup` with log lines as its entire observability

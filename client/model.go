@@ -817,6 +817,12 @@ func tunnelFromConfig(publicUrl, protocolName string, protocol proto.Protocol, c
 		// TunnelConfiguration.UpstreamProtocol for why the config keeps the
 		// emptiness).
 		UpstreamProtocol: upstreamProtocolOrDefault(config.UpstreamProtocol),
+
+		// SPEC-CLUSTER25: whether the local dial is pooled. A bool needs no
+		// resolving -- the zero value IS the default, and the config field
+		// keeps the key's absence for the round-trip contract the same way
+		// CarrierDedup does.
+		UpstreamPool: config.UpstreamPool,
 	}
 }
 
@@ -1099,13 +1105,23 @@ func (c *ClientModel) serveProxyConnection(remoteConn conn.Conn, startPxy *msg.S
 	// SPEC-CLUSTER17: upstream_protocol: http2 substitutes the h1<->h2c
 	// transcoder (client/upstreamh2.go) for the plain dial -- the conn.Conn
 	// this step produces behaves as the local leg either way, so every step
-	// below is unchanged. Explicit http1 and the unset default take the else
-	// branch, which is today's dial verbatim (review gate 1 pins that).
+	// below is unchanged. SPEC-CLUSTER25: upstream_pool: true does the same
+	// with the h1 pool bridge (client/upstreamh1.go). Explicit http1, the
+	// unset default, and a tunnel with neither key take the else branch, which
+	// is today's dial verbatim (review gate 1 pins that).
+	//
+	// One documented observable difference on a POOLED tunnel, and only there:
+	// the local-leg inspector tee sees Go-serialized h1 (header case and order
+	// may differ from the visitor's bytes), because net/http owns the local
+	// crossing. Dev-inspection only; the visitor sees the rewritten head as
+	// the rewriter emitted it.
 	start := time.Now()
 	var localConn conn.Conn
 	var localErr error
 	if tunnel.UpstreamProtocol == UpstreamProtocolHTTP2 {
 		localConn, localErr = dialUpstreamH2(tunnel)
+	} else if tunnel.UpstreamPool {
+		localConn, localErr = dialUpstreamH1Pooled(tunnel)
 	} else {
 		localConn, localErr = conn.Dial(tunnel.LocalAddr, "prv", nil)
 	}

@@ -4082,14 +4082,23 @@ YAML
 ./bin/ngrok -config="$TMPDIR/ngrok-oidc-zk.yml" -log=/tmp/ngrok-e2e-oidc-zk-client.log \
   start oidczk >/tmp/ngrok-e2e-oidc-zk-stdout.log 2>&1 &
 sleep 3
-if ! grep -qi 'oidc' /tmp/ngrok-e2e-oidc-zk-client.log; then
+# The refusal reaches two sinks: the logger's -log file and, via ctl.Shutdown,
+# the stdout the shutdown path prints before the process exits. Which copy of
+# the last lines survives is a flush race against that exit -- observed once
+# with stdout carrying the refusal while the log file lost its tail -- so the
+# assertion reads both files. Same words, either sink; the requirement is
+# unchanged.
+OIDC_ZK_EVIDENCE="$(cat /tmp/ngrok-e2e-oidc-zk-client.log /tmp/ngrok-e2e-oidc-zk-stdout.log 2>/dev/null)"
+if ! grep -qi 'oidc' <<<"$OIDC_ZK_EVIDENCE"; then
   echo "[e2e] the zk+oidc registration was not refused (or not named):"
   tail -n 20 /tmp/ngrok-e2e-oidc-zk-client.log
   exit 1
 fi
-if ! grep -qiE 'agent.tls|zero.knowledge|agent.terminated' /tmp/ngrok-e2e-oidc-zk-client.log; then
+if ! grep -qiE 'agent.tls|zero.knowledge|agent.terminated' <<<"$OIDC_ZK_EVIDENCE"; then
   echo "[e2e] the refusal does not name the termination mode:"
   tail -n 20 /tmp/ngrok-e2e-oidc-zk-client.log
+  echo '[e2e] stdout:'
+  cat /tmp/ngrok-e2e-oidc-zk-stdout.log
   exit 1
 fi
 
@@ -5978,5 +5987,937 @@ dedup_expect_refusal "$TMPDIR/dedup-refusal-tls.yml" bad-tls \
 
 kill "$DEDUP_HTTP_UP_PID" "$DEDUP_UDP_UP_PID" 2>/dev/null || true
 echo "[e2e] dedup group: 6/6 scenarios passed"
+
+# ---------------------------------------------------------------------------
+# upstream_pool (SPEC-CLUSTER25): ten scenarios for the opt-in h1 local-leg
+# pool. The default path dials one fresh TCP connection to the local service
+# per proxied request; `upstream_pool: true` replaces that dial with a bridge
+# whose requests ride one shared keep-alive transport per local address, so N
+# requests need k connections instead of N. The default path is untouched
+# (the dial site branches once), which is why half of this group spends its
+# time proving the pooled road behaves EXACTLY like the plain one on the
+# dimensions the plain one made promises about: the 502 page bytes, the
+# streaming shape, the upgrade passthrough, the single X-Forwarded-For.
+#
+# Scenario map (the spec's ten):
+#   1  byte-exact body + Content-Length through the bridge (sha256 echo)
+#   2  reuse: N fresh-connection requests, <=3 upstream accepts; an 8-way
+#      burst reported as measured (accept collapse N -> k)
+#   3  dead-cold upstream: the pooled answer is writeBadGateway's HTTP/1.0
+#      page, byte-IDENTICAL to the plain dial's (compared, not asserted)
+#   4  warm death: bridge 502 (HTTP/1.1 fingerprint), then self-heal on the
+#      same address with no operator action
+#   5  websocket upgrade passthrough (101, then post-upgrade bytes both ways)
+#   6  SSE: the first event is observable before the upstream writes the
+#      second -- flush parity, no bridge buffering
+#   7  exactly one X-Forwarded-For / one X-Forwarded-Proto at the upstream
+#      (Rewrite-mode ReverseProxy carries the rewriter's values verbatim)
+#   8  load-time refusal matrix (tcp, udp, forward_to, upstream_protocol h2,
+#      alpn h2) -- the exact refusals the unit matrix pins
+#   9  agent_tls_termination composes: request_header add and response_header
+#      remove both survive the bridge on an agent-terminated https tunnel
+#  10  upstream_pool survives the SaveAuthToken config rewrite; a config
+#      without the key grows none
+#
+# Ports grepped across the whole file before picking, the standing rule: the
+# other groups hold public http :18080-:18092, https :18443-:18446, tunnel
+# :14443-:14457, admin :19090-:19104, local upstreams :19001-:19022, claimed
+# remote ports :14877-:14880 (scripts/bench.sh holds 18180/18480/15443/19110/
+# 19190). This group takes public http :18093, https :18447 and tunnel :14458
+# for its ONE ngrokd stack (up for the whole group), plus local upstreams
+# :19023 (multi-route: /echo, /headers, /sse, /ws) and :19024 (the self-heal
+# upstream, killed and restarted on the same port mid-scenario). No admin
+# port: the group reads no telemetry, and a claim without a use would be a
+# lie in a file whose port banners are read as a registry. Every other
+# upstream_pool-adjacent port was left for the bench group to claim.
+#
+# Logs go to /tmp/ngrok-e2e-pool/ -- deliberately OUTSIDE the
+# /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks -- and the group
+# clears its own directory first, for the same O_APPEND reason that makes
+# every other group do it.
+# ---------------------------------------------------------------------------
+
+POOL_DIR=/tmp/ngrok-e2e-pool
+POOL_HTTP=18093
+POOL_HTTPS=18447
+POOL_TUNNEL=14458
+POOL_UP=127.0.0.1:19023
+POOL_HEAL_UP=127.0.0.1:19024
+mkdir -p "$POOL_DIR"
+rm -f "$POOL_DIR"/*.log
+
+# The multi-route upstream. HTTP/1.1 with explicit Content-Length everywhere a
+# body is declared, so keep-alive chains survive; ThreadingHTTPServer because
+# scenario 2's burst holds eight connections at once (the dedup group's
+# single-threaded HTTPServer would serialize them and measure nothing).
+#
+# Every response carries X-Upstream-Noise: the visitor-side surface this group
+# asserts on twice -- present in scenario 7 (the bridge must not editorialize
+# an unpolicied header), absent in scenario 9 (response_header remove must
+# still run on the visitor leg, which the pool path did not touch).
+#
+# The accept counter lives BELOW the handler, in get_request: a request
+# counter would credit keep-alive reuse as connections and the whole point of
+# scenario 2 is that it must not.
+cat > "$TMPDIR/pool_upstream.py" <<'PY'
+import base64, hashlib, json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class CountingHTTPServer(ThreadingHTTPServer):
+    accepts_path = ""
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with open(self.accepts_path, "a") as fh:
+            fh.write("accept\n")
+        return conn, addr
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code, ctype, body):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Upstream-Noise", "shh")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/headers":
+            body = json.dumps({
+                "xff": self.headers.get_all("X-Forwarded-For") or [],
+                "xfp": self.headers.get_all("X-Forwarded-Proto") or [],
+                "xfh": self.headers.get_all("X-Forwarded-Host") or [],
+                "pool_zk": self.headers.get_all("X-Pool-ZK") or [],
+                "host": self.headers.get("Host", ""),
+            }).encode()
+            self._send(200, "application/json", body)
+        elif self.path == "/sse":
+            # Two events with a real gap: the probe below must SEE the first
+            # before the second is written, which is what distinguishes a
+            # streaming bridge from a buffering one.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"data: first\n\n")
+            self.wfile.flush()
+            time.sleep(3)
+            self.wfile.write(b"data: second\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+        elif self.path == "/ws":
+            self._websocket()
+        else:
+            self._send(200, "text/plain", b"pool-e2e-ok")
+
+    def do_POST(self):
+        want = int(self.headers.get("Content-Length", "0") or "0")
+        data = b""
+        while len(data) < want:
+            chunk = self.rfile.read(want - len(data))
+            if not chunk:
+                break
+            data += chunk
+        body = ("sha256:%s:%d" % (hashlib.sha256(data).hexdigest(), len(data))).encode()
+        self._send(200, "text/plain", body)
+
+    def _websocket(self):
+        # Just enough websocket to prove the mechanism (the unit fixture's
+        # design): require the upgrade, answer 101 with the RFC 6455 accept
+        # key, echo one frame, drain to EOF. Unmasked frames only -- the probe
+        # is ours; browsers mask, this fixture proves the tunnel carries
+        # post-upgrade bytes both ways, not the whole RFC.
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.wfile.write((
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: websocket\r\n"
+            "Sec-WebSocket-Accept: %s\r\n\r\n" % accept
+        ).encode())
+        self.wfile.flush()
+        header = self.rfile.read(2)
+        n = header[1] & 0x7F
+        payload = self.rfile.read(n)
+        self.wfile.write(bytes([0x81, n]) + payload)
+        self.wfile.flush()
+        self.rfile.read()  # until the probe hangs up
+        self.close_connection = True
+
+    def log_message(self, *_):
+        pass
+
+
+srv = CountingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+srv.accepts_path = sys.argv[2]
+srv.serve_forever()
+PY
+
+# pool_post.py <port> <hostheader> <count> <mode>: <count> 64 KiB POSTs to
+# /echo, each on its OWN connection to the public port (fresh visitor
+# connections are what make the accept count mean "pooled", not "the driver
+# reused its connection"), verified per request against the sha256 the
+# upstream names. mode=sequential runs them one after another -- the collapse
+# window: N requests that must reuse one pooled connection. mode=burst runs
+# them concurrently -- the sanity window: every answer correct, accepts
+# bounded by the request count. Prints one POST-OK line.
+cat > "$TMPDIR/pool_post.py" <<'PY'
+import hashlib, http.client, os, sys, threading, time
+
+port, host_header, count, mode = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+payload = os.urandom(65536)
+want = ("sha256:%s:%d" % (hashlib.sha256(payload).hexdigest(), len(payload))).encode()
+
+errors = []
+lock = threading.Lock()
+started = time.perf_counter()
+
+
+def one(i):
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request("POST", "/echo", body=payload, headers={"Host": host_header})
+        resp = conn.getresponse()
+        answer = resp.read()
+        conn.close()
+        if resp.status != 200 or answer != want:
+            with lock:
+                errors.append("req %d answered %d %r" % (i, resp.status, answer[:64]))
+    except Exception as exc:
+        with lock:
+            errors.append("req %d raised %r" % (i, exc))
+
+
+if mode == "burst":
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+else:
+    for i in range(count):
+        one(i)
+wall = time.perf_counter() - started
+
+if errors:
+    for e in errors[:5]:
+        print(e)
+    sys.exit(1)
+print("POST-OK count=%d bytes_each=%d wall_s=%.3f" % (count, len(payload), wall))
+PY
+
+# pool_ws_probe.py <hostheader> <port>: the scenario 5 probe. Raw socket,
+# real RFC 6455 accept-key handshake; after the 101 it writes one unmasked
+# 0x81 frame and demands the echo back. Exit 0 only if the upgrade survived
+# AND post-upgrade bytes round-trip.
+cat > "$TMPDIR/pool_ws_probe.py" <<'PY'
+import base64, hashlib, os, socket, sys, time
+
+host_header, port = sys.argv[1], int(sys.argv[2])
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((
+    "GET /ws HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Connection: Upgrade\r\n"
+    "Upgrade: websocket\r\n"
+    "Sec-WebSocket-Key: %s\r\n"
+    "Sec-WebSocket-Version: 13\r\n\r\n" % (host_header, key)
+).encode())
+
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        sys.exit("connection closed before the 101 head: %r" % buf[:200])
+    buf += chunk
+head, _, rest = buf.partition(b"\r\n\r\n")
+if b"101" not in head.split(b"\r\n")[0]:
+    sys.exit("not a 101: %r" % head[:200])
+
+payload = b"ws-e2e-frame"
+want = bytes([0x81, len(payload)]) + payload
+s.sendall(want)
+buf = rest
+deadline = time.time() + 10
+while len(buf) < len(want) and time.time() < deadline:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+if not buf.startswith(want):
+    sys.exit("frame echo damaged: %r" % buf[:64])
+print("WS-OK 101 + frame echo (%d bytes back)" % len(buf))
+PY
+
+# pool_sse_probe.py <hostheader> <port>: the scenario 6 probe. Timestamps the
+# first SSE event and the end of stream; fails if the first event needed more
+# than 1.5s (a buffering bridge), the whole stream took under 2.5s (the
+# upstream's 3s gap went missing and the probe proved nothing), or the chunked
+# stream never completed.
+cat > "$TMPDIR/pool_sse_probe.py" <<'PY'
+import socket, sys, time
+
+host_header, port = sys.argv[1], int(sys.argv[2])
+t0 = time.perf_counter()
+s = socket.create_connection(("127.0.0.1", port), timeout=15)
+s.sendall(("GET /sse HTTP/1.1\r\nHost: %s\r\n\r\n" % host_header).encode())
+
+buf = b""
+while b"data: first\n\n" not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        sys.exit("closed before the first SSE event: %r" % buf[:200])
+    buf += chunk
+first = time.perf_counter() - t0
+
+# Through httputil.ReverseProxy the upstream's hop-by-hop Connection: close is
+# stripped and the unknown-length body is re-serialized as chunked, so the
+# visitor's stream ends with the terminator "0\r\n\r\n" -- it can NEVER end
+# with the raw event bytes. (An earlier endswith("data: second\\n\\n") here was
+# satisfiable only by a truncation race: a reset that chopped the terminator
+# made a damaged stream satisfy the success condition. Membership plus a
+# completed-stream check below is the honest shape.) A timeout still dumps
+# what the visitor actually has, so a stalled relay is diagnosed from
+# evidence, not guessed at.
+while b"data: second\n\n" not in buf:
+    try:
+        chunk = s.recv(4096)
+    except ConnectionResetError:
+        sys.exit("reset before the second event, tail: %r" % buf[-64:])
+    except TimeoutError:
+        sys.exit("timed out %.1fs after the first event with %d bytes:\n%r" % (time.perf_counter() - t0 - first, len(buf), buf))
+    if not chunk:
+        sys.exit("closed before the second event, tail: %r" % buf[-64:])
+    buf += chunk
+
+# Both events arrived; the response must also COMPLETE. Through the bridge
+# that means the chunked terminator (EOF is the plain-dial path's shape; the
+# bridge strips the close signal, so a clean reset is accepted as its
+# equivalent).
+while not buf.endswith(b"0\r\n\r\n"):
+    try:
+        chunk = s.recv(4096)
+    except ConnectionResetError:
+        break
+    except TimeoutError:
+        sys.exit("stream never completed after the second event, tail: %r" % buf[-64:])
+    if not chunk:
+        break
+    buf += chunk
+total = time.perf_counter() - t0
+if first >= 1.5:
+    sys.exit("first event took %.2fs -- the pooled bridge buffered a stream the plain dial delivers live" % first)
+if total <= 2.5:
+    sys.exit("whole stream took %.2fs -- the upstream's 3s gap is missing, this probe proves nothing" % total)
+print("SSE-OK first_event_s=%.2f total_s=%.2f" % (first, total))
+PY
+
+# pool_fetch_raw.py <port> <hostheader> <outfile>: one request on a raw
+# socket, every byte of the answer to <outfile> -- the 502 comparisons work
+# on what a visitor LITERALLY receives, not on what a client library
+# re-serialized.
+cat > "$TMPDIR/pool_fetch_raw.py" <<'PY'
+import socket, sys
+
+port, host_header, out = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port), timeout=15)
+s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % host_header).encode())
+buf = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+open(out, "wb").write(buf)
+print("FETCH-OK %d bytes" % len(buf))
+PY
+
+# pool_502_expect.py <pooled-raw> <plain-raw> <deadport>: the scenario 3
+# verdict. The expected bytes are writeBadGateway's, spelled out in full --
+# HTTP/1.0, bare-\n line endings, the BadGateway template substituted with
+# the public URL and the local address. The pooled and plain captures must
+# EACH equal their own expected page exactly, and equal each other modulo the
+# hostname -- the spec's "byte-identical to the existing path" made
+# literal.
+cat > "$TMPDIR/pool_502_expect.py" <<'PY'
+import sys
+
+pooled_path, plain_path, deadport = sys.argv[1], sys.argv[2], sys.argv[3]
+
+TEMPLATE = (
+    "<html>\n"
+    '<body style="background-color: #97a8b9">\n'
+    '    <div style="margin:auto; width:400px;padding: 20px 60px; '
+    'background-color: #D3D3D3; border: 5px solid maroon;">\n'
+    "        <h2>Tunnel %s unavailable</h2>\n"
+    "        <p>Unable to initiate connection to <strong>%s</strong>. "
+    "A web server must be running on port <strong>%s</strong> to complete the tunnel.</p>\n"
+)
+
+
+def expected(url, addr):
+    body = TEMPLATE % (url, addr, addr)
+    return (
+        "HTTP/1.0 502 Bad Gateway\n"
+        "Content-Type: text/html\n"
+        "Content-Length: %d\n\n%s" % (len(body), body)
+    ).encode()
+
+
+pooled = open(pooled_path, "rb").read()
+plain = open(plain_path, "rb").read()
+addr = "127.0.0.1:" + deadport
+want_pooled = expected("http://pool-dead", addr)
+want_plain = expected("http://plain-dead", addr)
+
+if pooled != want_pooled:
+    sys.exit("the pooled dead-cold answer is not writeBadGateway's page:\ngot:  %r\nwant: %r" % (pooled, want_pooled))
+if plain != want_plain:
+    sys.exit("the plain dead-cold answer is not writeBadGateway's page:\ngot:  %r\nwant: %r" % (plain, want_plain))
+
+
+# Same page modulo the hostname. The two template comparisons above already
+# imply it -- both expected pages come from the one function -- but the raw
+# captures are compared to each other anyway, because "byte-identical" is the
+# claim under test and two identical template calls could both drift. The one
+# honest wrinkle: the hostname is IN the body, so substituting it changes the
+# body length and with it the declared Content-Length -- the headers differ by
+# exactly that digit, by writeBadGateway's own arithmetic. Normalizing the
+# length line (and nothing else) before the hostname substitution is the
+# substitution done right, not a loophole: every other byte must still match.
+def same_page_modulo_hostname(a, b):
+    def norm(page, from_host, to_host):
+        head, sep, body = page.partition(b"\n\n")
+        head = b"\n".join(
+            b"Content-Length: N" if line.startswith(b"Content-Length:") else line
+            for line in head.split(b"\n")
+        )
+        return head + sep + body.replace(from_host, to_host)
+
+    return norm(a, b"plain-dead", b"pool-dead") == norm(b, b"plain-dead", b"pool-dead")
+
+
+if not same_page_modulo_hostname(pooled, plain):
+    sys.exit("the pooled and plain 502 pages are not the same page modulo the hostname:\npooled: %r\nplain:  %r" % (pooled, plain))
+print("502-IDENTICAL pooled=%d plain=%d bytes" % (len(pooled), len(plain)))
+PY
+
+pool_wait_server() {  # <log> <label>: the carrier listener is up
+  local log="$1" label="$2" i
+  for i in $(seq 1 40); do
+    if grep -q "Listening for control and proxy connections" "$log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: ngrokd never came up:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+pool_wait_tunnel() {  # <log> <want> <label>
+  local log="$1" want="$2" label="$3" i
+  for i in $(seq 1 40); do
+    if [[ "$(grep -c 'Tunnel established' "$log" 2>/dev/null || true)" -ge "$want" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "[e2e] $label: only $(grep -c 'Tunnel established' "$log" 2>/dev/null || true) of $want tunnels established:"
+  tail -n 40 "$log" || true
+  return 1
+}
+
+pool_wait_public() {  # <port> <host> <label>: first non-404, as everywhere
+  local port="$1" host="$2" label="$3" code i
+  for i in $(seq 1 40); do
+    code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Host: $host" "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the public listener never learned $host"
+  return 1
+}
+
+pool_wait_public_tls() {  # <host> <label>: --resolve sends the SNI that does the routing
+  local host="$1" label="$2" code i
+  for i in $(seq 1 40); do
+    code="$(curl -sSk -m 5 -o /dev/null -w '%{http_code}' --resolve "$host:$POOL_HTTPS:127.0.0.1" "https://$host:$POOL_HTTPS/" 2>/dev/null || true)"
+    if [[ "$code" != "404" && "$code" != "000" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the https listener never learned $host"
+  return 1
+}
+
+pool_reset_accepts() { : > "$POOL_DIR/accepts.log"; }
+pool_accept_count() { grep -c accept "$POOL_DIR/accepts.log" 2>/dev/null || true; }
+
+# pool_stop <client-pid> <ngrokd-pid>: the client goes first so the server's
+# registry lets the hostnames go (dedup_stop's reasoning, verbatim).
+pool_stop() {
+  kill "$1" "$2" 2>/dev/null || true
+  wait "$1" "$2" 2>/dev/null || true
+}
+
+pool_expect_refusal() {  # <config> <tunnel> <expected-substring> <label>
+  # Two local statements on purpose (the dedup twin's comment, verbatim):
+  # every RHS of ONE local expands before ANY of its assignments run, so
+  # out=... below would read $name unset and set -u aborts the run.
+  local cfg="$1" name="$2" want="$3" label="$4" pid rc=0 i
+  local out="$POOL_DIR/refusal-$name.log"
+  ./bin/ngrok -config="$cfg" start "$name" >"$out" 2>&1 &
+  pid=$!
+  for i in $(seq 1 40); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[e2e] $label: the client did not exit on the refused config:"
+    cat "$out" || true
+    kill "$pid" 2>/dev/null || true
+    return 1
+  fi
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  if [[ "$rc" == "0" ]]; then
+    echo "[e2e] $label: the client exited 0 on a config it must refuse:"
+    cat "$out" || true
+    return 1
+  fi
+  if ! grep -qF "$want" "$out"; then
+    echo "[e2e] $label: the client exited $rc but its output does not carry the expected refusal:"
+    cat "$out" || true
+    return 1
+  fi
+  echo "[e2e] $label: refused at load (exit $rc), naming the tunnel:"
+  grep -F "$want" "$out" | head -n 1 | sed 's/^/[e2e]     /'
+}
+
+echo "[e2e] starting the pool group's upstreams (:19023 multi-route, :19024 reserved for pool 4) and its one ngrokd (:18093/:18447/:14458)"
+python3 "$TMPDIR/pool_upstream.py" 19023 "$POOL_DIR/accepts.log" >"$POOL_DIR/upstream.log" 2>&1 &
+POOL_UP_PID=$!
+: > "$POOL_DIR/accepts.log"
+
+./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:$POOL_HTTP -httpsAddr=127.0.0.1:$POOL_HTTPS \
+  -tunnelAddr=127.0.0.1:$POOL_TUNNEL >"$POOL_DIR/ngrokd.log" 2>&1 &
+POOL_NGROKD_PID=$!
+pool_wait_server "$POOL_DIR/ngrokd.log" "pool (ngrokd)"
+
+# The main client: pool-echo is the pooled tunnel scenarios 1, 2, 5, 6 and 7
+# drive. The local address is spelled fully (not the bare-int form the dedup
+# configs use) so scenario 3's page substitution is predictable -- the 502
+# template prints LocalAddr verbatim, and "127.0.0.1:19023" is what a reader
+# expects there, not "19023".
+cat > "$TMPDIR/pool-main.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-echo:
+    hostname: pool-echo
+    proto:
+      http: "$POOL_UP"
+    upstream_pool: true
+YAML
+./bin/ngrok -config="$TMPDIR/pool-main.yml" -log="$POOL_DIR/main-client.log" \
+  start pool-echo >"$POOL_DIR/main-client-stdout.log" 2>&1 &
+POOL_MAIN_CLIENT_PID=$!
+pool_wait_tunnel "$POOL_DIR/main-client.log" 1 "pool 1 (client)"
+pool_wait_public "$POOL_HTTP" pool-echo "pool 1 (public)"
+
+# pool 1: byte-exactness. 64 KiB of urandom with an explicit Content-Length,
+# answered by the sha256 of the exact bytes received -- the POST body is
+# verified per byte through visitor -> ngrokd -> carrier -> agent -> bridge ->
+# upstream, and the response back with it.
+echo "[e2e] pool 1: byte-exact 64 KiB POST through the pooled bridge"
+python3 "$TMPDIR/pool_post.py" "$POOL_HTTP" pool-echo 1 sequential | sed 's/^/[e2e] pool 1: /'
+
+# pool 2: the accept collapse. Ten requests, each on a FRESH visitor
+# connection -- the shape that would cost the plain dial ten upstream
+# connections -- and the upstream must take at most a couple. The window is
+# steady-state on purpose: pool 1 warmed the address, so the ideal count is 0
+# (pure reuse of the connection scenario 1 created); the <=3 bound leaves room
+# for one replacement connection, not for per-request dialing. The burst leg
+# then proves eight concurrent visitor connections all get correct answers
+# with accepts bounded by the request count -- reported as measured, because
+# the honest number under concurrency is the transport's scheduling, not a
+# constant this script could promise.
+echo "[e2e] pool 2: reuse -- 10 sequential fresh-connection requests vs the upstream's accept count"
+pool_reset_accepts
+python3 "$TMPDIR/pool_post.py" "$POOL_HTTP" pool-echo 10 sequential | sed 's/^/[e2e] pool 2: /'
+ACCEPTS_SEQ="$(pool_accept_count)"
+if [[ "$ACCEPTS_SEQ" -gt 3 ]]; then
+  echo "[e2e] pool 2: the upstream took $ACCEPTS_SEQ connections for 10 requests (want <= 3: reuse is the feature)"
+  exit 1
+fi
+echo "[e2e] pool 2: 10 fresh-connection requests took $ACCEPTS_SEQ upstream accepts (the plain dial would take 10)"
+pool_reset_accepts
+python3 "$TMPDIR/pool_post.py" "$POOL_HTTP" pool-echo 8 burst | sed 's/^/[e2e] pool 2: /'
+ACCEPTS_BURST="$(pool_accept_count)"
+if [[ "$ACCEPTS_BURST" -gt 8 ]]; then
+  echo "[e2e] pool 2: an 8-way burst took $ACCEPTS_BURST accepts -- more connections than requests is per-request dialing"
+  exit 1
+fi
+echo "[e2e] pool 2: the 8-way burst took $ACCEPTS_BURST accepts (reported as measured)"
+
+# pool 3: dead-cold. A port with nothing behind it, one client, two tunnels
+# that differ ONLY in upstream_pool, and a raw-socket fetch of both answers.
+# The comparison is byte-exact against the page writeBadGateway writes --
+# HTTP/1.0 status line, bare-\n endings and all -- because "the existing 502
+# path" is a byte contract, not a status code.
+echo "[e2e] pool 3: dead-cold upstream -- pooled vs plain, byte for byte"
+DEAD_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+cat > "$TMPDIR/pool-dead.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-dead:
+    hostname: pool-dead
+    proto:
+      http: "127.0.0.1:$DEAD_PORT"
+    upstream_pool: true
+  plain-dead:
+    hostname: plain-dead
+    proto:
+      http: "127.0.0.1:$DEAD_PORT"
+YAML
+./bin/ngrok -config="$TMPDIR/pool-dead.yml" -log="$POOL_DIR/dead-client.log" \
+  start pool-dead plain-dead >"$POOL_DIR/dead-client-stdout.log" 2>&1 &
+POOL_DEAD_CLIENT_PID=$!
+pool_wait_tunnel "$POOL_DIR/dead-client.log" 2 "pool 3 (client)"
+pool_wait_public "$POOL_HTTP" pool-dead "pool 3 (public, pooled)"
+pool_wait_public "$POOL_HTTP" plain-dead "pool 3 (public, plain)"
+python3 "$TMPDIR/pool_fetch_raw.py" "$POOL_HTTP" pool-dead "$POOL_DIR/dead-pooled.raw" | sed 's/^/[e2e] pool 3: /'
+python3 "$TMPDIR/pool_fetch_raw.py" "$POOL_HTTP" plain-dead "$POOL_DIR/dead-plain.raw" | sed 's/^/[e2e] pool 3: /'
+python3 "$TMPDIR/pool_502_expect.py" "$POOL_DIR/dead-pooled.raw" "$POOL_DIR/dead-plain.raw" "$DEAD_PORT" \
+  | sed 's/^/[e2e] pool 3: /'
+pool_stop "$POOL_DEAD_CLIENT_PID" "$POOL_DEAD_CLIENT_PID"
+
+# pool 4: warm death and the self-heal. A second upstream on its own port, so
+# the kill cannot disturb the main tunnel's pool. Kill = listener closed AND
+# every accepted conn FINed, the way a process death kills a service. The
+# warm-death answer is the bridge's OWN 502 -- net/http writes it, so the
+# status line is HTTP/1.1, the documented fingerprint that distinguishes this
+# road from writeBadGateway's HTTP/1.0 above -- and after the restart on the
+# same address the next request heals with no operator action (no poisoned
+# pool).
+echo "[e2e] pool 4: warm death answers the bridge 502, restart on the same port heals"
+python3 "$TMPDIR/pool_upstream.py" 19024 "$POOL_DIR/heal-accepts.log" >"$POOL_DIR/heal-upstream.log" 2>&1 &
+POOL_HEAL_UP_PID=$!
+HEAL_CODE="000"
+for i in $(seq 1 40); do
+  HEAL_CODE="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://$POOL_HEAL_UP/ 2>/dev/null || true)"
+  if [[ "$HEAL_CODE" == "200" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$HEAL_CODE" != "200" ]]; then
+  echo "[e2e] pool 4: the self-heal upstream never came up on $POOL_HEAL_UP"
+  exit 1
+fi
+
+cat > "$TMPDIR/pool-heal.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-heal:
+    hostname: pool-heal
+    proto:
+      http: "$POOL_HEAL_UP"
+    upstream_pool: true
+YAML
+./bin/ngrok -config="$TMPDIR/pool-heal.yml" -log="$POOL_DIR/heal-client.log" \
+  start pool-heal >"$POOL_DIR/heal-client-stdout.log" 2>&1 &
+POOL_HEAL_CLIENT_PID=$!
+pool_wait_tunnel "$POOL_DIR/heal-client.log" 1 "pool 4 (client)"
+pool_wait_public "$POOL_HTTP" pool-heal "pool 4 (public)"
+
+HEAL_OK="$(curl -fsS -m 10 -H 'Host: pool-heal' "http://127.0.0.1:$POOL_HTTP/")"
+if [[ "$HEAL_OK" != "pool-e2e-ok" ]]; then
+  echo "[e2e] pool 4: the first request through the live service failed: $HEAL_OK"
+  exit 1
+fi
+echo "[e2e] pool 4: warm -- killing the upstream"
+
+kill "$POOL_HEAL_UP_PID" 2>/dev/null || true
+wait "$POOL_HEAL_UP_PID" 2>/dev/null || true
+
+DEATH_CODE="200"
+for i in $(seq 1 40); do
+  DEATH_CODE="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H 'Host: pool-heal' "http://127.0.0.1:$POOL_HTTP/" 2>/dev/null || true)"
+  if [[ "$DEATH_CODE" == "502" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$DEATH_CODE" != "502" ]]; then
+  echo "[e2e] pool 4: a warm pool whose service died never answered 502 (last code $DEATH_CODE)"
+  exit 1
+fi
+python3 "$TMPDIR/pool_fetch_raw.py" "$POOL_HTTP" pool-heal "$POOL_DIR/warm-dead.raw" >/dev/null
+if ! head -n 1 "$POOL_DIR/warm-dead.raw" | grep -q '^HTTP/1\.1 502'; then
+  echo "[e2e] pool 4: the warm-death 502 is not the bridge's own (expected the HTTP/1.1 fingerprint):"
+  head -n 1 "$POOL_DIR/warm-dead.raw"
+  exit 1
+fi
+echo "[e2e] pool 4: warm death answered HTTP/1.1 502 (the bridge's fingerprint, distinct from pool 3's HTTP/1.0)"
+
+python3 "$TMPDIR/pool_upstream.py" 19024 "$POOL_DIR/heal-accepts.log" >>"$POOL_DIR/heal-upstream.log" 2>&1 &
+POOL_HEAL_UP_PID=$!
+HEAL_CODE="502"
+for i in $(seq 1 40); do
+  HEAL_CODE="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H 'Host: pool-heal' "http://127.0.0.1:$POOL_HTTP/" 2>/dev/null || true)"
+  if [[ "$HEAL_CODE" == "200" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$HEAL_CODE" != "200" ]]; then
+  echo "[e2e] pool 4: the tunnel did not self-heal after the restart (last code $HEAL_CODE)"
+  exit 1
+fi
+HEAL_OK="$(curl -fsS -m 10 -H 'Host: pool-heal' "http://127.0.0.1:$POOL_HTTP/")"
+if [[ "$HEAL_OK" != "pool-e2e-ok" ]]; then
+  echo "[e2e] pool 4: the healed answer was not the upstream's: $HEAL_OK"
+  exit 1
+fi
+echo "[e2e] pool 4: healed on the same address, no operator action"
+pool_stop "$POOL_HEAL_CLIENT_PID" "$POOL_HEAL_CLIENT_PID"
+
+# pool 5: websocket upgrades PASS THROUGH the pooled bridge (the shipped
+# ruling -- ReverseProxy's 101 handling hijacks and splices, which is what the
+# raw pipe did anyway). Full stack here: visitor -> ngrokd -> carrier ->
+# rewriter -> bridge -> upstream, handshake accepted key included.
+echo "[e2e] pool 5: websocket upgrade passthrough (101 + post-upgrade frame echo)"
+python3 "$TMPDIR/pool_ws_probe.py" pool-echo "$POOL_HTTP" | sed 's/^/[e2e] pool 5: /'
+
+# pool 6: SSE flush parity. The upstream writes event one, flushes, sleeps 3s,
+# writes event two; the probe must OBSERVE event one during that gap.
+echo "[e2e] pool 6: SSE -- the first event is observable before the stream ends"
+python3 "$TMPDIR/pool_sse_probe.py" pool-echo "$POOL_HTTP" | sed 's/^/[e2e] pool 6: /'
+
+# pool 7: the XFF contract, end to end. Exactly ONE X-Forwarded-For (the
+# rewriter's injected value, carried verbatim -- a second value would mean the
+# bridge appended, which Rewrite-mode ReverseProxy must not) and one
+# X-Forwarded-Proto. The unpolicied upstream header reaching the visitor
+# untouched is the default-path half: the bridge does not editorialize.
+echo "[e2e] pool 7: exactly one X-Forwarded-For / one X-Forwarded-Proto at the upstream"
+curl -fsS -m 10 -H 'Host: pool-echo' "http://127.0.0.1:$POOL_HTTP/headers" >"$POOL_DIR/headers.json"
+python3 - "$POOL_DIR/headers.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+if h["xff"] != ["127.0.0.1"]:
+    sys.exit("X-Forwarded-For = %r; want exactly the rewriter's single value, never appended" % h["xff"])
+if h["xfp"] != ["http"]:
+    sys.exit("X-Forwarded-Proto = %r, want exactly [http]" % h["xfp"])
+print("headers: xff=%s xfp=%s host=%s" % (h["xff"], h["xfp"], h["host"]))
+PY
+sed 's/^/[e2e] pool 7: /' "$POOL_DIR/headers.json"
+POOL_PLAIN_HEADERS="$(curl -sS -m 10 -D - -o /dev/null -H 'Host: pool-echo' "http://127.0.0.1:$POOL_HTTP/")"
+if ! grep -qi '^X-Upstream-Noise: shh' <<<"$POOL_PLAIN_HEADERS"; then
+  echo "[e2e] pool 7: the upstream's unpolicied response header did not reach the visitor untouched:"
+  echo "$POOL_PLAIN_HEADERS"
+  exit 1
+fi
+echo "[e2e] pool 7: the unpolicied response header reached the visitor untouched (the bridge does not editorialize)"
+
+# pool 8: the load-time refusal matrix -- the e2e shadow of the unit matrix,
+# asserting the refusals survive into the real binary's output.
+echo "[e2e] pool 8: the load-time refusal matrix"
+cat > "$TMPDIR/pool-refusal-tcp.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  bad-tcp:
+    proto:
+      tcp: "127.0.0.1:19023"
+    upstream_pool: true
+YAML
+cat > "$TMPDIR/pool-refusal-udp.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  bad-udp:
+    proto:
+      udp: "127.0.0.1:19023"
+    upstream_pool: true
+YAML
+cat > "$TMPDIR/pool-refusal-forward.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  bad-forward:
+    proto:
+      http: "127.0.0.1:19023"
+    # the hostname must satisfy the forward_to validator (.internal suffix)
+    # so THIS refusal is upstream_pool's, not forward_to's own
+    forward_to: https://myapp.internal
+    upstream_pool: true
+YAML
+cat > "$TMPDIR/pool-refusal-h2.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  bad-h2:
+    proto:
+      http: "127.0.0.1:19023"
+    upstream_protocol: http2
+    upstream_pool: true
+YAML
+cat > "$TMPDIR/pool-refusal-alpn.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  bad-alpn:
+    proto:
+      https: "127.0.0.1:19023"
+    agent_tls_termination: true
+    alpn:
+      - h2
+    compression: false
+    upstream_pool: true
+YAML
+pool_expect_refusal "$TMPDIR/pool-refusal-tcp.yml" bad-tcp \
+  "Tunnel bad-tcp: upstream_pool is only supported for http and https tunnels, not tcp" "pool 8 (tcp)"
+pool_expect_refusal "$TMPDIR/pool-refusal-udp.yml" bad-udp \
+  "Tunnel bad-udp: upstream_pool is only supported for http and https tunnels, not udp" "pool 8 (udp)"
+pool_expect_refusal "$TMPDIR/pool-refusal-forward.yml" bad-forward \
+  "Tunnel bad-forward: upstream_pool cannot be combined with forward_to" "pool 8 (forward_to)"
+pool_expect_refusal "$TMPDIR/pool-refusal-h2.yml" bad-h2 \
+  "Tunnel bad-h2: upstream_pool cannot be combined with upstream_protocol: http2" "pool 8 (upstream_protocol)"
+pool_expect_refusal "$TMPDIR/pool-refusal-alpn.yml" bad-alpn \
+  "Tunnel bad-alpn: upstream_pool cannot be combined with an alpn list containing \"h2\"" "pool 8 (alpn h2)"
+
+# pool 9: the compose proof on the real stack -- an agent-terminated https
+# tunnel (ephemeral cert, curl -k, the edgetest group's spelling) whose
+# request_header add must REACH the upstream through the bridge and whose
+# response_header remove must still strip on the visitor leg. The XFF pair is
+# re-pinned here because the https public leg flips X-Forwarded-Proto.
+echo "[e2e] pool 9: agent_tls_termination composes -- headers cross the bridge both ways over zk TLS"
+cat > "$TMPDIR/pool-zk.yml" <<YAML
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-zk:
+    hostname: pool-zk
+    proto:
+      https: "$POOL_UP"
+    agent_tls_termination: true
+    upstream_pool: true
+    compression: false
+    request_header:
+      add:
+        - "X-Pool-ZK: yes"
+    response_header:
+      remove:
+        - X-Upstream-Noise
+YAML
+./bin/ngrok -config="$TMPDIR/pool-zk.yml" -log="$POOL_DIR/zk-client.log" \
+  start pool-zk >"$POOL_DIR/zk-client-stdout.log" 2>&1 &
+POOL_ZK_CLIENT_PID=$!
+pool_wait_tunnel "$POOL_DIR/zk-client.log" 1 "pool 9 (client)"
+pool_wait_public_tls pool-zk "pool 9 (public)"
+
+curl -fsSk -m 10 --resolve "pool-zk:$POOL_HTTPS:127.0.0.1" "https://pool-zk:$POOL_HTTPS/headers" >"$POOL_DIR/zk-headers.json"
+python3 - "$POOL_DIR/zk-headers.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+if h["xff"] != ["127.0.0.1"]:
+    sys.exit("X-Forwarded-For = %r; want exactly one value through the zk tunnel's bridge too" % h["xff"])
+if h["xfp"] != ["https"]:
+    sys.exit("X-Forwarded-Proto = %r, want [https] (derived from the https public leg)" % h["xfp"])
+if h["pool_zk"] != ["yes"]:
+    sys.exit("X-Pool-ZK = %r; the request_header add must reach the upstream through the pooled bridge" % h["pool_zk"])
+print("compose: single XFF, XFP=https, the added request header crossed the bridge")
+PY
+sed 's/^/[e2e] pool 9: /' "$POOL_DIR/zk-headers.json"
+POOL_ZK_RESP="$(curl -sSk -m 10 -D - -o /dev/null --resolve "pool-zk:$POOL_HTTPS:127.0.0.1" "https://pool-zk:$POOL_HTTPS/")"
+if grep -qi '^X-Upstream-Noise' <<<"$POOL_ZK_RESP"; then
+  echo "[e2e] pool 9: the response_header remove did not strip X-Upstream-Noise on the visitor leg:"
+  echo "$POOL_ZK_RESP"
+  exit 1
+fi
+echo "[e2e] pool 9: the removed response header stayed removed through the pooled bridge"
+pool_stop "$POOL_ZK_CLIENT_PID" "$POOL_ZK_CLIENT_PID"
+
+# pool 10: the SaveAuthToken contract, live. The client rewrites its config
+# file on startup when the -authtoken flag differs from the file's auth_token
+# -- the rewrite marshals the WHOLE Configuration, so the pin is twofold: a
+# pooled tunnel's key survives the rewrite, and a config that never said
+# upstream_pool does not grow the key. (Both configs carry a different
+# auth_token on purpose: a matching token short-circuits the save and would
+# prove nothing.)
+echo "[e2e] pool 10: upstream_pool survives the SaveAuthToken rewrite; key-less configs grow no key"
+cat > "$POOL_DIR/pool-rt-a.yml" <<YAML
+auth_token: config-token-a
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-rt-a:
+    hostname: pool-rt-a
+    proto:
+      http: "$POOL_UP"
+    upstream_pool: true
+YAML
+./bin/ngrok -config="$POOL_DIR/pool-rt-a.yml" -authtoken=flag-token-a -log="$POOL_DIR/rt-a-client.log" \
+  start pool-rt-a >"$POOL_DIR/rt-a-client-stdout.log" 2>&1 &
+POOL_RT_A_PID=$!
+pool_wait_tunnel "$POOL_DIR/rt-a-client.log" 1 "pool 10 (rt-a)"
+kill "$POOL_RT_A_PID" 2>/dev/null || true
+wait "$POOL_RT_A_PID" 2>/dev/null || true
+python3 - "$POOL_DIR/pool-rt-a.yml" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+if "auth_token: flag-token-a" not in text:
+    sys.exit("the config was not rewritten with the flag's token:\n%s" % text)
+if "upstream_pool: true" not in text:
+    sys.exit("the SaveAuthToken rewrite DROPPED upstream_pool:\n%s" % text)
+print("rt-a: rewrite kept upstream_pool: true and wrote the flag's token")
+PY
+echo "[e2e] pool 10: rt-a kept its upstream_pool through the rewrite"
+
+cat > "$POOL_DIR/pool-rt-b.yml" <<YAML
+auth_token: config-token-b
+server_addr: 127.0.0.1:$POOL_TUNNEL
+trust_host_root_certs: true
+tunnels:
+  pool-rt-b:
+    hostname: pool-rt-b
+    proto:
+      http: "$POOL_UP"
+YAML
+./bin/ngrok -config="$POOL_DIR/pool-rt-b.yml" -authtoken=flag-token-b -log="$POOL_DIR/rt-b-client.log" \
+  start pool-rt-b >"$POOL_DIR/rt-b-client-stdout.log" 2>&1 &
+POOL_RT_B_PID=$!
+pool_wait_tunnel "$POOL_DIR/rt-b-client.log" 1 "pool 10 (rt-b)"
+kill "$POOL_RT_B_PID" 2>/dev/null || true
+wait "$POOL_RT_B_PID" 2>/dev/null || true
+python3 - "$POOL_DIR/pool-rt-b.yml" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+if "auth_token: flag-token-b" not in text:
+    sys.exit("the config was not rewritten with the flag's token:\n%s" % text)
+if "upstream_pool" in text:
+    sys.exit("a config that never said upstream_pool GREW the key on rewrite:\n%s" % text)
+print("rt-b: rewrite wrote the flag's token and grew no upstream_pool key")
+PY
+echo "[e2e] pool 10: rt-b grew no upstream_pool key"
+
+pool_stop "$POOL_MAIN_CLIENT_PID" "$POOL_NGROKD_PID"
+kill "$POOL_UP_PID" "$POOL_HEAL_UP_PID" 2>/dev/null || true
+echo "[e2e] pool group: 10/10 scenarios passed"
 
 echo "[e2e] PASS"

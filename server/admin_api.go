@@ -173,6 +173,7 @@ var configTunnelSchema = []apiSchemaRow{
 	{"tls", "mapping", "none", "certificate material for agent TLS termination -- crt/key, or ca_crt/ca_key to mint per-hostname leaves; shapes per README."},
 	{"alpn", "list", "none", "application protocols the public TLS handshake advertises, in preference order (e.g. [h2, http/1.1]); nil advertises nothing."},
 	{"upstream_protocol", "string", `"http1"`, "what the agent speaks to the local service: http1 (default) or http2 (h2c, via the transcoder)."},
+	{"upstream_pool", "bool", "false", "pool keep-alive connections to the local http service (an opt-in parsed local leg; the default leg dials fresh per visitor connection); refused beside forward_to, upstream_protocol: http2, or alpn containing h2."},
 	{"compression", "bool", "true", "allow gzip of responses; on by default, false turns it off."},
 	{"traffic_policy", "mapping", "none", "inline traffic policy document (on_tcp_connect / on_http_request / on_http_response); the action set is the changelog's to list."},
 	{"traffic_policy_file", "path", "none", "file holding the traffic policy document, read once at load; naming both this and traffic_policy is refused."},

@@ -130,6 +130,27 @@ type TunnelConfiguration struct {
 	// did not have it. validateUpstreamProtocol owns the rules.
 	UpstreamProtocol string `yaml:"upstream_protocol,omitempty"`
 
+	// UpstreamPool opts the tunnel's local leg into connection pooling
+	// (SPEC-CLUSTER25): N requests over k pooled keep-alive conns to the local
+	// service instead of one fresh dial per proxy connection. The default leg
+	// is deliberately raw -- a pooled raw socket cannot be reused soundly (the
+	// client cannot know where an h1 message ended), so the pooled leg parses,
+	// via httputil.ReverseProxy over the shared pipe scaffolding, and is
+	// therefore opt-in: upstream_pool: true means "my local service speaks
+	// plain h1 and may be reached with Go-serialized requests". Like
+	// UpstreamProtocol and CarrierDedup, the default is never written back into
+	// the field: the bool's zero value IS the default and omitempty keeps it
+	// out of every config SaveAuthToken re-marshals, so a document without the
+	// key round-trips without growing one. What may not keep the key company
+	// is validateUpstreamPool's business, judged at load, tunnel named.
+	//
+	// Upgrade behavior on a pooled tunnel is WebSocket PASSTHROUGH:
+	// ReverseProxy relays the 101 handshake and then splices raw bytes both
+	// ways, which is what the default raw pipe already does for the same
+	// traffic -- refusing upgrades here would regress tunnels that work today.
+	// e2e pins the passthrough (scripts/e2e.sh, the pool group).
+	UpstreamPool bool `yaml:"upstream_pool,omitempty"`
+
 	// CarrierDedup opts the tunnel's agent<->server carrier into the
 	// experimental content-defined chunk dedup (SPEC-CLUSTER21): repeated
 	// chunks -- a re-sent 32 KiB LLM system prompt is the shape of the win --
@@ -629,6 +650,14 @@ func (config *Configuration) applyDefaultsAndValidate(loadVaults, loadFileRefs b
 		// refusal fires only against an alpn list that is otherwise valid --
 		// an invalid list is alpn's refusal to give, about alpn.
 		if err = validateUpstreamProtocol(name, t); err != nil {
+			return
+		}
+
+		// upstream_pool is judged after upstream_protocol (its sibling -- both
+		// own the local leg), so its http2-combination refusal fires against a
+		// tunnel whose upstream_protocol value the validator above has already
+		// judged, and after alpn for the same reason upstream_protocol is.
+		if err = validateUpstreamPool(name, t); err != nil {
 			return
 		}
 
@@ -1424,6 +1453,72 @@ func validateUpstreamProtocol(tunnelName string, t *TunnelConfiguration) error {
 	for _, offered := range t.Alpn {
 		if offered == alpnH2 {
 			return fmt.Errorf("Tunnel %s: upstream_protocol cannot be combined with an alpn list containing %q: the two h2 features own the local leg incompatibly -- alpn passes h2 visitors through raw, so the local service must speak h2c itself, while upstream_protocol keeps the visitor leg h1 and transcodes it to h2c. Use alpn for h2 visitors, upstream_protocol for h1 visitors, never both on one tunnel",
+				tunnelName, alpnH2)
+		}
+	}
+
+	return nil
+}
+
+// validateUpstreamPool checks a tunnel's upstream_pool key (SPEC-CLUSTER25):
+// the opt-in pooled local leg for HTTP tunnels. Like the validators around it,
+// it runs for every tunnel applyDefaultsAndValidate walks, so the loader and
+// the workbench road refuse the same document with the same error.
+//
+// There is deliberately no command-line flag for the key (the spec offers only
+// the config-file spelling), so the CLI-synthesized "default" tunnel can never
+// carry it and LoadConfiguration's flag branch needs no call here -- the same
+// shape validateCarrierDedup documents for itself.
+//
+// The refusals are the spec's non-goals made loud:
+//
+//   - any non-HTTP proto leg, tcp/udp including "+"-mixed: the bridge parses
+//     h1, and the port-routed protocols are raw byte pipes with no h1 leg at
+//     all. The mixed case is refused with the rest because the key is the
+//     tunnel's and the proxy path cannot exempt one leg -- the same reasoning
+//     validateCarrierDedup gives for refusing its own mixed case.
+//   - forward_to: a forwarding endpoint's traffic never reaches this agent's
+//     local dial, so there is no local leg to pool.
+//   - upstream_protocol: http2: that leg already pools (its transport is the
+//     per-address h2 pool of SPEC-CLUSTER17); both keys owning the local dial
+//     at once has no meaning.
+//   - alpn containing "h2": alpn-h2 visitors are relayed RAW to the local leg
+//     (the client never branches on NegotiatedProtocol -- verified absence in
+//     client/), so the bridge would parse h2 bytes as h1. An alpn list of
+//     ["http/1.1"] composes: every visitor is h1, and the bridge serves them.
+//
+// What composes, and is deliberately left alone: upstream_protocol: http1 (the
+// feature's exact shape), agent_tls_termination (it transforms the remote leg;
+// the local dial precedes it), carrier_dedup (carrier leg), compression and the
+// header keys (proxy leg), binding internal (an internal terminus is dialed
+// like any local service).
+func validateUpstreamPool(tunnelName string, t *TunnelConfiguration) error {
+	if !t.UpstreamPool {
+		return nil
+	}
+
+	// isHttpProtocol splits "+"-joined keys the way the server does, so a
+	// mixed tunnel ("http+tcp") is refused by the same test that refuses the
+	// pure ones -- the key would be silently half-honored on the raw leg.
+	for proto := range t.Protocols {
+		if !isHttpProtocol(proto) {
+			return fmt.Errorf("Tunnel %s: upstream_pool is only supported for http and https tunnels, not %s", tunnelName, proto)
+		}
+	}
+
+	if t.ForwardTo != "" {
+		return fmt.Errorf("Tunnel %s: upstream_pool cannot be combined with forward_to: a forwarding endpoint's traffic never reaches this agent's local dial, so there is nothing to pool",
+			tunnelName)
+	}
+
+	if t.UpstreamProtocol == UpstreamProtocolHTTP2 {
+		return fmt.Errorf("Tunnel %s: upstream_pool cannot be combined with upstream_protocol: http2: the h2 leg already pools its local connections (its per-address h2 transport), and both keys owning the local dial at once has no meaning. Use upstream_pool for an h1 local service, upstream_protocol: http2 for an h2c one",
+			tunnelName)
+	}
+
+	for _, offered := range t.Alpn {
+		if offered == alpnH2 {
+			return fmt.Errorf("Tunnel %s: upstream_pool cannot be combined with an alpn list containing %q: alpn passes h2 visitors through to the local leg raw, and the pooled bridge would parse h2 bytes as h1. Use alpn for h2 visitors without pooling, upstream_pool for h1 visitors",
 				tunnelName, alpnH2)
 		}
 	}

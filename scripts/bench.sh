@@ -129,6 +129,30 @@
 #               figure mixes both clients' traffic in one process and cannot
 #               be attributed -- reported as-is for completeness.
 #
+#   pool columns   a fourth leg per variant, for the upstream_pool cluster
+#               (SPEC-CLUSTER25): the same two-clients-on-one-ngrokd shape as
+#               dedup, because the comparison must be two agent configs
+#               differing in exactly `upstream_pool: true` -- same upstream,
+#               same carrier, same request loop. A plain client registers
+#               `bench` (the OFF side); a second client registers `bench-pool`
+#               with upstream_pool: true (the ON side). 200 sequential requests,
+#               each on a FRESH visitor connection asking for Connection: close
+#               (conn-rate's shape): the plain path dials the local upstream
+#               once per visitor connection, so OFF MUST count exactly 200
+#               upstream accepts -- that exactness is validated, not assumed.
+#               The pooled path serves every visitor connection from one
+#               keep-alive pool, so ON collapses to k (sequential load: 1).
+#               The accept counts are the leg's claim -- exact integers from
+#               the fixture's per-accept log, loopback noise cannot move them,
+#               the same reason dedup's claims live in close-line ratios. The
+#               req/s and p95 rows beside them are loopback timings, reported
+#               as measured with no pre-registered direction: pooling mostly
+#               moves connection counts, and on a lossless loopback the timing
+#               delta of reusing an already-dialled localhost conn is small by
+#               construction. The leg runs on the smux carrier only; pooling
+#               is agent-local dial behavior, identical on every carrier, so a
+#               QUIC twin would measure the carrier again, not the pool.
+#
 #   netem variant  the bandwidth-constrained run, where the byte win is
 #               allowed to show as wall time. tc cannot do it in the target
 #               environment (the container VM's kernel ships fq_codel only --
@@ -225,6 +249,14 @@ TLS_REQUESTS=200
 DEDUP_LLM_REQUESTS=100
 DEDUP_SSE_EVENTS=200
 DEDUP_DD_HOST="bench-dd"
+
+# The pool leg's knobs (same constants-not-flags rule): 200 fresh visitor
+# connections, the same count conn-rate uses, so the OFF leg's expected accept
+# count is a number the harness already exercises. The ON hostname must differ
+# from the OFF one (one ngrokd routes by Host), and the two client configs
+# differ in exactly the upstream_pool key -- that is the comparison.
+POOL_REQUESTS=200
+POOL_POOL_HOST="bench-pool"
 
 RESULT_JSON="${BENCH_RESULT_JSON:-/tmp/ngrok-bench-result.json}"
 
@@ -389,11 +421,43 @@ write_fixtures() {
 # body removes the temptation.)
 import random
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 BULK = random.Random(0xB3C4).randbytes(int(sys.argv[2]))
 SMALL = b"bench-ok"
+# Optional third argument: a file to append one "accept" line to per accepted
+# connection. Only the pool leg passes it -- the accept COUNT is that leg's
+# measured quantity, and it must come from the upstream's own socket accepts,
+# not from anything the harness counts on its side. Line-buffered so a count
+# read while the fixture is running sees every accept already made.
+ACCEPTS = open(sys.argv[3], "a", buffering=1) if len(sys.argv) > 3 else None
+
+
+if ACCEPTS:
+    # The pool leg's fixture is THREADED, and not as a nicety: a pooled client
+    # holds idle keep-alive connections open BY DESIGN -- that is the pool --
+    # and a single-threaded server serves the first response and then blocks
+    # forever reading the next request off the held conn, wedging every later
+    # connection behind the listen backlog. (The first live run died exactly
+    # there: the public-wait probe through the pooled tunnel answered, the
+    # fixture froze on the now-idle pooled conn, and the next leg's warmup
+    # timed out.) Which is also precisely what a single-threaded upstream
+    # behind upstream_pool would do in production -- threading is the honest
+    # fixture for this leg, not a fudge. Counts stay exact: get_request runs
+    # on the main accept loop thread. The other legs keep the historical
+    # single-threaded shape -- their clients always close.
+    class CountingHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def get_request(self):
+            conn, addr = super().get_request()
+            ACCEPTS.write("accept\n")
+            return conn, addr
+else:
+
+    class CountingHTTPServer(HTTPServer):
+        pass
 
 
 class H(BaseHTTPRequestHandler):
@@ -415,7 +479,53 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
-HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+CountingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PY
+
+  # The pool leg's request loop: conn_rate's shape with the hostname and key
+  # prefix as parameters, because the OFF/ON comparison is the same loop twice
+  # against two hostnames. One fresh visitor connection per request, every
+  # response asserted -- a run that half-failed cannot be read as a fast one.
+  # A python loop rather than curl-per-request for conn_rate's reason: process
+  # spawn costs the same order as the quantity being timed.
+  cat > "$WORKDIR/pool_driver.py" <<'PY'
+import http.client
+import math
+import sys
+import time
+
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+prefix = sys.argv[4]
+times = []
+for i in range(n):
+    started = time.perf_counter()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("GET", "/small", headers={"Host": host, "Connection": "close"})
+    resp = conn.getresponse()
+    body = resp.read()
+    if resp.status != 200 or body != b"bench-ok":
+        sys.exit(
+            "pool %s: request %d answered %d %r"
+            % (prefix, i + 1, resp.status, body[:64])
+        )
+    conn.close()
+    times.append(time.perf_counter() - started)
+
+total = sum(times)
+ordered = sorted(times)
+
+
+def pct(p):
+    # nearest rank, conn_rate's rule: with n=200 each percentile is a real
+    # sample, not an interpolation between two of them
+    return ordered[max(0, math.ceil(p * n) - 1)]
+
+
+print(prefix + "rps=%.1f" % (n / total))
+print(prefix + "total_s=%.3f" % total)
+print(prefix + "p50_ms=%.2f" % (pct(0.50) * 1000))
+print(prefix + "p95_ms=%.2f" % (pct(0.95) * 1000))
+print(prefix + "n=%d" % n)
 PY
 
   # The CA the agent-terminated bench tunnel mints its per-hostname leaves
@@ -1719,6 +1829,223 @@ run_variant_dedup() {  # <variant-label> <dir> <carrier>
   log "variant '$dlog' done (logs: /tmp/ngrok-bench-$dlog-*.log)"
 }
 
+# --- pool leg lifecycle (SPEC-CLUSTER25) ---------------------------------------
+#
+# The same two-clients-on-one-ngrokd shape as dedup, for the same structural
+# reason: the comparison is two agent CONFIGS differing in exactly
+# `upstream_pool: true`, and one config cannot be both itself and its control.
+# The OFF side's tunnel rides the plain local path (one local dial per visitor
+# connection -- conn_rate's header documents that path); the ON side's rides
+# the pooled bridge. What is measured is the upstream's own accept count,
+# because that is the quantity the feature exists to move, and it is exact:
+# integers off the fixture's per-accept log, which loopback timing noise
+# cannot touch. No CPU capture here on purpose -- dedup captures CPU because
+# its codec does per-byte work; the pool's work is *not dialling*, a saving
+# measured in fewer accepts, which the accept rows already state directly.
+
+POOL_PLAIN_PID=""
+POOL_CLIENT_PID=""
+POOL_NGROKD_PID=""
+
+pool_accept_count() {  # <accepts-log> -> accept lines so far (0 when none)
+  grep -c '^accept$' "$1" 2>/dev/null || true
+}
+
+# pool_wait_accepts <log> <base> <want> <label>: accept lines are written at
+# accept time and line-buffered, so unlike dedup's close lines they never lag
+# the driver's exit -- the bounded wait exists so an undercount can only be a
+# real shortage, never a read that raced the file.
+pool_wait_accepts() {
+  local log="$1" base="$2" want="$3" label="$4" i
+  for i in $(seq 1 40); do
+    if [[ "$(($(pool_accept_count "$log") - base))" -ge "$want" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  log "$label: only $(($(pool_accept_count "$log") - base)) of $want accepts in $log"
+  dump_logs "$label"
+  return 1
+}
+
+start_stack_pool() {
+  local label="$1" dir="$2" port
+
+  local guard_ports=("$BENCH_UPSTREAM_PORT" "$BENCH_HTTP_PORT" "$BENCH_HTTPS_PORT" "$BENCH_ADMIN_PORT")
+  if [[ "$BENCH_TUNNEL_BIND" == "127.0.0.1" ]]; then
+    guard_ports+=("$BENCH_TUNNEL_PORT")
+  fi
+  for port in "${guard_ports[@]}"; do
+    if port_in_use "$port"; then
+      die "port $port is already in use before the pool stack of '$label' -- a previous leg did not release it"
+    fi
+  done
+
+  rm -f /tmp/ngrok-bench-"$label"-*.log
+
+  # The fixture gets the accepts file only on this leg (third argument); the
+  # other legs start it without one and count nothing.
+  python3 "$WORKDIR/bench_upstream.py" "$BENCH_UPSTREAM_PORT" "$BULK_BYTES" \
+    "/tmp/ngrok-bench-$label-accepts.log" \
+    > "/tmp/ngrok-bench-$label-upstream.log" 2>&1 &
+  UPSTREAM_PID=$!
+  PIDS+=("$UPSTREAM_PID")
+
+  # No -quicAddr: with no QUIC listener advertised, auto transport cannot
+  # drift onto QUIC -- the leg measures the pool, not a carrier (smux form,
+  # same as the dedup smux leg).
+  "$dir/ngrokd" \
+    -domain=localhost \
+    -httpAddr="127.0.0.1:$BENCH_HTTP_PORT" \
+    -httpsAddr="127.0.0.1:$BENCH_HTTPS_PORT" \
+    -tunnelAddr="$BENCH_TUNNEL_BIND:$BENCH_TUNNEL_PORT" \
+    -adminAddr="127.0.0.1:$BENCH_ADMIN_PORT" \
+    > "/tmp/ngrok-bench-$label-ngrokd.log" 2>&1 &
+  POOL_NGROKD_PID=$!
+  PIDS+=("$POOL_NGROKD_PID")
+
+  sleep 1
+
+  # The two configs are deliberately byte-identical except the one line the
+  # leg exists to isolate -- hostname differs only because one ngrokd routes
+  # by Host, and the tunnel name follows the hostname.
+  cat > "$WORKDIR/ngrok-pool-plain-$label.yml" <<YAML
+server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
+trust_host_root_certs: true
+tunnels:
+  bench:
+    hostname: $BENCH_HOST
+    proto:
+      http: $BENCH_UPSTREAM_PORT
+YAML
+
+  cat > "$WORKDIR/ngrok-pool-$label.yml" <<YAML
+server_addr: 127.0.0.1:$BENCH_TUNNEL_PORT
+trust_host_root_certs: true
+tunnels:
+  bench-pool:
+    hostname: $POOL_POOL_HOST
+    proto:
+      http: $BENCH_UPSTREAM_PORT
+    upstream_pool: true
+YAML
+
+  "$dir/ngrok" -config="$WORKDIR/ngrok-pool-plain-$label.yml" \
+    -log="/tmp/ngrok-bench-$label-client-plain.log" start bench \
+    > "/tmp/ngrok-bench-$label-client-plain-stdout.log" 2>&1 &
+  POOL_PLAIN_PID=$!
+  PIDS+=("$POOL_PLAIN_PID")
+
+  "$dir/ngrok" -config="$WORKDIR/ngrok-pool-$label.yml" \
+    -log="/tmp/ngrok-bench-$label-client-pool.log" start bench-pool \
+    > "/tmp/ngrok-bench-$label-client-pool-stdout.log" 2>&1 &
+  POOL_CLIENT_PID=$!
+  PIDS+=("$POOL_CLIENT_PID")
+}
+
+stop_stack_pool() {  # <label> -- teardown order clients -> server -> upstream,
+  local label="$1" code code2 i # the same order stop_stack uses
+  kill "$POOL_CLIENT_PID" "$POOL_PLAIN_PID" 2>/dev/null || true
+  wait "$POOL_CLIENT_PID" "$POOL_PLAIN_PID" 2>/dev/null || true
+  for i in $(seq 1 40); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $BENCH_HOST" "$BASE_URL/" 2>/dev/null || true)"
+    code2="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $POOL_POOL_HOST" "$BASE_URL/" 2>/dev/null || true)"
+    if [[ "$code" == "404" && "$code2" == "404" ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  kill "$POOL_NGROKD_PID" "$UPSTREAM_PID" 2>/dev/null || true
+  wait "$POOL_NGROKD_PID" "$UPSTREAM_PID" 2>/dev/null || true
+  POOL_CLIENT_PID=""
+  POOL_PLAIN_PID=""
+  POOL_NGROKD_PID=""
+  UPSTREAM_PID=""
+
+  sleep 0.5
+}
+
+scenario_pool() {  # <leg-label> <pfx>
+  local leg="$1" pfx="$2" base off on accepts
+
+  # OFF leg. The expected count is EXACT: conn_rate's shape (one fresh visitor
+  # connection per request, Connection: close) maps one local dial per request
+  # on the plain path. An OFF count that is not exactly N means the plain path
+  # or the loop changed, and every ON number would be a ratio against a lie --
+  # so this is validated, not assumed.
+  accepts="/tmp/ngrok-bench-$leg-accepts.log"
+  base="$(pool_accept_count "$accepts")"
+  python3 "$WORKDIR/pool_driver.py" "$BENCH_HOST" "$BENCH_HTTP_PORT" \
+    "$POOL_REQUESTS" >> "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}off_"
+  pool_wait_accepts "$accepts" "$base" "$POOL_REQUESTS" "pool OFF"
+  off="$(($(pool_accept_count "$accepts") - base))"
+  if [[ "$off" -ne "$POOL_REQUESTS" ]]; then
+    log "pool OFF: $off upstream accepts for $POOL_REQUESTS fresh-connection requests (expected exactly $POOL_REQUESTS)"
+    dump_logs "$leg"
+    return 1
+  fi
+  echo "${pfx}off_upstream_accepts=$off" >> "$WORKDIR/result-${VARIANT_LABEL}.env"
+
+  # ON leg. base is taken AFTER the warmups, so the tunnel-open liveness probe
+  # and the first pooled dial are both already counted -- the measured number
+  # is pure pooled reuse across the loop's fresh visitor connections. Read
+  # directly, no waiter: the driver is synchronous and accept lines are
+  # line-buffered, and the honest expectation INCLUDES zero -- the warmup's
+  # pooled conn stays in the pool (90s idle timeout, the loop runs immediately)
+  # and can serve every one of the loop's requests. (The first live run's
+  # waiter demanded >=1 and timed out on exactly that: 200 requests, 0 new
+  # accepts, the feature overdelivering against a miscalibrated guess.)
+  base="$(pool_accept_count "$accepts")"
+  python3 "$WORKDIR/pool_driver.py" "$POOL_POOL_HOST" "$BENCH_HTTP_PORT" \
+    "$POOL_REQUESTS" >> "$WORKDIR/result-${VARIANT_LABEL}.env" "${pfx}on_"
+  on="$(($(pool_accept_count "$accepts") - base))"
+  # The collapse is the leg's claim; 5 is generous headroom over the expected
+  # k=1 (sequential load: one pooled conn serves every request) while still
+  # failing hard if the tunnel silently fell back to the plain path.
+  if [[ "$on" -gt 5 ]]; then
+    log "pool ON: $on upstream accepts for $POOL_REQUESTS requests -- the pool did not collapse (expected ~1)"
+    dump_logs "$leg"
+    return 1
+  fi
+  echo "${pfx}on_upstream_accepts=$on" >> "$WORKDIR/result-${VARIANT_LABEL}.env"
+}
+
+run_variant_pool() {  # <variant-label> <dir>
+  local label="$1" dir="$2"
+  local plog="$label-pool" pfx="pool_"
+  CURRENT_LABEL="$plog"
+  VARIANT_LABEL="$label"
+  log "=== variant '$plog': $dir (upstream_pool on/off, smux carrier) ==="
+
+  start_stack_pool "$plog" "$dir"
+  dd_wait_tunnel "/tmp/ngrok-bench-$plog-client-plain.log" "$plog (plain client)"
+  dd_wait_tunnel "/tmp/ngrok-bench-$plog-client-pool.log" "$plog (pool client)"
+  dd_wait_public "$BENCH_HOST" "$plog (plain)"
+  dd_wait_public "$POOL_POOL_HOST" "$plog (pool)"
+
+  # Warmups on BOTH tunnels (the one-time-cost rule): on the ON side this pays
+  # the first-use synchronous liveness probe and the first pooled dial, both
+  # of which land before the scenario's accept offsets.
+  curl -sS --max-time 60 -o /dev/null -H "Host: $BENCH_HOST" "$BASE_URL/small" \
+    || die "warmup through variant '$plog' failed (plain)"
+  curl -sS --max-time 60 -o /dev/null -H "Host: $POOL_POOL_HOST" "$BASE_URL/small" \
+    || die "warmup through variant '$plog' failed (pool)"
+
+  local want
+  for want in ${BENCH_SCENARIOS:-pool}; do
+    case "$want" in
+      pool)
+        log "pool: $POOL_REQUESTS fresh-connection requests x {plain, upstream_pool}"
+        scenario_pool "$plog" "$pfx" ;;
+      *) ;; # not a pool-leg scenario; the other legs own it
+    esac
+  done
+
+  stop_stack_pool "$plog"
+  log "variant '$plog' done (logs: /tmp/ngrok-bench-$plog-*.log)"
+}
+
 
 run_variant() {
   local label="$1" dir="$2"
@@ -1757,8 +2084,9 @@ run_variant() {
         log "tls-conn-rate: $TLS_REQUESTS requests x {edge, agent-terminated} over https"
         scenario_tls_conn_rate "$label" ;;
       dedup-llm|dedup-sse|dedup-bulk) ;; # owned by the dedup legs, below
+      pool) ;;                            # owned by the pool leg, below
       *)
-        echo "unknown scenario '$want' (bulk | conn-rate | keep-alive | tls-conn-rate | dedup-llm | dedup-sse | dedup-bulk)" >&2
+        echo "unknown scenario '$want' (bulk | conn-rate | keep-alive | tls-conn-rate | dedup-llm | dedup-sse | dedup-bulk | pool)" >&2
         exit 2 ;;
     esac
   done
@@ -1775,6 +2103,10 @@ run_variant() {
   run_variant_quic "$label" "$dir"
   run_variant_dedup "$label" "$dir" smux
   run_variant_dedup "$label" "$dir" quic
+  # The pool leg last, smux carrier: it measures agent-local dial behavior,
+  # identical on every carrier, so one leg states it and a QUIC twin would
+  # only re-measure the carrier (see the header's pool columns note).
+  run_variant_pool "$label" "$dir"
 
   log "variant '$label' done (logs: /tmp/ngrok-bench-$label-*.log)"
 }
@@ -1810,7 +2142,7 @@ run_variant_quic() {
       keep-alive)
         log "quic keep-alive: $KEEPALIVE_REQUESTS requests in one curl invocation"
         scenario_keepalive "$label" "quic_" ;;
-      tls-conn-rate|dedup-llm|dedup-sse|dedup-bulk) ;; # owned by other legs
+      tls-conn-rate|dedup-llm|dedup-sse|dedup-bulk|pool) ;; # owned by other legs
       *)
         echo "unknown scenario '$want'" >&2
         exit 2 ;;
@@ -1851,6 +2183,11 @@ write_params() {
     echo "dedup_dd_host=$DEDUP_DD_HOST"
     echo "dedup_llm_requests=$DEDUP_LLM_REQUESTS"
     echo "dedup_sse_events=$DEDUP_SSE_EVENTS"
+    # The pool leg's wiring: plain and upstream_pool clients on one ngrokd,
+    # configs differing in exactly the upstream_pool key.
+    echo "pool_plain_host=$BENCH_HOST"
+    echo "pool_pool_host=$POOL_POOL_HOST"
+    echo "pool_requests=$POOL_REQUESTS"
     if [[ "$mode" == "compare" ]]; then
       echo "baseline_dir=$first"
       echo "current_dir=$second"
@@ -1946,6 +2283,23 @@ ROWS = [
     ("quic dedup CPU plain client", "quic_dedup_cpu_plain_client", "%s"),
     ("quic dedup CPU dedup client", "quic_dedup_cpu_dd_client", "%s"),
     ("NOTE quic dedup rows: the dedup rows' caveat plus the quic rows' no-loss caveat both apply", "quic_dedup_caveat_row_marker", "%s"),
+    # The pool rows (SPEC-CLUSTER25). The accept rows are the leg's claim --
+    # exact integers from the upstream fixture's per-accept log, the same
+    # noise-immunity argument as the dedup close-line ratios. OFF is pinned to
+    # exactly POOL_REQUESTS by the harness (validated, and the run fails
+    # otherwise); ON collapses to k (~1 under sequential load, the liveness
+    # probe and first dial already spent in the warmup). The req/s and p95
+    # rows are loopback timings recorded as measured, with no pre-registered
+    # direction: on a lossless loopback, reusing a dialled localhost conn
+    # moves little wall time by construction -- the quantity the feature
+    # moves is the accept count above.
+    ("pool upstream accepts OFF (200 fresh visitor conns, plain local dial)", "pool_off_upstream_accepts", "%d"),
+    ("pool upstream accepts ON (upstream_pool; the collapse N->k, 0-1 expected)", "pool_on_upstream_accepts", "%d"),
+    ("pool OFF req/s (200 x Connection: close)", "pool_off_rps", "%.1f"),
+    ("pool ON req/s (upstream_pool)", "pool_on_rps", "%.1f"),
+    ("pool OFF p95 ms (lower is better)", "pool_off_p95_ms", "%.2f"),
+    ("pool ON p95 ms (lower is better)", "pool_on_p95_ms", "%.2f"),
+    ("NOTE pool rows: accepts are exact counts from the fixture's per-accept log (OFF is validated == request count); req/s and p95 are loopback timings, reported as measured -- pooling's quantity is the accept collapse, not loopback wall time", "pool_caveat_row_marker", "%s"),
 ]
 
 
@@ -1997,13 +2351,14 @@ print(
     )
 )
 print(
-    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}; QUIC leg re-runs bulk/conn-rate/keep-alive with server -quicAddr + client proxy_transport=quic; dedup legs (smux + QUIC) run llm/sse/control payloads through a plain client and a carrier_dedup client on one ngrokd"
+    "workload: bulk=%s MiB x %s runs, conn-rate=%s requests, keep-alive=%s requests in one curl, tls-conn-rate=%s requests x {edge, agent-terminated}; QUIC leg re-runs bulk/conn-rate/keep-alive with server -quicAddr + client proxy_transport=quic; dedup legs (smux + QUIC) run llm/sse/control payloads through a plain client and a carrier_dedup client on one ngrokd; pool leg (smux) runs %s fresh-connection requests through a plain client and an upstream_pool client on one ngrokd, measured in upstream accepts"
     % (
         int(params.get("bulk_bytes", 0)) // 1024 // 1024,
         params.get("bulk_runs", "?"),
         params.get("conn_rate_requests", "?"),
         params.get("keepalive_requests", "?"),
         params.get("tls_requests", "?"),
+        params.get("pool_requests", "?"),
     )
 )
 for label, kv in variants:

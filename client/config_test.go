@@ -2024,6 +2024,260 @@ func TestUpstreamProtocolFlagsAreRegistered(t *testing.T) {
 	}
 }
 
+// poolTunnelYAML is the upstream_pool twin of upstreamTunnelYAML: the same
+// http tunnel, with upstream_pool: true where that one had upstream_protocol.
+func poolTunnelYAML(extraLines ...string) string {
+	lines := []string{
+		"tunnels:",
+		"  web:",
+		"    proto:",
+		"      http: 127.0.0.1:7000",
+		"    upstream_pool: true",
+	}
+	lines = append(lines, extraLines...)
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// TestLoadConfigurationUpstreamPoolValidation is the load-time refusal matrix
+// (SPEC-CLUSTER25 objective 2), mirroring the upstream_protocol one: every
+// refusal verbatim, every composition a load. upstream_pool has NO CLI flag,
+// so there is no flag synthesis case here by design -- the config key is the
+// only way in, which the "no flag" case below also states.
+func TestLoadConfigurationUpstreamPoolValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string // the full refusal, verbatim; empty means it loads
+	}{
+		{
+			name:   "the valid base loads",
+			config: poolTunnelYAML(),
+		},
+		{
+			// The sibling key's default is what a pooled tunnel almost always
+			// wants (the bridge speaks h1); saying it explicitly composes.
+			name:   "upstream_protocol http1 composes",
+			config: poolTunnelYAML("    upstream_protocol: http1"),
+		},
+		{
+			name: "binding internal composes",
+			config: poolTunnelYAML(
+				"    binding: internal",
+				"    hostname: app.internal",
+			),
+		},
+		{
+			name: "a traffic policy composes",
+			config: poolTunnelYAML(
+				"    traffic_policy:",
+				"      on_http_request:",
+				"        - name: basic-auth",
+				"          config:",
+				"            credentials:",
+				"              - user:pass",
+			),
+		},
+		{
+			name: "request_header composes",
+			config: poolTunnelYAML(
+				"    request_header:",
+				"      add:",
+				"        - \"X-Env: staging\"",
+			),
+		},
+		{
+			name: "response_header composes",
+			config: poolTunnelYAML(
+				"    response_header:",
+				"      remove:",
+				"        - X-Powered-By",
+			),
+		},
+		{
+			// The rewriter pair and the carrier codec all run on the visitor
+			// leg, which the pool bridge keeps unchanged -- the same argument
+			// the transcoder's composition matrix makes.
+			name:   "carrier_dedup composes",
+			config: poolTunnelYAML("    carrier_dedup: true"),
+		},
+		{
+			name:   "compression composes",
+			config: poolTunnelYAML("    compression: true"),
+		},
+		{
+			name: "agent_tls_termination composes: the pool bridge sits on the plaintext local leg, downstream of the termination",
+			config: asHTTPS(poolTunnelYAML(
+				"    agent_tls_termination: true",
+			)),
+		},
+		{
+			name:    "a tcp tunnel is refused: the bridge parses h1, and a raw byte stream is not h1",
+			config:  strings.Replace(poolTunnelYAML(), "      http: 127.0.0.1:7000", "      tcp: 127.0.0.1:7000", 1),
+			wantErr: `Tunnel web: upstream_pool is only supported for http and https tunnels, not tcp`,
+		},
+		{
+			name:    "a udp tunnel is refused the same way",
+			config:  strings.Replace(poolTunnelYAML(), "      http: 127.0.0.1:7000", "      udp: 127.0.0.1:7000", 1),
+			wantErr: `Tunnel web: upstream_pool is only supported for http and https tunnels, not udp`,
+		},
+		{
+			// The combined key is ONE map key; isHttpProtocol splits it the way
+			// the server does, so the raw leg cannot hide inside an otherwise
+			// http tunnel and get half a bridge.
+			name: "a + mixed tunnel is refused, by the proto validator that runs first",
+			// The combined key is ONE map key -- but it never reaches this
+			// key's validator: validateProtocol judges the proto key itself
+			// first, and "http+tcp" is not a legal combination in this fork
+			// (only http+https is). The refusal below is validateProtocol's,
+			// typo ("for for") included. validateUpstreamPool's own
+			// "+"-splitting is defense in depth for callers that skip
+			// validateProtocol; TestUpstreamPoolValidatorMixedProto pins it
+			// directly.
+			config:  strings.Replace(poolTunnelYAML(), "      http: 127.0.0.1:7000", `      "http+tcp": 127.0.0.1:7000`, 1),
+			wantErr: `Invalid protocol for for tunnel web[http+tcp]: http+tcp`,
+		},
+		{
+			name: "forward_to is refused: the local dial the key would pool never happens",
+			config: poolTunnelYAML(
+				"    forward_to: https://target.internal",
+			),
+			wantErr: `Tunnel web: upstream_pool cannot be combined with forward_to: a forwarding endpoint's traffic never reaches this agent's local dial, so there is nothing to pool`,
+		},
+		{
+			// Both keys own the local leg; the h2 leg pools its connections
+			// already (its per-address h2 transport), so the combination has no
+			// meaning. The refusal says which tool serves which local service.
+			name:    "upstream_protocol http2 is refused: the h2 transport is the h2 local service's pooling",
+			config:  poolTunnelYAML("    upstream_protocol: http2"),
+			wantErr: `Tunnel web: upstream_pool cannot be combined with upstream_protocol: http2: the h2 leg already pools its local connections (its per-address h2 transport), and both keys owning the local dial at once has no meaning. Use upstream_pool for an h1 local service, upstream_protocol: http2 for an h2c one`,
+		},
+		{
+			// An otherwise-valid h2-offering tunnel (https leg, zk termination,
+			// compression off -- the same otherwise-valid shape the
+			// upstream_protocol matrix uses), so the refusal that fires is the
+			// combination's, not alpn's own.
+			name: "an alpn list containing h2 is refused: the bridge would parse h2 bytes as h1",
+			config: asHTTPS(poolTunnelYAML(
+				"    agent_tls_termination: true",
+				"    alpn:",
+				"      - h2",
+				"    compression: false",
+			)),
+			wantErr: `Tunnel web: upstream_pool cannot be combined with an alpn list containing "h2": alpn passes h2 visitors through to the local leg raw, and the pooled bridge would parse h2 bytes as h1. Use alpn for h2 visitors without pooling, upstream_pool for h1 visitors`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, tt.config)
+
+			_, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the config to load, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected the verbatim refusal\n\t%s\ngot none", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Fatalf("refusal does not match the contract:\n got: %s\nwant: %s", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestUpstreamPoolValidatorMixedProto pins validateUpstreamPool's own
+// "+"-splitting, called directly: the loader's tunnel traversal can never
+// reach it with a mixed key (validateProtocol refuses the key first -- see the
+// matrix above), but the function is a package-level contract and the split is
+// what keeps a future caller that skips the proto check from handing the
+// bridge a raw leg.
+func TestUpstreamPoolValidatorMixedProto(t *testing.T) {
+	err := validateUpstreamPool("web", &TunnelConfiguration{
+		UpstreamPool: true,
+		Protocols:    map[string]string{"http+tcp": "127.0.0.1:7000"},
+	})
+	if err == nil || err.Error() != `Tunnel web: upstream_pool is only supported for http and https tunnels, not http+tcp` {
+		t.Fatalf("the mixed-proto defense-in-depth refusal changed:\n got: %v", err)
+	}
+}
+
+// TestLoadConfigurationUpstreamPoolHasNoFlag pins the config surface's shape
+// (spec objective 2: "no CLI flag"): the key exists only in the file, so a
+// flag somebody half-remembers must not appear in the usage output either.
+func TestLoadConfigurationUpstreamPoolHasNoFlag(t *testing.T) {
+	_, usage := parseArgs(t, []string{"ngrok", "8080"})
+
+	if strings.Contains(usage, "upstream-pool") || strings.Contains(usage, "upstream_pool") {
+		t.Fatalf("upstream_pool must be config-only (the flag would need a synthesized-tunnel story the key does not have):\n%s", usage)
+	}
+}
+
+// TestLoadConfigurationUpstreamPoolTunnel pins the key arriving on the loaded
+// tunnel struct, and -- the round-trip reason -- the default staying ABSENT:
+// an unset key must not grow into every config SaveAuthToken rewrites.
+func TestLoadConfigurationUpstreamPoolTunnel(t *testing.T) {
+	configPath := writeConfig(t, poolTunnelYAML())
+
+	config, err := LoadConfiguration(&Options{config: configPath, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the config to load, got: %v", err)
+	}
+	if !config.Tunnels["web"].UpstreamPool {
+		t.Fatal("upstream_pool: true did not arrive on the loaded tunnel")
+	}
+
+	without := writeConfig(t, tunnelYAML())
+	config, err = LoadConfiguration(&Options{config: without, command: "start-all"})
+	if err != nil {
+		t.Fatalf("expected the key-less config to load, got: %v", err)
+	}
+	if config.Tunnels["web"].UpstreamPool {
+		t.Fatal("no upstream_pool key must leave the field false (the zero value IS the default)")
+	}
+}
+
+// TestUpstreamPoolConfigYAMLRoundTrip is the SaveAuthToken contract: a
+// configured value survives a marshal/reload cycle unchanged, and a config
+// without the key re-marshals without growing one.
+func TestUpstreamPoolConfigYAMLRoundTrip(t *testing.T) {
+	config := new(Configuration)
+	if err := yaml.Unmarshal([]byte(poolTunnelYAML()), config); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	if !strings.Contains(string(marshaled), "upstream_pool: true") {
+		t.Fatalf("marshaled config is missing the configured value:\n%s", marshaled)
+	}
+
+	reloaded := new(Configuration)
+	if err := yaml.Unmarshal(marshaled, reloaded); err != nil {
+		t.Fatalf("failed to re-unmarshal marshaled config: %v", err)
+	}
+	if again := reloaded.Tunnels["web"]; !reflect.DeepEqual(config.Tunnels["web"], again) {
+		t.Fatalf("round trip changed the tunnel:\n before: %+v\nafter: %+v", config.Tunnels["web"], again)
+	}
+
+	without := new(Configuration)
+	if err := yaml.Unmarshal([]byte(tunnelYAML()), without); err != nil {
+		t.Fatalf("failed to unmarshal the key-less config: %v", err)
+	}
+	withoutMarshaled, err := yaml.Marshal(without)
+	if err != nil {
+		t.Fatalf("failed to marshal the key-less config: %v", err)
+	}
+	if strings.Contains(string(withoutMarshaled), "upstream_pool") {
+		t.Fatalf("no upstream_pool key should be emitted when none was configured:\n%s", withoutMarshaled)
+	}
+}
+
 // TestDefaultTunnelUpstreamProtocolSynthesis covers the config.go wiring: the
 // flag feeds the synthesized "default" tunnel, and the same validator that
 // polices a config-file key polices what the flag produced.

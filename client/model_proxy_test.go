@@ -878,3 +878,76 @@ func TestFlattenHeaderConfig(t *testing.T) {
 		t.Fatalf("flattenHeaderConfig = %v, %v; want %v, %v", add, remove, hc.Add, hc.Remove)
 	}
 }
+
+// TestServeProxyConnectionWiresUpstreamPool is the wiring pin (SPEC-CLUSTER25):
+// through the real serveProxyConnection entry point, a pooled tunnel's local
+// leg is the bridge -- the request is served, the per-address pool exists and
+// is warm -- while an unpooled tunnel to a DIFFERENT address creates no pool
+// at all (the plain dial is untouched; review gate 2's default-path pin).
+func TestServeProxyConnectionWiresUpstreamPool(t *testing.T) {
+	// The pooled leg: a real h1 upstream, the tunnel flag on.
+	upstreamSeen := make(chan upstreamRequest, 1)
+	up := startH1Upstream(t, "127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamSeen <- upstreamRequest{host: r.Host, header: r.Header.Clone()}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, testUpstreamBody)
+	}))
+
+	pooled := h1PoolTunnel("https://wired.ngrok.dev", up.addr)
+	h := startAgentTLSProxy(t, pooled, nil, nil)
+	if _, err := io.WriteString(h.public, getRequest("wired.ngrok.dev")); err != nil {
+		t.Fatalf("failed to write the request: %v", err)
+	}
+	br := bufio.NewReader(h.public)
+	resp := readResponseHead(t, br)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 through the wired pool, got %d", resp.StatusCode)
+	}
+	if body := readBodyBounded(t, resp); body != testUpstreamBody {
+		t.Fatalf("body through the wired pool was %q, want %q", body, testUpstreamBody)
+	}
+	waitH1PoolWarm(t, up.addr)
+
+	select {
+	case req := <-upstreamSeen:
+		if xff := req.header["X-Forwarded-For"]; len(xff) != 1 || xff[0] != testClientIP {
+			t.Fatalf("X-Forwarded-For through the wired pool: got %#v, want exactly [%s]", xff, testClientIP)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upstream never saw the request")
+	}
+
+	// The unpooled control: same code path, flag off, different address. The
+	// request is served -- by the plain dial -- and no pool may exist for the
+	// address, because nothing on the default path may touch the pool map
+	// (gate 2: the default path is byte-identical to before this feature).
+	plainUp := startH1Upstream(t, "127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, testUpstreamBody)
+	}))
+
+	plain := httpTunnel("https://plainwired.ngrok.dev", plainUp.addr)
+	plainH := startAgentTLSProxy(t, plain, nil, nil)
+	if _, err := io.WriteString(plainH.public, getRequest("plainwired.ngrok.dev")); err != nil {
+		t.Fatalf("failed to write the request: %v", err)
+	}
+	plainBr := bufio.NewReader(plainH.public)
+	plainResp := readResponseHead(t, plainBr)
+	if plainResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 through the plain dial, got %d", plainResp.StatusCode)
+	}
+	readBodyBounded(t, plainResp)
+
+	upstreamH1Mu.Lock()
+	_, pooledExists := upstreamH1Pools[up.addr]
+	_, plainExists := upstreamH1Pools[plainUp.addr]
+	upstreamH1Mu.Unlock()
+	if !pooledExists {
+		t.Fatal("the pooled tunnel's address has no pool: the dial site did not take the pooled branch")
+	}
+	if plainExists {
+		t.Fatal("the unpooled tunnel created a pool entry: the default path is no longer the plain dial")
+	}
+}

@@ -183,3 +183,65 @@ Next release in landing order after the telemetry + toolchain trains
 is the accept collapse; loopback rps movement is small and the real-RTT case
 is the use case; the key is opt-in because the default leg is deliberately
 raw.
+
+## Amendment 2026-10-09 (post-implementation): as built
+
+Spec bodies are immutable; this section records what shipped against the
+design, including the two places reality corrected a guess.
+
+Shipped exactly the opt-in shape: `upstream_pool: true` on
+`TunnelConfiguration` (`client/config.go`, `validateUpstreamPool` with the
+four refusals verbatim, tcp/udp/forward_to/http2/alpn-h2, "+"-mixed pinned),
+the `mvc.Tunnel` mirror, and the one dial-site branch in `client/model.go`.
+The extraction is real: `client/upstream_shared.go` (out of
+`client/upstreamh2.go`, mechanical — cluster 17's tests green unchanged),
+and the bridge in `client/upstreamh1.go`: `upstreamH1PoolFor` per local
+address, `upstreamH1IdleTimeout` 90s, `upstreamH1MaxIdleConnsPerHost` 100
+explicit, no `ResponseHeaderTimeout` (the cluster-17 ruling carried),
+`FlushInterval: -1`, `Rewrite` mode carrying the rewriter's XFF verbatim.
+
+The upgrade ruling resolved to PASSTHROUGH: ReverseProxy's 101 handling
+(hijack + splice) works over the net.Pipe one-conn-listener bridge, e2e
+scenario 5 pins a genuine upgrade with a post-upgrade frame round-trip, and
+the key's config comment states it. No refusal was needed.
+
+Warm/cold detection points as built: cold is the first-use synchronous
+liveness dial (`ensureWarm`, per address, until the first successful
+RoundTrip) — a cold dead service fails into the existing `writeBadGateway`
+HTTP/1.0 path byte-identically, e2e-pinned as "same page modulo the
+hostname", whose substitution moves only the Content-Length digit
+writeBadGateway itself computes. Warm is `ModifyResponse` (the only moment
+the name is honest — it runs on success including 101, never on RoundTrip
+error); a warm death answers the bridge's HTTP/1.1 502, a fingerprint
+deliberately distinct from the cold page, and the next request re-dials —
+self-heal pinned on a same-port restart with no operator action.
+
+Harness names as built: `scripts/e2e.sh` (the spec's `e2e_run.sh`) and
+`scripts/bench.sh` (the spec's `bench_carrier.rb`) — the same renames the
+two preceding clusters' amendments recorded.
+
+Bench as built: the shared upstream fixture counts accepts to a per-accept
+log; the OFF leg's count is VALIDATED equal to the request count (200 fresh
+visitor connections = 200 plain dials) before the ON number may be read;
+the ON leg measured 0 new accepts on its first live run — the warmup's
+pooled conn, inside its 90s idle window, served all 200 — recorded because
+the honest expectation includes zero, not because a "~1" guess failed.
+One fixture lesson worth keeping: a pooled client holds idle keep-alive
+connections open BY DESIGN, and the bench's single-threaded python fixture
+froze exactly the way a single-threaded upstream behind `upstream_pool`
+would in production (it served the pooled tunnel's first response and then
+blocked forever reading the next request off the held conn). The pool leg's
+fixture is threaded; accept counts stay exact — they are taken on the
+accept-loop thread — and the other legs keep the historical shape.
+
+e2e as built: the ten scenarios shipped as the pool group of
+`scripts/e2e.sh`. The SSE probe initially asserted the visitor's stream
+"ends with the last event's bytes" — unreachable through
+`httputil.ReverseProxy`, which strips the upstream's hop-by-hop
+`Connection: close` and re-serializes the unknown-length body as chunked;
+two early "passes" had been truncation accidents (a reset that chopped the
+chunked terminator satisfied the success condition). The shipped probe
+asserts content membership plus a completed chunked stream. The
+SaveAuthToken scenario pins the rewrite's actual marshaled form (`auth_token:`),
+both directions: a pooled tunnel's key survives it, a key-less config grows
+nothing.
