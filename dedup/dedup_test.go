@@ -230,6 +230,31 @@ func TestTwoDirectionalPipe(t *testing.T) {
 		t.Fatalf("cross-direction tables diverged: a.enc=%d b.dec=%d b.enc=%d a.dec=%d",
 			a.enc.count, b.dec.count, b.enc.count, a.dec.count)
 	}
+
+	// The read-direction counters (SPEC-CLUSTER23), read from THIS
+	// goroutine while the join's reader goroutines advanced them: exactly
+	// the cross-goroutine access the atomics exist for, so -race owns the
+	// memory-model question and these asserts own the arithmetic. Each
+	// end's readWire must equal the PEER's framed -- the wire bytes one end
+	// counted writing are the bytes the other counted reading, which is
+	// precisely the agreement the two ends' close lines report about one
+	// stream. DecodedOut is the payload each pump reassembled, and it may
+	// legitimately exceed readWire (a REF costs 10 wire bytes and emits a
+	// whole chunk -- that inversion IS the win). Desyncs stay at zero: a
+	// healthy full-duplex exchange is not a failure.
+	if got := a.DecodedOut(); got != uint64(len(ba)) {
+		t.Fatalf("a decoded %d bytes, want %d", got, len(ba))
+	}
+	if got := b.DecodedOut(); got != uint64(len(ab)) {
+		t.Fatalf("b decoded %d bytes, want %d", got, len(ab))
+	}
+	if a.WireIn() != b.Framed() || b.WireIn() != a.Framed() {
+		t.Fatalf("read direction disagrees with the peer's write: a.readWire=%d b.framed=%d b.readWire=%d a.framed=%d",
+			a.WireIn(), b.Framed(), b.WireIn(), a.Framed())
+	}
+	if a.Desyncs() != 0 || b.Desyncs() != 0 {
+		t.Fatal("a clean full-duplex exchange counted desyncs")
+	}
 }
 
 // TestTailCausality is the latency guard: a Write returns only after its
@@ -313,7 +338,8 @@ func TestPassThroughByteIdentical(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatal("pass-through Read altered the byte stream")
 	}
-	if w.Offered() != 0 || w.Framed() != 0 || w.Refs() != 0 {
+	if w.Offered() != 0 || w.Framed() != 0 || w.Refs() != 0 ||
+		w.Desyncs() != 0 || w.WireIn() != 0 || w.DecodedOut() != 0 {
 		t.Fatal("pass-through traffic moved the dedup counters")
 	}
 }
@@ -576,5 +602,97 @@ func TestCounters(t *testing.T) {
 	}
 	if w.Refs() == 0 {
 		t.Fatal("identical second copy emitted no refs")
+	}
+
+	// The read direction (SPEC-CLUSTER23) over that exact wire: decoding it
+	// consumes every wire byte -- headers included -- and emits exactly the
+	// payload bytes, so the pair lands on the same numbers the write side
+	// measured from the other end. The win number of the direction the
+	// feature exists for (requests crossing the server) is therefore the
+	// same arithmetic, mirrored.
+	r := newMemConnReader(append([]byte(nil), wire.Bytes()...))
+	got := readAll(t, r, 2*len(body))
+	if len(got) != 2*len(body) || !bytes.Equal(got, append(append([]byte{}, body...), body...)) {
+		t.Fatalf("the read-back diverged: %d bytes decoded", len(got))
+	}
+	if r.WireIn() != uint64(wire.Len()) {
+		t.Fatalf("readWire=%d want %d (every wire byte, headers included)", r.WireIn(), wire.Len())
+	}
+	if r.DecodedOut() != 2*uint64(len(body)) {
+		t.Fatalf("readPayload=%d want %d (every payload byte, surplus handouts not double-counted)",
+			r.DecodedOut(), 2*len(body))
+	}
+	if r.Desyncs() != 0 {
+		t.Fatalf("a clean decode to EOF counted %d desyncs", r.Desyncs())
+	}
+}
+
+// errReader fails every Read with the same raw error -- the shape of an
+// inner conn dying under a blocked read (closed pipe, reset, deadline),
+// which is how a join's LOCAL teardown of a healthy stream reaches the codec.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestDesyncsCountDesyncsNotCloses pins the judgment calls in the desync
+// counter (SPEC-CLUSTER23 review gate 2, plus the correction the e2e dedup
+// group forced): a stream that ends exactly at a frame boundary is a CLEAN
+// CLOSE -- io.EOF through fail() -- and a stream whose transport dies under
+// it is a DEATH, not a framing failure; only what the codec itself
+// determined (a mid-frame end, a rejected frame) is a desync, counted
+// exactly once no matter how many sticky Reads come after.
+func TestDesyncsCountDesyncsNotCloses(t *testing.T) {
+	body := llmPromptBody(rand.New(rand.NewSource(29)), 16*1024)
+	w, _ := newMemConnWriter()
+	if _, err := w.Write(body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clean close: the full wire, ending on a frame boundary. The final
+	// Read surfaces io.EOF and desyncs stays at zero.
+	r := newMemConnReader(append([]byte(nil), w.wbuf...))
+	got := readAll(t, r, len(body))
+	if !bytes.Equal(got, body) {
+		t.Fatal("the clean stream decoded wrong before its close")
+	}
+	if _, err := r.Read(make([]byte, 16)); err != io.EOF {
+		t.Fatalf("the boundary close surfaced as %v, want io.EOF", err)
+	}
+	if r.Desyncs() != 0 {
+		t.Fatalf("a boundary EOF counted %d desyncs; a clean close is not a desync", r.Desyncs())
+	}
+
+	// Genuine desync: the same stream truncated mid-frame -- the shape
+	// TestEOFTransparency pins as ErrUnexpectedEOF. Counted once, and the
+	// sticky re-reads add nothing.
+	wire := append([]byte(nil), w.wbuf...)
+	r = newMemConnReader(wire[:len(wire)-2])
+	buf := make([]byte, 64*1024)
+	for {
+		if _, err := r.Read(buf); err != nil {
+			break
+		}
+	}
+	if got := r.Desyncs(); got != 1 {
+		t.Fatalf("a mid-frame truncation counted %d desyncs, want exactly 1", got)
+	}
+	if _, err := r.Read(buf); err == nil {
+		t.Fatal("the truncation error is not sticky")
+	}
+	if got := r.Desyncs(); got != 1 {
+		t.Fatalf("sticky re-reads moved the desync counter to %d", got)
+	}
+
+	// Transport death: a blocked read killed under a healthy stream -- the
+	// local-teardown shape, a closed pipe arriving after two header bytes.
+	// The error is real and the stream is dead, but nothing about the
+	// framing lied; counting it would book every visitor disconnect as a
+	// desync (the e2e dedup group caught exactly that in the first draft).
+	r = NewEngaged(&memConn{r: io.MultiReader(bytes.NewReader([]byte{byte(frameTail), 0}), errReader{io.ErrClosedPipe})})
+	if n, err := r.Read(buf); err == nil || n != 0 {
+		t.Fatalf("a dead transport read returned n=%d err=%v, want the raw error", n, err)
+	}
+	if got := r.Desyncs(); got != 0 {
+		t.Fatalf("a transport death counted %d desyncs; only codec-determined framing failures count", got)
 	}
 }

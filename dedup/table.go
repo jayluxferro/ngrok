@@ -110,12 +110,12 @@ func (t *table) insert(key digest, chunk []byte) {
 func (t *table) fetch(s uint16, prefix []byte) ([]byte, error) {
 	d := (uint16(t.count-1) - s) & 0xFFFF
 	if !(d < ringSlots && uint64(d) < t.count) {
-		return nil, fmt.Errorf("carrier_dedup: REF to slot %d outside the live window (count=%d): stream desync", s, t.count)
+		return nil, fmt.Errorf("%w: REF to slot %d outside the live window (count=%d)", errStreamDesync, s, t.count)
 	}
 	sl := &t.slots[int(s)&ringMask]
 	sum := blake2b.Sum256(sl.buf)
 	if !bytes.Equal(sum[:refDigestLen], prefix) {
-		return nil, fmt.Errorf("carrier_dedup: REF to slot %d failed digest verification: stream desync", s)
+		return nil, fmt.Errorf("%w: REF to slot %d failed digest verification", errStreamDesync, s)
 	}
 	return sl.buf, nil
 }

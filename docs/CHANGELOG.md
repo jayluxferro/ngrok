@@ -1,4 +1,66 @@
 # Changelog
+## 1.0.23 - 2026-10-09 - carrier_dedup telemetry: the v2 gate becomes readable
+
+Cluster 21 shipped `carrier_dedup` with log lines as its entire observability
+surface. This release moves it where every other server quantity already
+lives — the `/metrics` JSON, prometheus, and the `/tunnels` snapshots the
+workbench renders — without touching the wire, the codec's framing, or the
+hot path's lock discipline: two atomic adds per ≤16 KiB frame on the decode
+path, one store lock per finished stream, taken at the same teardown moment
+the close line was already written.
+
+### What became readable
+
+Seven counters per tunnel and seven process globals: the write direction's
+`offered/framed/refs`, the read direction's `read_wire/read_payload`,
+`desyncs`, and `streams` (how many streams ever engaged — the kill switch's
+observable form: a stack running `-disableCarrierDedup` shows a zero delta
+on every field, pinned e2e by a before/after scrape over all fourteen; the
+per-tunnel prometheus series are emitted zeros included, because an absent
+series compares as no-data, not zero — the v2 gate's cross-stream question
+is a comparison across them).
+
+### Direction, stated honestly (and a correction)
+
+The codec frames BOTH directions of a carrier stream, and a workload's win
+can land on either. At the server, `offered/framed/refs` are the visitors'
+request bytes — where the flagship LLM-POST win actually lands: this
+release's own e2e llm leg leaves a server close line reading
+`offered=3314100 framed=599827 refs=494` — and `read_wire/read_payload` are
+the agent-encoded responses it decodes back, the direction that until this
+release existed in no server-side number at all. Spec 18's design note had
+those two inverted; a dated amendment at the bottom of the spec corrects
+it. Nothing in the implementation changes: both directions were built
+regardless, and the two ends' close lines agree exactly (one end's
+readWire is the peer's framed — pinned by unit test).
+
+### The desync counter's honesty
+
+`desyncs` counts only the deaths the codec itself determined — framing
+violations it rejected, REF digests that failed verification, streams that
+ended mid-frame — never a transport dying under a blocked read. The first
+draft counted every non-EOF sticky error, and the e2e group caught it in
+one run: one false desync per visitor disconnect on the server, while the
+far end — seeing the same stream's remote close as a clean boundary EOF —
+logged zero. A counter that reads one on every healthy close is noise, not
+the v2 gate's signal. Zero on both ends is the steady state, pinned by
+unit test and by all twelve close lines of the e2e group.
+
+### Proof it only appended
+
+The close line grew `desyncs/readWire/readPayload` AFTER `refs=`; the
+bench's positional regex and all six e2e close-line scenarios pass
+byte-for-byte unchanged — that is the append-only review gate, not a
+claim. The bench compare (pristine v1.0.22 vs this tree, same machine,
+both binaries built with go1.26.9) holds the exact byte ratios dead-on —
+requests saved 82.1% → 82.0% (QUIC) and 81.1% → 81.8% (smux), responses
+−2.8% → −2.8%, bulk control overhead 0.070% → 0.070% — while the loopback
+timing rows moved inside their documented noise (mixed signs, the
+codec-less control legs swinging as much as the codec legs) and the dedup
+client's CPU bill moved ~4%, the two atomic adds' expected shape. v2 stays
+gated — now on counters an operator can actually read. This release
+measures the feature; it does not change it.
+
 ## 1.0.22 - 2026-10-09 - toolchain: go 1.26.0 floor, quic-go v0.63.0
 
 The release the go.mod pin comment has been promising since it was written:

@@ -920,7 +920,16 @@ func (c *ClientModel) closeCarrierDedup(carrier *dedup.Conn, startPxy *msg.Start
 		}
 		return
 	}
-	c.Info("carrier_dedup: offered=%d framed=%d refs=%d", carrier.Offered(), carrier.Framed(), carrier.Refs())
+	// The appended desyncs/readWire/readPayload triple (SPEC-CLUSTER23)
+	// keeps the client log-only -- the client has no admin surface -- while
+	// making its line the same both-directions story the server logs:
+	// offered/framed/refs are what this agent encoded (responses), and the
+	// appended triple is the direction it decoded -- the visitors' request
+	// bytes the server forwarded, which is where this end's win number
+	// lives (readWire below readPayload is a REF paying off). APPEND-ONLY:
+	// everything through refs= is parsed positionally by the bench and e2e.
+	c.Info("carrier_dedup: offered=%d framed=%d refs=%d desyncs=%d readWire=%d readPayload=%d",
+		carrier.Offered(), carrier.Framed(), carrier.Refs(), carrier.Desyncs(), carrier.WireIn(), carrier.DecodedOut())
 }
 
 // proxyDial is the original per-connection path: dial the server, register, and

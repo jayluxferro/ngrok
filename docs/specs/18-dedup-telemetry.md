@@ -167,3 +167,34 @@ shifts stay attributable). CHANGELOG states the win-direction rationale in one s
 read counters are the point, not a nicety) and the honest scope: this measures
 the feature; it does not change it. v2 remains gated — now on counters an
 operator can actually read.
+
+## Amendment 2026-10-09 (post-implementation): the direction premise, corrected
+
+The design note above says the win is agent→server requests "which the
+server receives on its read path" — measurement says the opposite about the
+path, and the implementation followed the measurement. At the server's
+tunnel join, `offered/framed/refs` are the visitors' request bytes: the
+join wraps the codec around the visitor connection, so what the codec
+*writes to the agent* is the visitors' request stream — the LLM-POST win
+lands there (this release's e2e llm leg: `offered=3314100 framed=599827
+refs=494` on the server close line). `read_wire/read_payload` are the
+agent-encoded responses the server decodes back — the direction that, until
+this cluster, existed in no server-side number at all.
+
+The read counters survive the correction on their own merits: (1) the
+response direction was previously unobservable server-side at all, (2)
+diagnosing the codec needs both directions of the same stream, and (3)
+cross-end agreement — one end's `read_wire` equals its peer's `framed`,
+pinned by unit test — is the cheapest consistency check an operator has.
+The e2e assert `dedup_read_wire > 0` therefore pins that both directions
+are counted, not that the win is on the read side.
+
+Also corrected during implementation (deviation B, accepted at review):
+`desyncs` counts only codec-determined deaths — the `errStreamDesync`
+sentinel (all validateHeader/decodeFrame refusals and table fetch
+re-wraps) plus mid-frame truncation (`io.ErrUnexpectedEOF`) — never
+transport deaths under a blocked read. The first draft counted every
+non-EOF sticky error and the e2e group caught it in one run: one false
+desync per visitor disconnect on the server while the far end logged zero.
+Zero on both ends is steady state, pinned by
+TestDesyncsCountDesyncsNotCloses and all twelve e2e close lines.

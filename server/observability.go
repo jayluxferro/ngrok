@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"ngrok/dedup"
 )
 
 type tunnelSnapshot struct {
@@ -30,6 +32,28 @@ type tunnelSnapshot struct {
 	ClaimedPort    int    `json:"claimed_port"`
 	Pooling        bool   `json:"pooling"`
 	PolicyAttached bool   `json:"policy_attached"`
+
+	// carrier_dedup telemetry (SPEC-CLUSTER23): the codec counters summed
+	// over the tunnel's engaged streams, folded in at stream close exactly
+	// where the connection counters above are mutated -- one store lock per
+	// finished stream, never on the frame path. dedup_streams counts the
+	// engaged streams themselves. Direction map, measured against the real
+	// data path (the join copies visitor bytes INTO the carrier codec): at
+	// the server, dedup_offered/framed/refs are the visitors' request
+	// direction -- where the http win lives -- and dedup_read_wire/
+	// dedup_read_payload are the agent-encoded direction it decoded back
+	// (responses, near-incompressible by design, spec 17 §Non-goals). The
+	// client's line/snapshot is the mirror image. Both directions are kept
+	// because an operator's first question on a weird ratio is which side
+	// produced it. A tunnel whose carrier_dedup never engaged carries the
+	// zero of every field, which is the observable form of the kill switch.
+	DedupOffered     uint64 `json:"dedup_offered"`
+	DedupFramed      uint64 `json:"dedup_framed"`
+	DedupRefs        uint64 `json:"dedup_refs"`
+	DedupDesyncs     uint64 `json:"dedup_desyncs"`
+	DedupReadWire    uint64 `json:"dedup_read_wire"`
+	DedupReadPayload uint64 `json:"dedup_read_payload"`
+	DedupStreams     uint64 `json:"dedup_streams"`
 }
 
 type observabilityStore struct {
@@ -380,6 +404,50 @@ func (o *observabilityStore) onConnClose(t *Tunnel, bytesIn, bytesOut int64) {
 	}
 	o.mu.Unlock()
 	o.events.publishConnectionClose(t.url, bytesIn, bytesOut)
+}
+
+// onDedupClose folds one finished carrier_dedup stream's final counters into
+// the tunnel's snapshot and the process globals (SPEC-CLUSTER23). It runs at
+// the same teardown moment the close line is logged -- the join has wound
+// down, so the codec's counters are final -- and mirrors onConnClose's
+// discipline: one store lock per finished stream, and never anywhere on the
+// frame path (during the stream's life the codec's counters are atomics the
+// join's goroutines advance; this method only reads them, once).
+//
+// The globals advance even when the snapshot lookup misses: a stream can
+// outlive its tunnel's deregistration, and process-wide totals that
+// silently dropped streams would understate exactly the races an operator
+// is trying to see. The snapshot, which is per-tunnel, cannot follow a
+// tunnel that is gone -- the same asymmetry onConnClose accepts when it
+// publishes the event for a tunnel whose snapshot row has already been
+// deleted.
+func (o *observabilityStore) onDedupClose(t *Tunnel, codec *dedup.Conn) {
+	offered := codec.Offered()
+	framed := codec.Framed()
+	refs := codec.Refs()
+	desyncs := codec.Desyncs()
+	readWire := codec.WireIn()
+	readPayload := codec.DecodedOut()
+
+	o.mu.Lock()
+	if s := o.tunnels[t.url]; s != nil {
+		s.DedupOffered += offered
+		s.DedupFramed += framed
+		s.DedupRefs += refs
+		s.DedupDesyncs += desyncs
+		s.DedupReadWire += readWire
+		s.DedupReadPayload += readPayload
+		s.DedupStreams++
+	}
+	o.mu.Unlock()
+
+	dedupOfferedTotal.Add(offered)
+	dedupFramedTotal.Add(framed)
+	dedupRefsTotal.Add(refs)
+	dedupDesyncsTotal.Add(desyncs)
+	dedupReadWireTotal.Add(readWire)
+	dedupReadPayloadTotal.Add(readPayload)
+	dedupStreamsTotal.Add(1)
 }
 
 func (o *observabilityStore) snapshots() []tunnelSnapshot {

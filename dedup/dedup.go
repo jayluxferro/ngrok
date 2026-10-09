@@ -53,6 +53,7 @@
 package dedup
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -70,6 +71,28 @@ var _ net.Conn = (*Conn)(nil)
 // without meaningfully costing large writes: four batches cover the join
 // buffer, and each batch is one inner Write either way.
 const maxBatch = 64 * 1024
+
+// errStreamDesync marks every error this codec MANUFACTURES from its own
+// framing analysis: a rejected header, a REF that fails verification, an
+// unknown frame type. It is how fail() tells "the codec determined this
+// stream is unframable" -- a desync, the fail-loud event the telemetry
+// counts -- apart from "the transport died under a blocked read". The
+// distinction is not pedantry: conn.Join tears both legs down on any error,
+// and the LOCAL close of a perfectly healthy stream surfaces to the codec's
+// blocked read as the inner conn's own error (a closed-pipe/reset, never a
+// boundary EOF -- the far end's close is what arrives as EOF). The first
+// draft of the desync counter counted every sticky error but a bare io.EOF,
+// and the e2e dedup group caught it within one run: a healthy scenario
+// logged desyncs=1 per stream on the server -- one per visitor disconnect,
+// the join's own teardown -- while the far end, seeing the remote close as
+// a clean boundary EOF, logged zero. A counter that reads one on every
+// closed connection is noise, not the v2 gate's signal.
+//
+// The mid-frame truncation (io.EOF after a partial frame) is counted too,
+// via errors.Is(io.ErrUnexpectedEOF) rather than this sentinel: readErr
+// already re-classifies exactly that case, and a stream that ends mid-frame
+// is a framing lie whoever caused it.
+var errStreamDesync = errors.New("carrier_dedup: stream desync")
 
 // Conn is the carrier_dedup wrapper. Construct with NewPassThrough (for
 // install-then-engage) or NewEngaged; both take the inner conn and delegate
@@ -105,6 +128,20 @@ type Conn struct {
 	offered atomic.Uint64
 	framed  atomic.Uint64
 	refs    atomic.Uint64
+
+	// The telemetry half of the close line (SPEC-CLUSTER23):
+	// desyncs=N readWire=W readPayload=P. The asymmetry with the three
+	// above is the point of the cluster: offered/framed/refs only ever
+	// advance on the WRITE path, and the win the feature exists for --
+	// agent->server requests -- crosses the server on its READ path, so a
+	// server aggregating only its own write counters would aggregate the
+	// ~0 direction and miss the payload entirely. wireIn/decodedOut are
+	// the read direction's framed/offered pair; desyncs is the fail-loud
+	// event made queryable. Same atomicity rule: advanced only by the
+	// join's reader goroutine, read cross-goroutine at teardown.
+	desyncs    atomic.Uint64
+	wireIn     atomic.Uint64
+	decodedOut atomic.Uint64
 }
 
 // NewPassThrough wraps inner with the codec disengaged: every byte passes
@@ -152,6 +189,28 @@ func (c *Conn) Framed() uint64 { return c.framed.Load() }
 
 // Refs returns the number of REF frames emitted -- the "refs" figure.
 func (c *Conn) Refs() uint64 { return c.refs.Load() }
+
+// Desyncs returns the number of desyncs this codec observed: framing
+// violations it rejected (bad header, failed REF verification, unknown type)
+// and streams that ended mid-frame. Transport deaths -- a join tearing down
+// a blocked read because the visitor disconnected, a reset, a deadline --
+// are NOT desyncs and do not count, whatever error they hand the codec; see
+// errStreamDesync for the full story. Zero is the honest steady state of a
+// healthy stream on BOTH ends; a non-zero figure is the v2 gate's queryable
+// version of the once-per-direction Warn log.
+func (c *Conn) Desyncs() uint64 { return c.desyncs.Load() }
+
+// WireIn returns the count of inner bytes the engaged Reads consumed,
+// headers included -- the "readWire" figure. It is the read direction's
+// Framed(): what the far end actually put on the wire for this side.
+func (c *Conn) WireIn() uint64 { return c.wireIn.Load() }
+
+// DecodedOut returns the count of payload bytes the engaged Reads emitted --
+// the "readPayload" figure. WireIn/DecodedOut is the read direction's win
+// number, the same shape as Framed()/Offered(); bytes held in the surplus
+// buffer (a frame larger than the caller's Read) are counted once, when
+// their frame is decoded, not again per partial handout.
+func (c *Conn) DecodedOut() uint64 { return c.decodedOut.Load() }
 
 // Write encodes p and writes it to the inner conn. On success it returns
 // len(p): every byte of p is framed before Write returns -- complete chunks
@@ -233,6 +292,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 	if err != nil {
 		return c.fail(err)
 	}
+	// One add per frame decoded (SPEC-CLUSTER23): the wire bytes it cost
+	// were counted in fill, the payload it produced here. The surplus
+	// branch below re-emits from c.out without re-counting -- those bytes
+	// were this frame's payload the moment decodeFrame returned them.
+	c.decodedOut.Add(uint64(len(payload)))
 	n := copy(p, payload)
 	if n < len(payload) {
 		c.out = append(c.out[:0], payload[n:]...)
@@ -257,18 +321,18 @@ func (c *Conn) validateHeader() error {
 	switch typ {
 	case frameLiteral:
 		if need < minChunk || need > maxChunk {
-			return fmt.Errorf("carrier_dedup: LITERAL frame of %d bytes outside [%d,%d]: stream desync", need, minChunk, maxChunk)
+			return fmt.Errorf("%w: LITERAL frame of %d bytes outside [%d,%d]", errStreamDesync, need, minChunk, maxChunk)
 		}
 	case frameTail:
 		if need < 1 || need >= maxChunk {
-			return fmt.Errorf("carrier_dedup: TAIL frame of %d bytes outside [1,%d]: stream desync", need, maxChunk-1)
+			return fmt.Errorf("%w: TAIL frame of %d bytes outside [1,%d]", errStreamDesync, need, maxChunk-1)
 		}
 	case frameRef:
 		if need != refPayloadLen {
-			return fmt.Errorf("carrier_dedup: REF frame with payload length %d, want %d: stream desync", need, refPayloadLen)
+			return fmt.Errorf("%w: REF frame with payload length %d, want %d", errStreamDesync, need, refPayloadLen)
 		}
 	default:
-		return fmt.Errorf("carrier_dedup: unknown frame type %d: stream desync", typ)
+		return fmt.Errorf("%w: unknown frame type %d", errStreamDesync, typ)
 	}
 	c.need = need
 	return nil
@@ -293,7 +357,7 @@ func (c *Conn) decodeFrame() ([]byte, error) {
 	default:
 		// validateHeader already rejected this; unreachable, but the
 		// fall-through answer to an unknown type is an error, not silence.
-		return nil, fmt.Errorf("carrier_dedup: unknown frame type %d: stream desync", c.hdr[0])
+		return nil, fmt.Errorf("%w: unknown frame type %d", errStreamDesync, c.hdr[0])
 	}
 }
 
@@ -301,25 +365,35 @@ func (c *Conn) decodeFrame() ([]byte, error) {
 // a Read that returns both data and EOF consumes the data first and lets the
 // EOF surface on the next fill, at the frame boundary where it means a clean
 // close.
+//
+// The single exit is load-bearing for the telemetry (SPEC-CLUSTER23): one
+// wireIn add per fill, on every path, so a fill that consumed bytes before
+// hitting a failing edge still books them -- a truncated stream's readWire
+// must reflect the bytes that really crossed before it died, or the win
+// number quietly undercounts exactly the streams an operator is debugging.
 func (c *Conn) fill(dst []byte) error {
-	for len(dst) > 0 {
-		n, err := c.Conn.Read(dst)
+	consumed := 0
+	var err error
+	for len(dst) > 0 && err == nil {
+		var n int
+		n, err = c.Conn.Read(dst)
+		consumed += n
 		if n > 0 {
 			dst = dst[n:]
-			if len(dst) == 0 {
-				return nil
-			}
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
+		} else if err == nil {
 			// io.Reader contract violation; the net.Conn and smux
 			// implementations this wraps never do it. Fail rather than spin.
-			return io.ErrNoProgress
+			err = io.ErrNoProgress
 		}
 	}
-	return nil
+	c.wireIn.Add(uint64(consumed))
+	if len(dst) == 0 {
+		// dst filled: whatever the last Read also returned is dropped, as it
+		// always was -- the data was consumed first and the stream is at a
+		// frame boundary, where a trailing error would mean nothing.
+		return nil
+	}
+	return err
 }
 
 // readErr classifies an inner-read failure. EOF exactly at a frame boundary
@@ -338,7 +412,18 @@ func readErr(err error, atBoundary bool) error {
 // fail records the sticky error. The stream is dead the moment a desync is
 // seen -- conn.Join closes both legs on any Read error -- so every later
 // Read returns the same hard error and can never manufacture bytes.
+//
+// The desync counter (SPEC-CLUSTER23) counts only the deaths the CODEC
+// determined -- the errStreamDesync-marked framing violations and the
+// mid-frame truncation readErr classifies -- never the raw error an inner
+// conn hands back when the join closes a healthy stream underneath a
+// blocked read. fail() is unreachable twice for one error (the sticky check
+// in Read precedes every fail site), so the add is once-per-death, not
+// once-per-Read.
 func (c *Conn) fail(err error) (int, error) {
+	if errors.Is(err, errStreamDesync) || errors.Is(err, io.ErrUnexpectedEOF) {
+		c.desyncs.Add(1)
+	}
 	c.readErr = err
 	return 0, err
 }

@@ -1034,11 +1034,23 @@ func (t *Tunnel) HandlePublicConnection(publicConn conn.Conn, pol *policy.Compil
 	// carrier_dedup close line (SPEC-CLUSTER21 §5): the honest win number, at
 	// the join's teardown -- the same moment the join's own "Copied N bytes"
 	// line is written, one line per stream, and only for streams that were
-	// actually engaged (the counters are the codec's write direction, i.e.
-	// what this server encoded toward the agent). A pass-through stream --
-	// kill switch on, no proposal, dialed conn -- logs nothing here.
+	// actually engaged. The line carries BOTH directions of this end's
+	// stream: offered/framed/refs are what this server ENCODED toward the
+	// agent -- on the http path that is the visitors' request bytes, the
+	// direction the dedup win lives in -- and the appended desyncs/readWire/
+	// readPayload triple is the direction it DECODED, the agent-encoded
+	// side (responses, near-incompressible by design, spec 17 §Non-goals).
+	// A pass-through stream -- kill switch on, no proposal, dialed conn --
+	// logs nothing here.
+	//
+	// The aggregation (SPEC-CLUSTER23) runs BEFORE the line: it is the same
+	// teardown moment, but the e2e group waits on the log line and then
+	// scrapes the admin surface, so the counters must already be folded when
+	// the line the waiter greps for exists.
 	if codec != nil {
-		proxyConn.Info("carrier_dedup: offered=%d framed=%d refs=%d", codec.Offered(), codec.Framed(), codec.Refs())
+		observe.onDedupClose(t, codec)
+		proxyConn.Info("carrier_dedup: offered=%d framed=%d refs=%d desyncs=%d readWire=%d readPayload=%d",
+			codec.Offered(), codec.Framed(), codec.Refs(), codec.Desyncs(), codec.WireIn(), codec.DecodedOut())
 	}
 
 	metrics.CloseConnection(t, publicConn, startTime, bytesIn, bytesOut)

@@ -23,6 +23,23 @@ var (
 	publicConnOpenTotal uint64
 	publicConnPeak      int64
 	controlConnCount    int64
+
+	// carrier_dedup totals (SPEC-CLUSTER23), folded once per finished stream
+	// by observe.onDedupClose -- atomic.Uint64 because streams close on many
+	// goroutines while /metrics reads them. Direction map: the join copies
+	// visitor bytes INTO the carrier codec, so offered/framed/refs are the
+	// visitors' request direction (where the http win lives) and
+	// read_wire/read_payload are the agent-encoded direction decoded back.
+	// streams counts the engaged streams over the process's life; the byte
+	// figures are sums over them. Pass-through traffic -- kill switch,
+	// unacked proposal, no proposal -- never touches any of these.
+	dedupOfferedTotal     atomic.Uint64
+	dedupFramedTotal      atomic.Uint64
+	dedupRefsTotal        atomic.Uint64
+	dedupDesyncsTotal     atomic.Uint64
+	dedupReadWireTotal    atomic.Uint64
+	dedupReadPayloadTotal atomic.Uint64
+	dedupStreamsTotal     atomic.Uint64
 )
 
 const adminSessionCookie = "ngrok_admin_session"
@@ -250,6 +267,16 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 			"event_drop_count":   observe.events.droppedEvents(),
 			"event_subscribers":  observe.events.subscriberCount(),
 			"event_destinations": exportedDestinationStats(),
+			// carrier_dedup totals (SPEC-CLUSTER23): the quantities spec 17
+			// gates dedup v2 on -- cross-stream demand, desyncs, and both
+			// wire directions -- readable without hand-grepping logs.
+			"dedup_offered_total":      dedupOfferedTotal.Load(),
+			"dedup_framed_total":       dedupFramedTotal.Load(),
+			"dedup_refs_total":         dedupRefsTotal.Load(),
+			"dedup_desyncs_total":      dedupDesyncsTotal.Load(),
+			"dedup_read_wire_total":    dedupReadWireTotal.Load(),
+			"dedup_read_payload_total": dedupReadPayloadTotal.Load(),
+			"dedup_streams_total":      dedupStreamsTotal.Load(),
 		}
 		if strings.EqualFold(r.URL.Query().Get("detail"), "full") {
 			payload["series"] = series
@@ -307,6 +334,20 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_rate_drop_count counter\nngrokd_rate_drop_count %d\n", atomic.LoadUint64(&rateDropCount))
 		_, _ = fmt.Fprintf(w, "# HELP ngrokd_event_drop_count events dropped on full subscriber queues\n")
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_event_drop_count counter\nngrokd_event_drop_count %d\n", observe.events.droppedEvents())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_offered_total carrier_dedup payload bytes accepted on engaged streams\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_offered_total counter\nngrokd_dedup_offered_total %d\n", dedupOfferedTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_framed_total carrier_dedup wire bytes written from engaged streams\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_framed_total counter\nngrokd_dedup_framed_total %d\n", dedupFramedTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_refs_total carrier_dedup REF frames emitted\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_refs_total counter\nngrokd_dedup_refs_total %d\n", dedupRefsTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_desyncs_total carrier_dedup fail-loud desyncs (clean closes excluded)\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_desyncs_total counter\nngrokd_dedup_desyncs_total %d\n", dedupDesyncsTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_read_wire_total carrier_dedup wire bytes consumed on the read path\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_read_wire_total counter\nngrokd_dedup_read_wire_total %d\n", dedupReadWireTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_read_payload_total carrier_dedup payload bytes decoded on the read path\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_read_payload_total counter\nngrokd_dedup_read_payload_total %d\n", dedupReadPayloadTotal.Load())
+		_, _ = fmt.Fprintf(w, "# HELP ngrokd_dedup_streams_total carrier_dedup engaged streams over the process life\n")
+		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_dedup_streams_total counter\nngrokd_dedup_streams_total %d\n", dedupStreamsTotal.Load())
 		_, _ = fmt.Fprintf(w, "# HELP ngrokd_tunnel_active_connections active connections by tunnel\n")
 		_, _ = fmt.Fprintf(w, "# TYPE ngrokd_tunnel_active_connections gauge\n")
 		for _, t := range s {
@@ -314,6 +355,18 @@ func adminHandler(enablePprof bool, auth *adminAuth, rate int) *http.ServeMux {
 			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_total_connections{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.TotalConnections)
 			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_bytes_in{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.BytesIn)
 			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_bytes_out{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.BytesOut)
+			// carrier_dedup per-tunnel telemetry (SPEC-CLUSTER23). Emitted
+			// for every tunnel, zeros included: the v2 gate's cross-stream
+			// question -- which tunnels are actually engaging, and is any
+			// of them desyncing -- is a comparison ACROSS these series, and
+			// an absent series compares as no-data, not as zero.
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_offered{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupOffered)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_framed{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupFramed)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_refs{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupRefs)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_desyncs{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupDesyncs)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_read_wire{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupReadWire)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_read_payload{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupReadPayload)
+			_, _ = fmt.Fprintf(w, "ngrokd_tunnel_dedup_streams{url=%q,protocol=%q} %d\n", t.URL, t.Protocol, t.DedupStreams)
 		}
 	}))
 

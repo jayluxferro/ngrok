@@ -5092,10 +5092,15 @@ bot_wait_msg 'unknown command; send /help' "the unknown-command hint"
 # 15443/19110/19190). This group takes public http :18089-:18092 (one per
 # stack), tunnel :14454-:14457 (the QUIC stack's listener rides the UDP side
 # of its tunnel port, like every -quicAddr stack in this file), local
-# upstreams :19021 (http echo) and :19022 (udp echo), and the mixed client's
-# claimed public udp port :14880 -- none of which appear anywhere else in
-# the file. The stacks' ngrokds disable the admin listener; nothing here
-# reads it.
+# upstreams :19021 (http echo) and :19022 (udp echo), the mixed client's
+# claimed public udp port :14880, and ONE admin port, :19104 (SPEC-CLUSTER23
+# telemetry) -- none of which appear anywhere else in the file. The admin
+# port is bound SEQUENTIALLY, never concurrently: scenario 1's ngrokd (whose
+# admin surface the telemetry assertions read) and scenario 3's (whose reads
+# the kill-switch zero-delta) each take :19104, the second only after the
+# first stack has been stopped and reaped -- the same reuse :18089/:14454
+# already receive between scenarios 1 and 5. Every other stack here still
+# runs without -adminAddr.
 #
 # Logs go to /tmp/ngrok-e2e-dedup/ -- deliberately OUTSIDE the
 # /tmp/ngrok-e2e-*.log glob the opening rm -f unlinks -- and the group
@@ -5435,6 +5440,23 @@ dedup_wait_public() {
   return 1
 }
 
+# dedup_wait_admin <label>: the telemetry scenarios' ngrokd binds the group's
+# one admin port (:19104); the carrier-listener wait does not cover it, so
+# the scrape below would race startup. Same bounded shape as
+# dedup_wait_public, against /healthz.
+dedup_wait_admin() {
+  local label="$1" code i
+  for i in $(seq 1 40); do
+    code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:19104/healthz 2>/dev/null || true)"
+    if [[ "$code" == "200" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[e2e] $label: the admin listener on :19104 never came up"
+  return 1
+}
+
 # dedup_stop <client-pid> <ngrokd-pid>: the client goes first so the server's
 # registry lets the hostnames go before any later stack reuses them.
 dedup_stop() {
@@ -5451,9 +5473,10 @@ echo "[e2e] starting the dedup group's local upstreams (http :19021, udp :19022)
 # close lines on both sides, and refs>0 server-side.
 echo "[e2e] dedup 1: dedup tunnel over the smux carrier (correctness + repetition)"
 ./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18089 -httpsAddr= \
-  -tunnelAddr=127.0.0.1:14454 >"$DEDUP_DIR/a-ngrokd.log" 2>&1 &
+  -tunnelAddr=127.0.0.1:14454 -adminAddr=127.0.0.1:19104 >"$DEDUP_DIR/a-ngrokd.log" 2>&1 &
 DEDUP_A_NGROKD_PID=$!
 dedup_wait_server "$DEDUP_DIR/a-ngrokd.log" "dedup 1 (ngrokd)"
+dedup_wait_admin "dedup 1 (ngrokd)"
 
 cat > "$TMPDIR/dedup-a.yml" <<'YAML'
 server_addr: 127.0.0.1:14454
@@ -5481,6 +5504,75 @@ python3 "$TMPDIR/dedup_post.py" 18089 dedup 5 repeat | sed 's/^/[e2e] dedup 1: /
 dedup_wait_close_lines "$DEDUP_DIR/a-ngrokd.log" 2 "dedup 1 (server close lines)"
 dedup_wait_close_lines "$DEDUP_DIR/a-client.log" 2 "dedup 1 (client close lines)"
 dedup_assert_refs "$DEDUP_DIR/a-ngrokd.log" "dedup 1"
+
+# The telemetry surface (SPEC-CLUSTER23): the same two streams the close
+# lines above belong to, folded into the tunnel snapshot and the globals by
+# the teardown aggregation. Queried AFTER the close-line wait on purpose --
+# the fold runs at the same teardown moment the lines are written, and
+# before them, so any line the waiter saw recorded is already on the admin
+# surface. Direction map, measured against this very group's numbers: the
+# join copies the visitor's bytes INTO the carrier codec, so dedup_offered/
+# framed here ARE the request direction (the tens of KiB of repeat bodies),
+# while dedup_read_wire/read_payload are the agent-encoded direction this
+# ngrokd decoded back -- asserting read_wire > 0 pins that BOTH directions
+# are counted server-side, not only the one the win rides. desyncs stays 0:
+# a healthy stream is not a desync (and the first draft of the codec's
+# counter, which counted every non-EOF death, failed exactly here -- one
+# false desync per visitor disconnect, while the client end logged zero).
+curl -fsS -m 5 http://127.0.0.1:19104/tunnels >"$DEDUP_DIR/a-tunnels.json"
+python3 - "$DEDUP_DIR/a-tunnels.json" <<'PY'
+import json, sys
+tuns = json.load(open(sys.argv[1]))["tunnels"]
+t = next((u for u in tuns if u.get("url") == "http://dedup"), None)
+if t is None:
+    sys.exit("dedup 1: the dedup tunnel is not in /tunnels: %r" % [u.get("url") for u in tuns])
+for k in ("dedup_offered", "dedup_framed", "dedup_refs", "dedup_desyncs",
+          "dedup_read_wire", "dedup_read_payload", "dedup_streams"):
+    if k not in t:
+        sys.exit("dedup 1: /tunnels snapshot carries no %s key: %r" % (k, sorted(t)))
+if t["dedup_offered"] <= 0:
+    sys.exit("dedup 1: dedup_offered=%r, want > 0 (the engaged streams framed their direction)" % t["dedup_offered"])
+if t["dedup_streams"] < 1:
+    sys.exit("dedup 1: dedup_streams=%r, want >= 1" % t["dedup_streams"])
+if t["dedup_read_wire"] <= 0:
+    sys.exit("dedup 1: dedup_read_wire=%r, want > 0 -- the agent-encoded direction moved no wire bytes" % t["dedup_read_wire"])
+if t["dedup_desyncs"] != 0:
+    sys.exit("dedup 1: dedup_desyncs=%r, want 0 (a healthy stream is not a desync)" % t["dedup_desyncs"])
+print("snapshot: offered=%d framed=%d refs=%d desyncs=%d read_wire=%d read_payload=%d streams=%d"
+      % (t["dedup_offered"], t["dedup_framed"], t["dedup_refs"], t["dedup_desyncs"],
+         t["dedup_read_wire"], t["dedup_read_payload"], t["dedup_streams"]))
+PY
+echo "[e2e] dedup 1: /tunnels snapshot carries the dedup fields, both directions counted server-side"
+
+curl -fsS -m 5 http://127.0.0.1:19104/metrics >"$DEDUP_DIR/a-metrics.json"
+python3 - "$DEDUP_DIR/a-metrics.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+for k in ("dedup_offered_total", "dedup_framed_total", "dedup_refs_total", "dedup_desyncs_total",
+          "dedup_read_wire_total", "dedup_read_payload_total", "dedup_streams_total"):
+    if not isinstance(m.get(k), (int, float)) or isinstance(m.get(k), bool):
+        sys.exit("dedup 1: /metrics carries no numeric %s" % k)
+if m["dedup_streams_total"] < 1 or m["dedup_read_wire_total"] <= 0:
+    sys.exit("dedup 1: the dedup globals did not move: streams=%r read_wire=%r"
+             % (m["dedup_streams_total"], m["dedup_read_wire_total"]))
+print("globals: offered=%(dedup_offered_total)d framed=%(dedup_framed_total)d refs=%(dedup_refs_total)d "
+      "desyncs=%(dedup_desyncs_total)d read_wire=%(dedup_read_wire_total)d "
+      "read_payload=%(dedup_read_payload_total)d streams=%(dedup_streams_total)d" % m)
+PY
+
+curl -fsS -m 5 http://127.0.0.1:19104/metrics/prometheus >"$DEDUP_DIR/a-prom.txt"
+if ! grep -q '^# TYPE ngrokd_dedup_read_wire_total counter' "$DEDUP_DIR/a-prom.txt" \
+  || ! grep -q '^ngrokd_dedup_streams_total ' "$DEDUP_DIR/a-prom.txt"; then
+  echo "[e2e] dedup 1: prometheus does not carry the ngrokd_dedup_*_total counters:"
+  grep dedup "$DEDUP_DIR/a-prom.txt" || true
+  exit 1
+fi
+if ! grep -q '^ngrokd_tunnel_dedup_read_wire{url="http://dedup",protocol="http"} ' "$DEDUP_DIR/a-prom.txt"; then
+  echo "[e2e] dedup 1: prometheus carries no per-tunnel ngrokd_tunnel_dedup_read_wire for the dedup tunnel:"
+  grep 'ngrokd_tunnel_dedup' "$DEDUP_DIR/a-prom.txt" || true
+  exit 1
+fi
+echo "[e2e] dedup 1: telemetry surfaced in /tunnels, /metrics JSON and prometheus"
 dedup_stop "$DEDUP_A_CLIENT_PID" "$DEDUP_A_NGROKD_PID"
 
 # dedup 2: the same correctness over the QUIC carrier. proxy_transport is
@@ -5537,17 +5629,23 @@ dedup_stop "$DEDUP_B_CLIENT_PID" "$DEDUP_B_NGROKD_PID"
 # an old (pre-21) server does -- RegProxy/StartProxy are additive json, and
 # "no DedupAck" IS the old wire -- so this scenario is also the spec's
 # old-binary interop case, exercised without standing up a stale binary.
-# Assert all three halves of the contract: traffic stays correct
+# Assert all four halves of the contract: traffic stays correct
 # (pass-through, four requests across several streams), the client logs
 # EXACTLY ONE "stays pass-through" notice per tunnel no matter how many
-# streams asked, and NEITHER side logs a close line (kill switch on = the
-# server installs nothing at all; there is no codec to count bytes).
-echo "[e2e] dedup 3: kill switch -- pass-through, one notice, zero close lines"
+# streams asked, NEITHER side logs a close line (kill switch on = the
+# server installs nothing at all; there is no codec to count bytes), and
+# the admin surface records a ZERO DELTA -- no dedup field moves anywhere
+# (SPEC-CLUSTER23), which is what pass-through looks like in numbers.
+echo "[e2e] dedup 3: kill switch -- pass-through, one notice, zero close lines, zero telemetry delta"
 ./bin/ngrokd -domain=localhost -httpAddr=127.0.0.1:18091 -httpsAddr= \
-  -tunnelAddr=127.0.0.1:14456 -disableCarrierDedup \
+  -tunnelAddr=127.0.0.1:14456 -disableCarrierDedup -adminAddr=127.0.0.1:19104 \
   >"$DEDUP_DIR/c-ngrokd.log" 2>&1 &
 DEDUP_C_NGROKD_PID=$!
 dedup_wait_server "$DEDUP_DIR/c-ngrokd.log" "dedup 3 (ngrokd)"
+dedup_wait_admin "dedup 3 (ngrokd)"
+# The baseline: scraped before any traffic on this stack. Scenario 1's
+# ngrokd held :19104 and was stopped above, so the bind is clean.
+curl -fsS -m 5 http://127.0.0.1:19104/metrics >"$DEDUP_DIR/c-metrics-before.json"
 
 cat > "$TMPDIR/dedup-c.yml" <<'YAML'
 server_addr: 127.0.0.1:14456
@@ -5592,6 +5690,33 @@ for f in "$DEDUP_DIR/c-ngrokd.log" "$DEDUP_DIR/c-client.log"; do
   fi
 done
 echo "[e2e] dedup 3: 4 requests correct, exactly 1 notice, 0 close lines"
+# The zero-delta assert (SPEC-CLUSTER23): no codec was ever installed, so no
+# stream ever folded -- every dedup global must be exactly what it was
+# before the traffic, and the tunnel's snapshot fields must all read zero.
+# The snapshot check is what makes "kill switch" observable as a number
+# rather than as an absence of log lines.
+curl -fsS -m 5 http://127.0.0.1:19104/metrics >"$DEDUP_DIR/c-metrics-after.json"
+curl -fsS -m 5 http://127.0.0.1:19104/tunnels >"$DEDUP_DIR/c-tunnels.json"
+python3 - "$DEDUP_DIR/c-metrics-before.json" "$DEDUP_DIR/c-metrics-after.json" "$DEDUP_DIR/c-tunnels.json" <<'PY'
+import json, sys
+before, after, tunj = (json.load(open(p)) for p in sys.argv[1:4])
+totals = ("dedup_offered_total", "dedup_framed_total", "dedup_refs_total", "dedup_desyncs_total",
+          "dedup_read_wire_total", "dedup_read_payload_total", "dedup_streams_total")
+moved = {k: (before.get(k, 0), after.get(k, 0)) for k in totals if before.get(k, 0) != after.get(k, 0)}
+if moved:
+    sys.exit("dedup 3: kill switch on, but the dedup globals moved: %r" % moved)
+snap = ("dedup_offered", "dedup_framed", "dedup_refs", "dedup_desyncs",
+        "dedup_read_wire", "dedup_read_payload", "dedup_streams")
+t = next((u for u in tunj.get("tunnels", []) if u.get("url") == "http://dedup-kill"), None)
+if t is None:
+    sys.exit("dedup 3: the kill-switch tunnel is not in /tunnels: %r"
+             % [u.get("url") for u in tunj.get("tunnels", [])])
+nonzero = {k: t[k] for k in snap if t.get(k, 0) != 0}
+if nonzero:
+    sys.exit("dedup 3: kill switch on, but the tunnel snapshot carries non-zero dedup fields: %r" % nonzero)
+print("snapshot+globals: zero delta across %d dedup fields" % (len(totals) + len(snap)))
+PY
+echo "[e2e] dedup 3: telemetry zero-delta holds (no dedup field moved on the admin surface)"
 dedup_stop "$DEDUP_C_CLIENT_PID" "$DEDUP_C_NGROKD_PID"
 
 # dedup 4: the SPEC-CLUSTER21 payload end to end, and the kill criterion
