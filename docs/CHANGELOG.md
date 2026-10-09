@@ -1,4 +1,57 @@
 # Changelog
+## 1.0.22 - 2026-10-09 - toolchain: go 1.26.0 floor, quic-go v0.63.0
+
+The release the go.mod pin comment has been promising since it was written:
+the deliberate toolchain upgrade that the quic-go pin rides, shipped as its
+own pair of commits so a bisect lands on exactly one suspicion at a time.
+The first commit raises the floors and nothing else; this one moves the
+dependency those floors unlock.
+
+### Why 1.26.0 and not the newest
+
+Current stable is go1.27.2, and the first draft of this bump targeted 1.27.0.
+It stopped there on evidence, not preference: Go 1.27 replaced the
+encoding/json engine, and the new one no longer refuses
+`map[interface{}]interface{}` at marshal time — it coerces non-string keys
+to strings. That silently voided policy/fuzz_test.go's wire-shape invariant
+(a policy the YAML shape refuses must not gain a valid JSON shape:
+`headers: {1: x}` became `{"1": "x"}` on the wire while the document path
+still refuses it), and FuzzPolicyValidate seed#15 went red —
+deterministically, under 1.27 only, independent of go.mod state. Upstream
+tracks the behavior as golang/go#79938. Restoring that invariant is a
+validation-strictness decision that belongs to the policy engine's own
+review, so this release takes 1.26.0 — the floor quic-go v0.63.0 declares,
+the newest line whose stdlib still refuses — and leaves the 1.27 question,
+and the invariant decision that comes with it, explicitly open.
+
+### What moved
+
+The go directive goes 1.23.0 → **go 1.26.0**, and every workflow's setup-go
+follows (1.23 → 1.26). Machines building from source need nothing: with the
+default GOTOOLCHAIN=auto the go command downloads the 1.26 toolchain on
+first use, which is the same path CI takes. quic-go then moves
+v0.54.0 → **v0.63.0**, current @latest, whose declared floor (go 1.26.0)
+this directive meets exactly — so after this release the go.mod pin comment
+has no caveat left to state, and the comment now says only that the require
+line moves deliberately, never by an incidental `go get`.
+
+The golang.org/x modules ride MVS to what quic-go v0.63.0 requires:
+net 0.43 → 0.56, crypto 0.41 → 0.54, sys 0.35 → 0.47, text 0.28 → 0.40.
+Three indirect riders tidy dropped outright (x/mod, x/sync, x/tools —
+nothing in the build graph needs them anymore), and x/crypto moved from the
+indirect block into the direct require list: the dedup chunker's blake2b
+import made it a real dependency of this module in 1.0.21 and the marking
+was stale. cel-go is untouched at cel.dev/cel-go v0.32.0.
+
+QUIC's fork-facing surface is signature-identical across the jump (same
+Listen/Dial/Transport calls, same Config fields; only Tracer changed type
+and the fork never sets it), so this diff carries **zero .go changes** — the
+e2e QUIC group is the judge of that claim, not the compiler alone. The
+dependency-updates workflow's hardcoded "go 1.23" strings move with the
+floor so its skip-class messages keep telling the truth, and the auto-updater
+stays pinned to GOTOOLCHAIN=local: a floor bump is still a deliberate change
+with its own review, never a weekly side effect.
+
 ## 1.0.21 - 2026-10-09 - carrier_dedup: per-stream content-defined chunk dedup on the agent↔server carrier
 
 This release ships the first feature that changes what the carrier
