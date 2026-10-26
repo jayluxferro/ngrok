@@ -12,18 +12,18 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/inconshreveable/go-vhost v1.0.0
 	github.com/inconshreveable/mousetrap v1.1.0
-	github.com/nsf/termbox-go v1.1.1
-	github.com/quic-go/quic-go v0.63.0
+	github.com/nsf/termbox-go v1.1.2
+	github.com/quic-go/quic-go v0.64.1
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
 	github.com/xtaci/smux/v2 v2.1.0
-	golang.org/x/net v0.56.0
+	golang.org/x/net v0.61.0
 	gopkg.in/inconshreveable/go-update.v0 v0.0.0-20150814200126-d8b0b1d421aa
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	cel.dev/cel-go v0.32.0
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.58.0
 )
 
 require (
@@ -32,15 +32,16 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/kr/binarydist v0.1.0 // indirect
-	github.com/kr/text v0.2.0 // indirect
-	github.com/mattn/go-runewidth v0.0.30 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/mattn/go-runewidth v0.0.31 // indirect
+	github.com/rogpeppe/go-internal v1.16.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
+	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20261019180522-ce908d29299b // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 )
